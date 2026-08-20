@@ -40,3 +40,9 @@ yamlcheck/
 
 # Workspace
 workspace.code-workspace
+
+# Node dependencies
+node_modules/
+
+# SDD workspace (task reports may reference secrets) — never track
+.superpowers/
