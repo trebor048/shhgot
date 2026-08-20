@@ -1,0 +1,42 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.err
+
+# Build artifacts
+build/
+vendor/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Config files with secrets — DO NOT COMMIT REAL CONFIG
+config.yaml
+config_backup.yaml
+config_clean.yaml
+config_enhanced.yaml
+config.cleaned.sanitized.yaml
+
+# Logs
+logs/
+*.log
+
+# Runtime output
+found_keys_*.txt
+
+# AI review workspace (job data, clones, archives) — never commit
+ai_review/
+yamlcheck/
+
+# Workspace
+workspace.code-workspace

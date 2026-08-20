@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  shhgit-server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: shhgit.server
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - shhgit
+
+  shhgit-web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: shhgit.web
+    ports:
+      - "80:80"
+    depends_on:
+      shhgit-server:
+        condition: service_healthy
+    networks:
+      - shhgit
+
+  shhgit-app:
+    build: .
+    container_name: shhgit.app
+    entrypoint: ["/app/shhgit", "--live=http://shhgit-server:8000/api/push"]
+    depends_on:
+      shhgit-server:
+        condition: service_healthy
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./logs:/app/logs
+    networks:
+      - shhgit
+    environment:
+      - TERM=xterm-256color
+
+networks:
+  shhgit:
+    driver: bridge
