@@ -813,8 +813,61 @@ func processRepositoryOrGist(url string, ref string, stars int, source core.GitR
 	}
 }
 
+// isViteOnlyEnvFile reports whether an environment file contains nothing but
+// public Vite (VITE_*) variables, comments, or blank lines. Vite exposes
+// VITE_* vars to the client bundle by design, so a file that ONLY carries
+// those is not a finding. Files mixing VITE_ with real keys are still scanned.
+func isViteOnlyEnvFile(file core.MatchFile) bool {
+	base := strings.ToLower(file.Filename)
+	if !strings.HasPrefix(base, ".env") && !strings.HasPrefix(base, "env.") {
+		return false
+	}
+	hasAssignment := false
+	for _, line := range strings.Split(string(file.Contents), "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, ";") {
+			continue
+		}
+		hasAssignment = true
+		lower := strings.ToLower(t)
+		if !(strings.HasPrefix(lower, "vite_") && (strings.Contains(t, "=") || strings.Contains(t, ":"))) {
+			return false
+		}
+	}
+	return hasAssignment
+}
+
+// isTestFixturePath reports whether a repo-relative path points at test
+// fixtures, which overwhelmingly contain fake placeholder credentials.
+func isTestFixturePath(rel string) bool {
+	lower := strings.ToLower(rel)
+	if strings.Contains(lower, "/tests/") || strings.Contains(lower, "/__tests__/") ||
+		strings.Contains(lower, "/test/") || strings.Contains(lower, "/spec/") ||
+		strings.Contains(lower, "/testdata/") || strings.Contains(lower, "/fixtures/") {
+		return true
+	}
+	base := lower
+	if idx := strings.LastIndex(lower, "/"); idx >= 0 {
+		base = lower[idx+1:]
+	}
+	return strings.Contains(base, "_test.") || strings.Contains(base, ".spec.") ||
+		strings.HasPrefix(base, "test_") || strings.HasPrefix(base, "tests_")
+}
+
+// isPasswordFamilySignature reports whether a signature detects passwords —
+// the class of match that most often fires on fake test-fixture credentials.
+func isPasswordFamilySignature(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.Contains(lower, "password") || strings.Contains(lower, "passwd") || strings.Contains(lower, "pwd")
+}
+
 func checkSignatures(dir string, url string, ref string, stars int, source core.GitResourceType) (matchedAny bool) {
 	for _, file := range core.GetMatchingFiles(dir) {
+		// Env files whose only assignments are public VITE_* variables (Vite
+		// client-side envs ship to the browser by design) are not findings.
+		if isViteOnlyEnvFile(file) {
+			continue
+		}
 		var (
 			matches          []string
 			relativeFileName string
@@ -864,6 +917,11 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 				if matched, part := signature.Match(file); matched {
 					if part == core.PartContents {
 						if matches = signature.GetContentsMatches(file); len(matches) > 0 {
+							// Test fixtures (e.g. backend/tests/*) overwhelmingly
+							// contain fake placeholder passwords — skip them.
+							if isPasswordFamilySignature(signature.Name()) && isTestFixturePath(relativeFileName) {
+								continue
+							}
 							count := len(matches)
 							m := strings.Join(matches, ", ")
 							
