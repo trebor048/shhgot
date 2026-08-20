@@ -1111,6 +1111,11 @@ func runWebMode() {
 	ensureWebHub()
 	webLogCapture = true
 
+	// The web dashboard renders ANSI colours client-side, so force the
+	// terminal palette to emit escape codes even though stdout is not a TTY
+	// (fatih/color disables them by default when output is redirected).
+	color.NoColor = false
+
 	// Capture scanner log output (Logger writes) into the web log buffer so
 	// the dashboard's Logs tab shows everything.
 	if session.Log != nil {
