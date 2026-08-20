@@ -128,6 +128,9 @@ func (s *Service) Start(id string) error {
 	if err != nil {
 		return err
 	}
+	if j.State == StateRunning {
+		return nil // already started; don't re-run the gate or spawn another clone
+	}
 	if err := Transition(j.State, StateRunning); err != nil {
 		return err
 	}
@@ -146,7 +149,12 @@ func (s *Service) Start(id string) error {
 		j.StageName = "Pre-validation (dud: " + verdict + ")"
 		_ = s.Jobs.Update(j)
 		_ = s.Jobs.AppendLog(id, "DUD: "+reason+" (review needed)")
-		_ = s.Cases.Update(&Case{Fingerprint: j.SecretFingerprint, FirstSeen: j.CreatedAt, Verdict: verdict})
+		// Read-modify-write: preserve the case's Jobs links, FirstSeen, and
+		// any cached Verification — only the verdict changes.
+		if c, err := s.Cases.Get(j.SecretFingerprint); err == nil {
+			c.Verdict = verdict
+			_ = s.Cases.Update(c)
+		}
 		s.notify(j, NotifyDud, "warn", "Stage 0: "+reason)
 		return nil
 	}
@@ -164,6 +172,11 @@ func (s *Service) cloneInBackground(id string) {
 	}
 	path, reused, err := s.Pool.Ensure(j.RepoURL)
 	if err != nil {
+		// Re-read so the failure does not clobber state changes
+		// (pause/resume/stop) made while the clone was in flight.
+		if cur, err := s.Jobs.Get(id); err == nil {
+			j = cur
+		}
 		j.State = StateFailed
 		j.Error = "clone failed: " + err.Error()
 		_ = s.Jobs.Update(j)

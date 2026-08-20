@@ -1,8 +1,10 @@
 package aireview
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -161,5 +163,118 @@ func TestServiceEvents(t *testing.T) {
 	defer mu.Unlock()
 	if seen == 0 {
 		t.Fatal("expected at least one event")
+	}
+}
+
+func TestServiceStartGateDudPreservesCaseJobs(t *testing.T) {
+	svc, _ := newTestService(t, nil)
+	secret := "changeme123"
+	j1, err := svc.Flag("https://github.com/o/r", "a.env", "Generic Key", secret, "", 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := svc.Cases.Get(j1.SecretFingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSeen := c.FirstSeen
+	j2, err := svc.Flag("https://github.com/o/r2", "a.env", "Generic Key", secret, "", 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Start(j1.ID); err != nil {
+		t.Fatal(err)
+	}
+	c, err = svc.Cases.Get(j1.SecretFingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Verdict != VerdictPlaceholder {
+		t.Fatalf("case verdict = %q, want %q", c.Verdict, VerdictPlaceholder)
+	}
+	if !c.FirstSeen.Equal(firstSeen) {
+		t.Fatalf("case FirstSeen changed: %v -> %v", firstSeen, c.FirstSeen)
+	}
+	seen := map[string]bool{}
+	for _, id := range c.Jobs {
+		seen[id] = true
+	}
+	if !seen[j1.ID] || !seen[j2.ID] {
+		t.Fatalf("case Jobs lost links: %v (want %s and %s)", c.Jobs, j1.ID, j2.ID)
+	}
+}
+
+func TestServiceCloneFailureDoesNotClobberPause(t *testing.T) {
+	root := t.TempDir()
+	errClone := func(dst, url string) error { return errors.New("boom") }
+	svc, err := NewService(root, "", "", errClone, NewGate([]string{"changeme"}, nil, nil, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := svc.Flag("https://github.com/o/r", "a.env", "Generic Key", "sk-fail-1", "", 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Start(j.ID); err != nil {
+		t.Fatal(err)
+	}
+	// wait for the background clone failure
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		got, _ := svc.Jobs.Get(j.ID)
+		if got.State == StateFailed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("clone failure did not land")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	got, _ := svc.Jobs.Get(j.ID)
+	if got.State != StateFailed {
+		t.Fatalf("state = %s, want failed", got.State)
+	}
+	if !strings.Contains(got.Error, "boom") {
+		t.Fatalf("error = %q, want contains %q", got.Error, "boom")
+	}
+}
+
+func TestServiceStartIdempotent(t *testing.T) {
+	svc, root := newTestService(t, nil)
+	j, err := svc.Flag("https://github.com/o/r2", "a.env", "Generic Key", "sk-real-456", "", 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Start(j.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Start(j.ID); err != nil {
+		t.Fatalf("second Start must be a no-op, got %v", err)
+	}
+	tail, err := svc.Jobs.ReadLogTail(j.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(tail, "Stage 0 passed"); n != 1 {
+		t.Fatalf("gate ran %d times, want exactly 1 (duplicate clone goroutine)", n)
+	}
+	// wait for the (single) background clone
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		got, _ := svc.Jobs.Get(j.ID)
+		if got.ClonePath != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("clone did not complete")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	got, _ := svc.Jobs.Get(j.ID)
+	if got.State != StateRunning {
+		t.Fatalf("state = %s, want running", got.State)
+	}
+	if _, err := os.Stat(filepath.Join(root, "clones", "o-r2", ".cloned")); err != nil {
+		t.Fatal(err)
 	}
 }
