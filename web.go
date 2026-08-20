@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/eth0izzle/shhgit/aireview"
 )
 
 // Match represents a detected secret match.
@@ -169,6 +171,7 @@ type FeedEvent struct {
 	Token    *TokenResult      `json:"token,omitempty"`
 	Activity *ActivitySnapshot `json:"activity,omitempty"`
 	Stats    *Stats            `json:"stats,omitempty"`
+	AI       *aireview.Job     `json:"ai,omitempty"`
 }
 
 var (
@@ -549,6 +552,7 @@ func StartWebServer(host, port string) error {
 	http.HandleFunc("/api/activity", corsMiddleware(getActivity))
 	http.HandleFunc("/api/file", corsMiddleware(getMatchFile))
 	http.HandleFunc("/api/events", corsMiddleware(eventsHandler))
+	registerAIRoutes()
 	http.HandleFunc("/health", corsMiddleware(health))
 
 	// Serve embedded frontend

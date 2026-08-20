@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -1139,6 +1140,11 @@ func runWebMode() {
 
 	// Start scanner in background AND serve the web UI concurrently.
 	go runScanner()
+
+	// Wire the AI review service (from config) before the web server starts.
+	if err := InitAIReview(session.Config); err != nil {
+		log.Printf("[web] AI review init failed: %v", err)
+	}
 
 	// Start web server (blocking)
 	if err := modeConfig.SetupIntegratedUI(); err != nil {

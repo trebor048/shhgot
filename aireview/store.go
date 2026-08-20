@@ -71,7 +71,9 @@ func (s *JobStore) List() ([]*Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	var jobs []*Job
+	// Start with an empty (non-nil) slice so an empty store marshals to "[]"
+	// rather than "null" over the API.
+	jobs := []*Job{}
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue

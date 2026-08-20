@@ -136,6 +136,31 @@ func TestServicePauseResumeStop(t *testing.T) {
 	}
 }
 
+func TestServiceStopOnTerminalIsNoop(t *testing.T) {
+	svc, _ := newTestService(t, nil)
+	// "changeme123" hits the placeholder gate -> dud (terminal) on Start.
+	j, err := svc.Flag("https://github.com/o/r", "a.env", "Generic Key", "changeme123", "", 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Start(j.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := svc.Jobs.Get(j.ID)
+	if got.State != StateDud {
+		t.Fatalf("expected dud, got %s", got.State)
+	}
+	// Stop on a terminal verdict state must be a no-op, not an error, so the
+	// web API can safely stop jobs that already gate-short-circuited.
+	if err := svc.Stop(j.ID); err != nil {
+		t.Fatalf("stop on terminal state must be a no-op: %v", err)
+	}
+	after, _ := svc.Jobs.Get(j.ID)
+	if after.State != StateDud {
+		t.Fatalf("state changed by no-op stop: %s", after.State)
+	}
+}
+
 func TestServiceArchive(t *testing.T) {
 	svc, root := newTestService(t, nil)
 	j, _ := svc.Flag("https://github.com/o/r", "a.env", "Generic Key", "sk-a", "", 0, false)

@@ -235,14 +235,21 @@ func (s *Service) Resume(id string) error {
 	return nil
 }
 
-// Stop transitions any active state -> cancelled.
+// Stop transitions any active state -> cancelled. A job that already reached
+// a terminal verdict state (dud/done/failed) needs no stopping: Stop returns
+// nil as a no-op so operators can safely stop after a gate short-circuit.
+// Stopping an already-cancelled job is still an error (operator already did
+// it).
 func (s *Service) Stop(id string) error {
 	j, err := s.Jobs.Get(id)
 	if err != nil {
 		return err
 	}
-	if j.State == StateCancelled {
+	switch j.State {
+	case StateCancelled:
 		return fmt.Errorf("job %s is already cancelled", id)
+	case StateDud, StateDone, StateFailed:
+		return nil // already finished; nothing to stop
 	}
 	if err := Transition(j.State, StateCancelled); err != nil {
 		return err
