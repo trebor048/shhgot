@@ -17,15 +17,17 @@ var dudVerdicts = map[string]bool{
 // Service is the app-side facade over the job store, case store,
 // notifications, clone pool, and Stage-0 gate.
 type Service struct {
-	Jobs    *JobStore
-	Cases   *CaseStore
-	Notify  *NotifyStore
-	Pool    *ClonePool
-	Gate    *Gate
-	Webhook string
-	BaseURL string
-	root    string
-	onEvent func(job *Job)
+	Jobs      *JobStore
+	Cases     *CaseStore
+	Notify    *NotifyStore
+	Pool      *ClonePool
+	Gate      *Gate
+	Webhook   string
+	BaseURL   string
+	root      string
+	onEvent   func(job *Job)
+	watchDone chan struct{}
+	emitted   map[string]State
 }
 
 // NewService wires the stores and pool together. cloneFn is the real clone
@@ -46,7 +48,7 @@ func NewService(root, webhook, baseURL string, cloneFn CloneFn, gate *Gate) (*Se
 	if cloneFn == nil {
 		cloneFn = func(dst, url string) error { return fmt.Errorf("no clone implementation configured") }
 	}
-	return &Service{
+	svc := &Service{
 		Jobs:    js,
 		Cases:   cs,
 		Notify:  ns,
@@ -55,7 +57,9 @@ func NewService(root, webhook, baseURL string, cloneFn CloneFn, gate *Gate) (*Se
 		Webhook: webhook,
 		BaseURL: baseURL,
 		root:    root,
-	}, nil
+	}
+	svc.emitted = map[string]State{}
+	return svc, nil
 }
 
 // SetOnEvent registers a callback fired whenever a job changes. The web
