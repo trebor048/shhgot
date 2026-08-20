@@ -861,6 +861,31 @@ func isPasswordFamilySignature(name string) bool {
 	return strings.Contains(lower, "password") || strings.Contains(lower, "passwd") || strings.Contains(lower, "pwd")
 }
 
+// isDocSkillPath reports whether a repo-relative path points at AI-agent
+// skill/instruction files (.agents/skills, .cursor/rules, .github/skills, ...).
+// Those files are documentation: secrets inside them are examples, not findings.
+func isDocSkillPath(rel string) bool {
+	lower := strings.ToLower(rel)
+	for _, seg := range []string{"/.agents/", "/.cursor/", "/.claude/", "/skills/", "/rules/", "/prompts/"} {
+		if strings.Contains(lower, seg) {
+			return true
+		}
+	}
+	return strings.HasPrefix(lower, ".agents/") || strings.HasPrefix(lower, ".cursor/") || strings.HasPrefix(lower, ".claude/")
+}
+
+// hasCompletePemBlock reports whether the content contains a PEM footer
+// ("-----END") after its header. A bare "-----BEGIN ...-----" line with no
+// closing footer is a doc fragment/example, not a real key.
+func hasCompletePemBlock(contents string) bool {
+	lower := strings.ToLower(contents)
+	begin := strings.Index(lower, "-----begin")
+	if begin < 0 {
+		return false
+	}
+	return strings.Index(lower[begin:], "-----end") > 0
+}
+
 func checkSignatures(dir string, url string, ref string, stars int, source core.GitResourceType) (matchedAny bool) {
 	for _, file := range core.GetMatchingFiles(dir) {
 		// Env files whose only assignments are public VITE_* variables (Vite
@@ -920,6 +945,16 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 							// Test fixtures (e.g. backend/tests/*) overwhelmingly
 							// contain fake placeholder passwords — skip them.
 							if isPasswordFamilySignature(signature.Name()) && isTestFixturePath(relativeFileName) {
+								continue
+							}
+							// AI-agent skill/instruction files are documentation:
+							// any secret shown inside them is an example, not a finding.
+							if isDocSkillPath(relativeFileName) {
+								continue
+							}
+							// A PEM header with no closing footer is a doc fragment,
+							// not a key (e.g. "-----BEGIN PRIVATE KEY-----" in a tutorial).
+							if strings.HasPrefix(matches[0], "-----BEGIN") && !hasCompletePemBlock(string(file.Contents)) {
 								continue
 							}
 							count := len(matches)
