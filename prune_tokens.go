@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/eth0izzle/shhgit/core"
+	"github.com/trebor048/shhgot/core"
 )
 
 // GitHub token pruning.

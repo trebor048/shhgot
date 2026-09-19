@@ -18,7 +18,7 @@ var (
 	httpClient = &http.Client{
 		Timeout: 10 * time.Second,
 	}
-	
+
 	// Global webhook queue for rate limiting and retry
 	globalWebhookQueue *WebhookQueue
 	webhookQueueOnce   sync.Once
@@ -173,7 +173,7 @@ func ValidateDiscordWebhook(webhookURL string) bool {
 			},
 		},
 	}
-	
+
 	jsonData, err := json.Marshal(testPayload)
 	if err != nil {
 		fmt.Printf("[ERROR] Failed to marshal validation payload: %v\n", err)
@@ -521,12 +521,12 @@ func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, m
 	if len(matchesStr) > 1000 {
 		matchesStr = matchesStr[:997] + "..."
 	}
-	
+
 	// For filename-based matches, show the filename if no content matches
 	if len(matchesStr) == 0 || matchesStr == "" {
 		matchesStr = fmt.Sprintf("Filename: %s", file)
 	}
-	
+
 	// Generate GitHub link - only add line anchor if we have a valid line number
 	var githubLink string
 	if len(matches) > 0 && fileContent != "" {
@@ -541,18 +541,17 @@ func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, m
 		// No matches or content, link to file without anchor
 		githubLink = generateGitHubBlobLinkNoAnchor(url, file)
 	}
-	
+
 	// Enhanced message format with clear signature match display
-	message := fmt.Sprintf("**%s** | Priority: %d\n**File:** [%s](%s)\n**Repository:** %s\n\n**<match>**\n```\n%s\n```", 
+	message := fmt.Sprintf("**%s** | Priority: %d\n**File:** [%s](%s)\n**Repository:** %s\n\n**<match>**\n```\n%s\n```",
 		signature, priority, file, githubLink, url, matchesStr)
-	
+
 	// For .env files, embed FULL file content (match all .env variants)
-	isEnvFile := fileContent != "" && (
-		strings.HasSuffix(strings.ToLower(file), ".env") ||
+	isEnvFile := fileContent != "" && (strings.HasSuffix(strings.ToLower(file), ".env") ||
 		strings.Contains(strings.ToLower(file), ".env.") ||
 		strings.HasPrefix(strings.ToLower(filepath.Base(file)), "env.") ||
 		filepath.Base(strings.ToLower(file)) == ".env")
-	
+
 	if isEnvFile {
 		// Embed FULL file content for .env files (no truncation)
 		message += "\n**📄 .env File Content:**\n```env\n" + fileContent + "\n```"
@@ -589,7 +588,7 @@ func sendDiscordMatchWebhook(webhookURL string, url string, signature string, fi
 
 	// Create Discord embed payload
 	fields := []map[string]interface{}{}
-	
+
 	// Add signature match section with clear formatting
 	if len(matchesStr) == 0 || matchesStr == "" {
 		// For filename-based matches (like .env files), show the filename
@@ -612,18 +611,17 @@ func sendDiscordMatchWebhook(webhookURL string, url string, signature string, fi
 
 	// For .env files, embed the FULL content in code blocks (no truncation)
 	// Match any .env file: .env, .env.local, .env.production, env.staging, etc.
-	isEnvFile := fileContent != "" && (
-		strings.HasSuffix(strings.ToLower(file), ".env") ||
+	isEnvFile := fileContent != "" && (strings.HasSuffix(strings.ToLower(file), ".env") ||
 		strings.Contains(strings.ToLower(file), ".env.") ||
 		strings.HasPrefix(strings.ToLower(filepath.Base(file)), "env.") ||
 		filepath.Base(strings.ToLower(file)) == ".env")
-	
+
 	if isEnvFile {
 		// Discord has a 6000 character limit per embed description
 		// and 1024 character limit per field value
 		// We'll split the content across multiple fields if needed
 		const maxFieldLength = 900 // Leave room for code block markers
-		
+
 		if len(fileContent) <= maxFieldLength {
 			// Single field if content is small enough
 			fields = append(fields, map[string]interface{}{
@@ -663,7 +661,7 @@ func sendDiscordMatchWebhook(webhookURL string, url string, signature string, fi
 	}
 
 	// Create description with clickable link
-	description := fmt.Sprintf("**Priority:** %d\n**File:** [%s](%s)\n**Repository:** %s", 
+	description := fmt.Sprintf("**Priority:** %d\n**File:** [%s](%s)\n**Repository:** %s",
 		priority, file, githubLink, url)
 
 	embed := map[string]interface{}{

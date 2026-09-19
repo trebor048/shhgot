@@ -44,13 +44,13 @@ func StartCloudflaredTunnel(config *TunnelConfig) error {
 
 	// Start the tunnel and capture its output
 	cmd = exec.Command("cloudflared", "tunnel", "run", config.TunnelName)
-	
+
 	// Capture stdout/stderr to monitor for the tunnel URL
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		log.Printf("[TUNNEL] Error creating stdout pipe: %v", err)
 	}
-	
+
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		log.Printf("[TUNNEL] Error creating stderr pipe: %v", err)
@@ -78,15 +78,17 @@ func StartCloudflaredTunnel(config *TunnelConfig) error {
 // monitorTunnelOutput monitors cloudflared output for the tunnel URL
 func monitorTunnelOutput(stdout, stderr interface{}, tunnelName string) {
 	urlFound := false
-	
+
 	// Monitor stdout
 	if stdout != nil {
 		go func() {
-			scanner := bufio.NewScanner(stdout.(interface{ Read(p []byte) (n int, err error) }))
+			scanner := bufio.NewScanner(stdout.(interface {
+				Read(p []byte) (n int, err error)
+			}))
 			for scanner.Scan() {
 				line := scanner.Text()
 				fmt.Println("[TUNNEL OUT]", line)
-				
+
 				if !urlFound {
 					if url := extractURLFromLog(line); url != "" {
 						printTunnelURL(url)
@@ -100,11 +102,13 @@ func monitorTunnelOutput(stdout, stderr interface{}, tunnelName string) {
 	// Monitor stderr
 	if stderr != nil {
 		go func() {
-			scanner := bufio.NewScanner(stderr.(interface{ Read(p []byte) (n int, err error) }))
+			scanner := bufio.NewScanner(stderr.(interface {
+				Read(p []byte) (n int, err error)
+			}))
 			for scanner.Scan() {
 				line := scanner.Text()
 				fmt.Println("[TUNNEL ERR]", line)
-				
+
 				if !urlFound {
 					if url := extractURLFromLog(line); url != "" {
 						printTunnelURL(url)
@@ -181,7 +185,7 @@ func extractTunnelName(url string) string {
 	// Remove https:// prefix
 	url = strings.TrimPrefix(url, "https://")
 	url = strings.TrimPrefix(url, "http://")
-	
+
 	// Get the part before .cfargotunnel.com
 	parts := strings.Split(url, ".")
 	if len(parts) > 0 {

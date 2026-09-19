@@ -24,18 +24,18 @@ func FastWalk(root string, walkFn func(path string, info os.FileInfo, err error)
 	if maxWorkers <= 0 {
 		maxWorkers = 4 // Default to 4 parallel workers
 	}
-	
+
 	type walkItem struct {
 		path string
 		info os.FileInfo
 		err  error
 	}
-	
+
 	// Buffered channel for discovered items
 	items := make(chan walkItem, 1000)
 	var wg sync.WaitGroup
 	var walkErr atomic.Value
-	
+
 	// Worker pool to process items
 	for i := 0; i < maxWorkers; i++ {
 		wg.Add(1)
@@ -49,7 +49,7 @@ func FastWalk(root string, walkFn func(path string, info os.FileInfo, err error)
 			}
 		}()
 	}
-	
+
 	// Single goroutine to walk directory tree and feed workers
 	go func() {
 		filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -57,15 +57,15 @@ func FastWalk(root string, walkFn func(path string, info os.FileInfo, err error)
 			if e := walkErr.Load(); e != nil {
 				return filepath.SkipDir
 			}
-			
+
 			items <- walkItem{path, info, err}
 			return nil
 		})
 		close(items)
 	}()
-	
+
 	wg.Wait()
-	
+
 	if e := walkErr.Load(); e != nil {
 		return e.(error)
 	}
@@ -103,13 +103,13 @@ func (ds *DirectoryScanner) ScanDirectory(dir string) []MatchFile {
 func (ds *DirectoryScanner) ScanDirectoryWithOptions(dir string, maxFileSize uint, blacklistedExts []string, blacklistedPaths []string) []MatchFile {
 	var files []MatchFile
 	var mu sync.Mutex
-	
+
 	// Pre-build maps for faster lookups
 	extMap := make(map[string]bool, len(blacklistedExts))
 	for _, ext := range blacklistedExts {
 		extMap[strings.ToLower(ext)] = true
 	}
-	
+
 	pathIndicators := make([]string, len(blacklistedPaths))
 	for i, path := range blacklistedPaths {
 		pathIndicators[i] = strings.Replace(path, "{sep}", string(os.PathSeparator), -1)
@@ -146,7 +146,7 @@ func (ds *DirectoryScanner) ScanDirectoryWithOptions(dir string, maxFileSize uin
 // Optimized with parallel counting
 func (ds *DirectoryScanner) GetFileCount(dir string) int {
 	var count int64
-	
+
 	FastWalk(dir, func(path string, f os.FileInfo, err error) error {
 		if err != nil || f.IsDir() {
 			return nil
@@ -154,7 +154,7 @@ func (ds *DirectoryScanner) GetFileCount(dir string) int {
 		atomic.AddInt64(&count, 1)
 		return nil
 	}, 4)
-	
+
 	return int(count)
 }
 
@@ -162,7 +162,7 @@ func (ds *DirectoryScanner) GetFileCount(dir string) int {
 // Optimized with parallel size calculation
 func (ds *DirectoryScanner) GetDirectorySize(dir string) int64 {
 	var size int64
-	
+
 	FastWalk(dir, func(path string, f os.FileInfo, err error) error {
 		if err != nil || f.IsDir() {
 			return nil
@@ -170,7 +170,7 @@ func (ds *DirectoryScanner) GetDirectorySize(dir string) int64 {
 		atomic.AddInt64(&size, f.Size())
 		return nil
 	}, 4)
-	
+
 	return size
 }
 
@@ -181,20 +181,20 @@ func ReadFileOptimized(path string) ([]byte, error) {
 		return nil, err
 	}
 	defer file.Close()
-	
+
 	stat, err := file.Stat()
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Pre-allocate buffer to exact size
 	buf := make([]byte, stat.Size())
 	reader := bufio.NewReaderSize(file, 64*1024) // 64KB buffer
-	
+
 	_, err = reader.Read(buf)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return buf, nil
 }

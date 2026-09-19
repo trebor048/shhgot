@@ -12,20 +12,20 @@ import (
 
 // RegexPattern represents a compiled regex pattern with metadata
 type RegexPattern struct {
-	Original    string
-	Pattern     *regexp.Regexp
-	Name        string
-	Priority    int
-	Part        string // "contents", "filename", "path"
-	IsCompiled  bool
-	Error       string
+	Original   string
+	Pattern    *regexp.Regexp
+	Name       string
+	Priority   int
+	Part       string // "contents", "filename", "path"
+	IsCompiled bool
+	Error      string
 }
 
 // RegexOptimizer handles compiled pattern caching and parallel matching
 type RegexOptimizer struct {
 	patterns         map[string]*RegexPattern
-	patternsList     []*RegexPattern          // Pre-allocated slice for iteration
-	priorityPatterns [][]*RegexPattern        // Patterns grouped by priority (0-3)
+	patternsList     []*RegexPattern   // Pre-allocated slice for iteration
+	priorityPatterns [][]*RegexPattern // Patterns grouped by priority (0-3)
 	cache            *FastLRUCache
 	mu               sync.RWMutex
 	maxWorkers       int
@@ -63,7 +63,7 @@ var GlobalRegexOptimizer *RegexOptimizer
 func InitGlobalOptimizer(maxWorkers int, cacheSize int, timeoutMs int, enableCache bool) {
 	if GlobalRegexOptimizer == nil {
 		GlobalRegexOptimizer = NewRegexOptimizer(maxWorkers, cacheSize, timeoutMs, enableCache)
-		log.Printf("[REGEX] Global optimizer initialized: %d workers, cache=%d, timeout=%dms", 
+		log.Printf("[REGEX] Global optimizer initialized: %d workers, cache=%d, timeout=%dms",
 			maxWorkers, cacheSize, timeoutMs)
 	}
 }
@@ -73,7 +73,7 @@ func NewRegexOptimizer(maxWorkers int, cacheSize int, timeoutMs int, enableCache
 	ro := &RegexOptimizer{
 		patterns:         make(map[string]*RegexPattern),
 		patternsList:     make([]*RegexPattern, 0, 200), // Pre-allocate for ~200 patterns
-		priorityPatterns: make([][]*RegexPattern, 4),     // Priority 0-3
+		priorityPatterns: make([][]*RegexPattern, 4),    // Priority 0-3
 		cache:            NewFastLRUCache(cacheSize),
 		maxWorkers:       maxWorkers,
 		timeoutMs:        timeoutMs,
@@ -138,7 +138,7 @@ func (ro *RegexOptimizer) CompilePattern(patternStr string, name string, priorit
 
 	ro.patterns[patternStr] = pattern
 	ro.patternsList = append(ro.patternsList, pattern)
-	
+
 	// Add to priority bucket (clamp to 0-3)
 	if priority < 0 {
 		priority = 0
@@ -146,7 +146,7 @@ func (ro *RegexOptimizer) CompilePattern(patternStr string, name string, priorit
 		priority = 3
 	}
 	ro.priorityPatterns[priority] = append(ro.priorityPatterns[priority], pattern)
-	
+
 	ro.compiledCount++
 
 	return pattern, nil
@@ -164,12 +164,12 @@ func generateCacheKey(patternName string, text string) string {
 		sb.WriteString(text)
 		return sb.String()
 	}
-	
+
 	// For long strings, use hash
 	h := sha256.New()
 	h.Write([]byte(text))
 	hash := base64.RawURLEncoding.EncodeToString(h.Sum(nil))[:16]
-	
+
 	var sb strings.Builder
 	sb.Grow(len(patternName) + 1 + 16)
 	sb.WriteString(patternName)
@@ -198,7 +198,7 @@ func (ro *RegexOptimizer) MatchString(pattern *RegexPattern, text string) (bool,
 
 		// Cache the result (non-blocking)
 		ro.cache.Set(cacheKey, result)
-		
+
 		return result, nil
 	}
 
@@ -218,7 +218,7 @@ func (ro *RegexOptimizer) FindAllString(pattern *RegexPattern, text string, n in
 // ParallelMatch matches patterns with priority-based early exit
 func (ro *RegexOptimizer) ParallelMatch(patterns []*RegexPattern, text string) map[string]bool {
 	results := make(map[string]bool, len(patterns))
-	
+
 	// Use pre-allocated patterns list for better performance
 	if len(patterns) == 0 {
 		ro.mu.RLock()
@@ -271,13 +271,13 @@ func (ro *RegexOptimizer) ParallelMatch(patterns []*RegexPattern, text string) m
 // BatchMatch processes multiple patterns sequentially (no goroutines for small batches)
 func (ro *RegexOptimizer) BatchMatch(patterns []*RegexPattern, text string) map[string]bool {
 	results := make(map[string]bool, len(patterns))
-	
+
 	for _, pattern := range patterns {
 		if matched, err := ro.MatchString(pattern, text); err == nil {
 			results[pattern.Name] = matched
 		}
 	}
-	
+
 	return results
 }
 
@@ -288,7 +288,7 @@ func (ro *RegexOptimizer) Stats() map[string]interface{} {
 
 	hits := atomic.LoadInt64(&ro.hits)
 	misses := atomic.LoadInt64(&ro.misses)
-	
+
 	hitRate := float64(0)
 	totalHits := hits + misses
 	if totalHits > 0 {
@@ -332,7 +332,7 @@ func (c *FastLRUCache) Get(key string) (bool, bool) {
 	c.mu.RLock()
 	entry, ok := c.cache[key]
 	c.mu.RUnlock()
-	
+
 	if !ok {
 		return false, false
 	}
@@ -341,7 +341,7 @@ func (c *FastLRUCache) Get(key string) (bool, bool) {
 	c.mu.Lock()
 	c.moveToFront(entry)
 	c.mu.Unlock()
-	
+
 	return entry.value, true
 }
 
@@ -418,7 +418,7 @@ func (c *FastLRUCache) evictLRU() {
 
 	// Remove tail (LRU)
 	delete(c.cache, c.tail.key)
-	
+
 	if c.tail.prev != nil {
 		c.tail.prev.next = nil
 		c.tail = c.tail.prev
@@ -445,5 +445,3 @@ func (c *FastLRUCache) Clear() {
 	c.tail = nil
 	atomic.StoreInt32(&c.size, 0)
 }
-
-

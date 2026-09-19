@@ -10,33 +10,33 @@ import (
 	"strings"
 	"time"
 
-	"github.com/eth0izzle/shhgit/core"
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/trebor048/shhgot/core"
 )
 
 // WebServerConfig holds configuration for the web server
 type WebServerConfig struct {
-	Host           string
-	Port           string
-	EnableTLS      bool
-	CertFile       string
-	KeyFile        string
-	EnableAuth     bool
+	Host            string
+	Port            string
+	EnableTLS       bool
+	CertFile        string
+	KeyFile         string
+	EnableAuth      bool
 	RateLimitPerSec float64
-	EnableTunnel   bool
-	TunnelName     string
+	EnableTunnel    bool
+	TunnelName      string
 }
 
 // MatchPage represents a paginated response of matches
 type MatchPage struct {
 	Matches    []*Match `json:"matches"`
 	Pagination struct {
-		Page       int `json:"page"`
-		Limit      int `json:"limit"`
-		Total      int `json:"total"`
-		TotalPages int `json:"total_pages"`
+		Page       int  `json:"page"`
+		Limit      int  `json:"limit"`
+		Total      int  `json:"total"`
+		TotalPages int  `json:"total_pages"`
 		HasNext    bool `json:"has_next"`
 		HasPrev    bool `json:"has_prev"`
 	} `json:"pagination"`
@@ -300,10 +300,10 @@ func HealthCheck(w http.ResponseWriter, r *http.Request) {
 	hub.matchesMutex.RUnlock()
 
 	health := map[string]interface{}{
-		"status":   "ok",
+		"status":    "ok",
 		"timestamp": time.Now(),
-		"matches": matchCount,
-		"uptime":   time.Since(startTime).Seconds(),
+		"matches":   matchCount,
+		"uptime":    time.Since(startTime).Seconds(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")

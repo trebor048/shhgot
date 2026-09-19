@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/eth0izzle/shhgit/core"
+	"github.com/trebor048/shhgot/core"
 )
 
 // ChatMessage is one turn of the AI-review conversation. Role is "system",

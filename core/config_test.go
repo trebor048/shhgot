@@ -84,10 +84,10 @@ func TestPerfTuning(t *testing.T) {
 
 	// Config values are honored.
 	s := &Session{Config: &Config{Performance: PerformanceConfig{
-		APIPerPage:      intPtr(50),
+		APIPerPage:       intPtr(50),
 		APIPagesPerCycle: intPtr(7),
-		WorkerPoolSize:  intPtr(64),
-		APISleepSeconds: intPtr(2),
+		WorkerPoolSize:   intPtr(64),
+		APISleepSeconds:  intPtr(2),
 	}}}
 	perPage, sleep, maxPages, pool = perfTuning(s)
 	if perPage != 50 || sleep != 2*time.Second || maxPages != 7 || pool != 64 {
@@ -96,10 +96,10 @@ func TestPerfTuning(t *testing.T) {
 
 	// Floors: per_page capped at 100, sleep floored at 1s, out-of-range clamps.
 	s = &Session{Config: &Config{Performance: PerformanceConfig{
-		APIPerPage:      intPtr(500),
+		APIPerPage:       intPtr(500),
 		APIPagesPerCycle: intPtr(0),
-		WorkerPoolSize:  intPtr(0),
-		APISleepSeconds: intPtr(-3),
+		WorkerPoolSize:   intPtr(0),
+		APISleepSeconds:  intPtr(-3),
 	}}}
 	perPage, sleep, maxPages, pool = perfTuning(s)
 	if perPage != 100 {

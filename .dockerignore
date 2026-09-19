@@ -1,5 +1,51 @@
-Dockerfile
-LICENSE
-README.md
+# Keep the build context small and make sure secrets never reach an image layer.
+.git
+.gitignore
+.github
+
+# Real config and env — never bake these in. The example is kept for the image.
 config.yaml
-images/
+config.yaml.*
+!config.yaml.example
+.env
+.env.*
+
+# Build output and dependencies
+shhgit
+shhgit.exe
+shhgit-*
+frontend/node_modules
+node_modules
+dist
+build
+vendor
+
+# Runtime data
+logs
+run.log
+*.log
+found_keys_*.txt
+remote_connection_strings.txt
+
+# Local/agent workspace state
+ai_review
+aireview/jobs
+.swarm
+.opencode
+.superpowers
+yamlcheck
+docs
+
+# Scratch
+*.bak
+*.orig
+_*.txt
+_*.html
+
+# Not needed at runtime
+Makefile
+Dockerfile
+docker-compose.yml
+README.md
+LICENSE
+images

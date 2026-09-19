@@ -504,7 +504,6 @@ func hasGoodEntropy(s string) bool {
 	return count >= 2
 }
 
-
 // min returns the minimum of two integers
 func min(a, b int) int {
 	if a < b {

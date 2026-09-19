@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/eth0izzle/shhgit/core"
+	"github.com/trebor048/shhgot/core"
 )
 
 func TestDefaultAIChatConfig(t *testing.T) {

@@ -1,278 +1,268 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# shhgit — one-shot installer for Linux and macOS
+# ==============================================
+# Checks/installs Go, gets the source, builds the shhgit binary and creates
+# config.yaml from the example. No Docker required.
+#
+#   ./install.sh                 # install into ./ (or clone into $HOME/shhgit)
+#   INSTALL_DIR=~/tools/shhgit ./install.sh
+#   ./install.sh --no-build      # set up source + config only
+#   ./install.sh --docker        # print the Docker route instead
+#
+# One-liner:
+#   curl -fsSL https://raw.githubusercontent.com/trebor048/shhgot/main/install.sh | bash
+#
+set -euo pipefail
 
-set -e
+REPO_URL="https://github.com/trebor048/shhgot.git"
+REPO_SLUG="trebor048/shhgot"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/shhgit}"
+BINARY="shhgit"
+DO_BUILD=1
+DOCKER_MODE=0
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# Fallback if go.mod cannot be read; keep in sync with the `go` directive.
+FALLBACK_GO_VERSION="1.26.0"
 
-# Functions
-print_header() {
-    echo -e "${BLUE}╔════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║${NC}  $1"
-    echo -e "${BLUE}╚════════════════════════════════════════════════════════════════╝${NC}"
+# ── Output helpers ─────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+    BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+    RED='\033[0;31m'; BLUE='\033[0;34m'; NC='\033[0m'
+else
+    BOLD=''; GREEN=''; YELLOW=''; RED=''; BLUE=''; NC=''
+fi
+
+log()  { printf "${GREEN}[ok]${NC} %s\n" "$1"; }
+info() { printf "${BLUE}[..]${NC} %s\n" "$1"; }
+warn() { printf "${YELLOW}[!]${NC} %s\n" "$1"; }
+fail() { printf "${RED}[x]${NC} %s\n" "$1" >&2; exit 1; }
+step() { printf "\n${BOLD}%s${NC}\n" "$1"; }
+
+# ── Argument parsing ───────────────────────────────────────────────────────
+for arg in "$@"; do
+    case "$arg" in
+        --no-build) DO_BUILD=0 ;;
+        --docker)   DOCKER_MODE=1 ;;
+        -h|--help)
+            sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        *) fail "unknown argument: $arg (try --help)" ;;
+    esac
+done
+
+# ── Platform detection ─────────────────────────────────────────────────────
+detect_platform() {
+    OS="$(uname -s)"
+    case "$OS" in
+        Linux)  GOOS="linux" ;;
+        Darwin) GOOS="darwin" ;;
+        *)      fail "unsupported OS: $OS. On Windows use WSL2, or the Docker route (--docker)." ;;
+    esac
+
+    ARCH="$(uname -m)"
+    case "$ARCH" in
+        x86_64|amd64)   GOARCH="amd64" ;;
+        arm64|aarch64)  GOARCH="arm64" ;;
+        *)              fail "unsupported architecture: $ARCH" ;;
+    esac
+
+    log "platform: $GOOS/$GOARCH"
 }
 
-print_success() {
-    echo -e "${GREEN}✓${NC} $1"
+# Portable "is $1 >= $2" for dotted versions (no GNU sort -V on macOS).
+version_ge() {
+    awk -v have="$1" -v want="$2" 'BEGIN {
+        h = split(have, H, "."); w = split(want, W, ".");
+        for (i = 1; i <= 3; i++) {
+            if ((H[i] + 0) > (W[i] + 0)) exit 0;
+            if ((H[i] + 0) < (W[i] + 0)) exit 1;
+        }
+        exit 0;
+    }'
 }
 
-print_error() {
-    echo -e "${RED}✗${NC} $1"
+# Read the Go version the project actually requires from go.mod.
+required_go_version() {
+    if [ -f go.mod ]; then
+        awk '/^go /{print $2; exit}' go.mod
+    else
+        echo "$FALLBACK_GO_VERSION"
+    fi
 }
 
-print_warning() {
-    echo -e "${YELLOW}⚠${NC} $1"
-}
+# ── Step 1: Go toolchain ───────────────────────────────────────────────────
+ensure_go() {
+    step "1/4  Go toolchain"
 
-print_info() {
-    echo -e "${BLUE}ℹ${NC} $1"
-}
+    local want
+    want="$(required_go_version)"
+    [ -n "$want" ] || want="$FALLBACK_GO_VERSION"
 
-check_root() {
-    if [ "$EUID" -eq 0 ]; then
+    if command -v go >/dev/null 2>&1; then
+        local have
+        have="$(go version | awk '{print $3}' | sed 's/^go//')"
+        if version_ge "$have" "$want"; then
+            log "Go $have found (project needs >= $want)"
+            return 0
+        fi
+        warn "Go $have is too old — this project needs >= $want."
+    else
+        info "Go is not installed (project needs >= $want)."
+    fi
+
+    if [ "$GOOS" = "darwin" ] && command -v brew >/dev/null 2>&1; then
+        info "Installing Go with Homebrew..."
+        brew install go || fail "brew install go failed. Install Go manually from https://go.dev/dl/"
+        log "Go installed: $(go version)"
         return 0
-    else
-        return 1
     fi
+
+    info "Downloading Go $want for $GOOS/$GOARCH ..."
+    local tarball="/tmp/go${want}.${GOOS}-${GOARCH}.tar.gz"
+    local url="https://go.dev/dl/go${want}.${GOOS}-${GOARCH}.tar.gz"
+
+    if ! curl -fsSL "$url" -o "$tarball"; then
+        fail "could not download Go $want from $url
+       Install Go >= $want manually (https://go.dev/dl/) and re-run this script."
+    fi
+
+    info "Extracting to /usr/local (needs sudo)..."
+    sudo rm -rf /usr/local/go
+    sudo tar -C /usr/local -xzf "$tarball"
+    rm -f "$tarball"
+
+    export PATH="/usr/local/go/bin:$PATH"
+    for rc in "$HOME/.profile" "$HOME/.zshrc"; do
+        [ -f "$rc" ] || continue
+        grep -q '/usr/local/go/bin' "$rc" 2>/dev/null || \
+            echo 'export PATH="/usr/local/go/bin:$PATH"' >> "$rc"
+    done
+
+    command -v go >/dev/null 2>&1 || fail "Go installed but not on PATH. Open a new shell and re-run."
+    log "Go installed: $(go version)"
 }
 
-# Main installation
-main() {
-    print_header "shhgit Installation Script"
-    
-    # Detect OS
-    if [[ ! "$OSTYPE" == "linux-gnu"* ]]; then
-        print_error "This script only supports Linux"
-        echo "Detected OS: $OSTYPE"
-        exit 1
+# ── Step 2: Source checkout ────────────────────────────────────────────────
+ensure_source() {
+    step "2/4  Source code"
+
+    # Already inside a shhgit checkout? (check the module path, not the name)
+    if [ -f go.mod ] && grep -q "shhgot\|shhgit" go.mod 2>/dev/null; then
+        INSTALL_DIR="$(pwd)"
+        log "using existing checkout: $INSTALL_DIR"
+        return 0
     fi
-    
-    print_info "Detected Linux system"
-    
-    # Check if running as root or with sudo
-    if ! check_root; then
-        print_warning "This script needs sudo privileges"
-        print_info "Re-running with sudo..."
-        sudo bash "$0"
-        exit $?
-    fi
-    
-    print_header "Step 1: Checking Prerequisites"
-    
-    # Check Docker
-    if ! command -v docker &> /dev/null; then
-        print_error "Docker is not installed"
-        print_info "Installing Docker..."
-        curl -fsSL https://get.docker.com -o get-docker.sh
-        sudo sh get-docker.sh
-        sudo usermod -aG docker "$SUDO_USER"
-        print_success "Docker installed"
+
+    command -v git >/dev/null 2>&1 || fail "git is required. Install git and re-run."
+
+    if [ -d "$INSTALL_DIR/.git" ]; then
+        info "Updating existing checkout at $INSTALL_DIR ..."
+        git -C "$INSTALL_DIR" pull --ff-only || warn "could not update; using what is on disk"
     else
-        print_success "Docker is installed: $(docker --version)"
+        info "Cloning $REPO_SLUG into $INSTALL_DIR ..."
+        mkdir -p "$(dirname "$INSTALL_DIR")"
+        git clone --depth 1 "$REPO_URL" "$INSTALL_DIR" || fail "git clone failed"
     fi
-    
-    # Check Docker Compose
-    if ! command -v docker-compose &> /dev/null; then
-        print_error "Docker Compose is not installed"
-        print_info "Installing Docker Compose..."
-        sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-        sudo chmod +x /usr/local/bin/docker-compose
-        print_success "Docker Compose installed"
-    else
-        print_success "Docker Compose is installed: $(docker-compose --version)"
-    fi
-    
-    # Check Git
-    if ! command -v git &> /dev/null; then
-        print_error "Git is not installed"
-        print_info "Installing Git..."
-        apt-get update -qq
-        apt-get install -y git >/dev/null 2>&1
-        print_success "Git installed"
-    else
-        print_success "Git is installed: $(git --version)"
-    fi
-    
-    print_header "Step 2: Cloning Repository"
-    
-    # Determine installation directory
-    INSTALL_DIR="${INSTALL_DIR:-.}"
-    if [ "$INSTALL_DIR" = "." ]; then
-        INSTALL_DIR="$PWD"
-    fi
-    
-    # Check if already in shhgit directory
-    if [ -f "go.mod" ] && grep -q "shhgit" go.mod 2>/dev/null; then
-        print_info "Already in shhgit directory: $PWD"
-        INSTALL_DIR="$PWD"
-    else
-        print_info "Installation directory: $INSTALL_DIR"
-        SHHGIT_DIR="$INSTALL_DIR/shhgit"
-        
-        if [ -d "$SHHGIT_DIR" ]; then
-            print_warning "Directory $SHHGIT_DIR already exists"
-            read -p "Use existing directory? (y/n) " -n 1 -r
-            echo
-            if [[ $REPLY =~ ^[Yy]$ ]]; then
-                INSTALL_DIR="$SHHGIT_DIR"
-            else
-                print_error "Installation cancelled"
-                exit 1
-            fi
-        else
-            print_info "Cloning shhgit..."
-            git clone https://github.com/eth0izzle/shhgit "$SHHGIT_DIR"
-            INSTALL_DIR="$SHHGIT_DIR"
-            print_success "Repository cloned"
-        fi
-    fi
-    
+
     cd "$INSTALL_DIR"
-    
-    print_header "Step 3: Configuration"
-    
-    # Copy .env if not exists
-    if [ ! -f ".env" ]; then
-        print_info "Creating .env file..."
-        if [ -f ".env.example" ]; then
-            cp .env.example .env
-            print_success ".env created from .env.example"
-        else
-            print_warning "No .env.example found, creating basic .env..."
-            cat > .env << 'EOF'
-SHHGIT_PORT=8080
-SHHGIT_HOST=0.0.0.0
-JWT_SECRET=change-me-to-random-string
-ENABLE_AUTH=false
-DB_TYPE=postgres
-DB_NAME=shhgit
-DB_USER=shhgit
-DB_PASSWORD=change-me-to-secure-password
-GITHUB_TOKEN=your_github_token_here
-ENABLE_TUNNEL=false
-TUNNEL_NAME=shhgit
-PROMETHEUS_PORT=9090
-GRAFANA_PORT=3000
-GRAFANA_PASSWORD=change-me-to-secure-password
-EOF
-            print_success ".env created"
-        fi
-        
-        # Prompt for essential configuration
-        read -p "Enter GitHub Token (leave empty to skip): " github_token
-        if [ -n "$github_token" ]; then
-            sed -i "s|your_github_token_here|$github_token|g" .env
-            print_success "GitHub token configured"
-        fi
-    else
-        print_info ".env already exists"
-    fi
-    
-    print_header "Step 4: Building Docker Image"
-    
-    # Build Docker image
-    if [ -f "Dockerfile.new" ]; then
-        print_info "Building shhgit Docker image (this may take 5-10 minutes)..."
-        docker build -t shhgit:latest -f Dockerfile.new .
-        print_success "Docker image built"
-    elif [ -f "Dockerfile" ]; then
-        print_info "Building shhgit Docker image (this may take 5-10 minutes)..."
-        docker build -t shhgit:latest .
-        print_success "Docker image built"
-    else
-        print_error "No Dockerfile found"
-        exit 1
-    fi
-    
-    print_header "Step 5: Starting Services"
-    
-    # Ask about Cloudflare Tunnel
-    read -p "Enable Cloudflare Tunnel for remote access? (y/n) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        print_info "Cloudflare Tunnel will be enabled"
-        
-        # Check if cloudflared is installed
-        if ! command -v cloudflared &> /dev/null; then
-            print_warning "cloudflared CLI not found, installing..."
-            curl -L https://pkg.cloudflare.com/cloudflare-release-key.gpg | apt-key add -
-            echo 'deb http://pkg.cloudflare.com/deb focal main' | tee /etc/apt/sources.list.d/cloudflare-main.list
-            apt-get update -qq
-            apt-get install -y cloudflared >/dev/null 2>&1
-            print_success "cloudflared installed"
-        fi
-        
-        sed -i 's|ENABLE_TUNNEL=false|ENABLE_TUNNEL=true|g' .env
-        docker-compose --profile tunnel up -d
-    else
-        docker-compose up -d
-    fi
-    
-    print_success "Services started"
-    
-    print_header "Step 6: Verification"
-    
-    # Wait for services to start
-    print_info "Waiting for services to start (30 seconds)..."
-    sleep 30
-    
-    # Check health
-    if curl -s http://localhost:8080/health >/dev/null 2>&1; then
-        print_success "shhgit is healthy"
-    else
-        print_warning "shhgit is not yet responding, it may still be starting"
-    fi
-    
-    print_header "Installation Complete! 🎉"
-    
-    # Print access information
-    echo ""
-    echo -e "${GREEN}Access your shhgit instance:${NC}"
-    echo ""
-    echo -e "  ${BLUE}Web UI:${NC}         http://localhost:8080"
-    echo -e "  ${BLUE}Prometheus:${NC}     http://localhost:9090"
-    echo -e "  ${BLUE}Grafana:${NC}        http://localhost:3000"
-    echo ""
-    echo -e "${GREEN}Health Check:${NC}"
-    echo "  curl http://localhost:8080/health"
-    echo ""
-    echo -e "${GREEN}View Logs:${NC}"
-    echo "  docker-compose logs -f shhgit"
-    echo ""
-    
-    # Check if Cloudflare Tunnel is enabled
-    if grep -q "ENABLE_TUNNEL=true" .env 2>/dev/null; then
-        echo -e "${GREEN}Cloudflare Tunnel:${NC}"
-        echo "  Your tunnel will be accessible at:"
-        echo "  https://<tunnel-name>.cfargotunnel.com"
-        echo ""
-        echo "  Configure your DNS CNAME record in Cloudflare dashboard:"
-        echo "  Name: <tunnel-name>"
-        echo "  Type: CNAME"
-        echo "  Content: <tunnel-name>.cfargotunnel.com"
-        echo ""
-    fi
-    
-    echo -e "${GREEN}Configuration:${NC}"
-    echo "  Edit .env file to customize settings:"
-    echo "  nano .env"
-    echo ""
-    echo -e "${YELLOW}Next Steps:${NC}"
-    echo "  1. Configure your GitHub token in .env if not done"
-    echo "  2. Access the web UI at http://localhost:8080"
-    echo "  3. Set up Cloudflare Tunnel for remote access (optional)"
-    echo "  4. Create API tokens for authentication"
-    echo ""
-    echo -e "${BLUE}Documentation:${NC}"
-    echo "  Overview:        ./README.md"
-    echo "  Config example:  ./config.yaml.example"
-    echo "  Env example:     ./.env.example"
-    echo ""
+    log "checkout ready: $(pwd)"
 }
 
-# Run main
+# ── Step 3: Build ──────────────────────────────────────────────────────────
+do_build() {
+    step "3/4  Build"
+
+    [ "$DO_BUILD" -eq 1 ] || { warn "skipped (--no-build)"; return 0; }
+
+    export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH"
+    info "Downloading Go modules..."
+    go mod download || fail "go mod download failed (no network?)"
+
+    info "Compiling..."
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$BINARY" . || fail "build failed"
+
+    local size
+    size="$(du -h "$BINARY" 2>/dev/null | cut -f1 || echo '?')"
+    log "built ./$BINARY ($size)"
+}
+
+# ── Step 4: Config ─────────────────────────────────────────────────────────
+configure() {
+    step "4/4  Configuration"
+
+    if [ -f config.yaml ]; then
+        log "config.yaml already exists — leaving it alone"
+    elif [ -f config.yaml.example ]; then
+        cp config.yaml.example config.yaml
+        chmod 600 config.yaml          # it will hold tokens
+        log "created config.yaml from config.yaml.example"
+        warn "add your GitHub token(s) to github_access_tokens before scanning GitHub"
+    else
+        warn "no config.yaml.example found — you will need to create config.yaml yourself"
+    fi
+}
+
+# ── Smoke test ─────────────────────────────────────────────────────────────
+smoke_test() {
+    [ "$DO_BUILD" -eq 1 ] || return 0
+    [ -x "./$BINARY" ] || { warn "binary not executable; skipping smoke test"; return 0; }
+
+    if ./"$BINARY" -h 2>&1 | grep -qi 'usage'; then
+        log "smoke test passed — the binary runs and lists its flags"
+    else
+        warn "could not verify the binary (it may still work)"
+    fi
+}
+
+# ── Summary ────────────────────────────────────────────────────────────────
+summary() {
+    printf "\n${GREEN}${BOLD}Setup complete${NC}\n\n"
+    printf "  Location:  %s\n" "$(pwd)"
+    printf "  Binary:    %s/%s\n" "$(pwd)" "$BINARY"
+    printf "  Config:    %s/config.yaml\n" "$(pwd)"
+    printf "\n${BOLD}Next steps${NC}\n"
+    printf "  1. Edit config.yaml and add your GitHub token(s) to github_access_tokens\n"
+    printf "     (skip this if you only ever scan local code with --local)\n"
+    printf "\n  2. Run it:\n"
+    printf "       ./%s                 # terminal UI (default)\n" "$BINARY"
+    printf "       ./%s --web           # web dashboard on http://127.0.0.1:8080\n" "$BINARY"
+    printf "       ./%s --local ./code  # scan a local directory, no tokens needed\n" "$BINARY"
+    printf "\n  Docs: https://github.com/%s#readme\n\n" "$REPO_SLUG"
+}
+
+docker_notice() {
+    cat <<EOF
+
+${BOLD}Docker route${NC}
+
+  shhgit also runs from Docker. From a checkout of the repo:
+
+      cp .env.example .env
+      docker compose up -d
+      # dashboard on http://localhost:8080
+
+  The container needs a config.yaml; mount yours with
+  -v "\$(pwd)/config.yaml:/app/config.yaml:ro" or set GITHUB_TOKEN in .env.
+
+EOF
+}
+
+main() {
+    printf "\n${BOLD}shhgit installer${NC} — ${REPO_SLUG}\n"
+
+    if [ "$DOCKER_MODE" -eq 1 ]; then
+        docker_notice
+        exit 0
+    fi
+
+    detect_platform
+    ensure_go
+    ensure_source
+    do_build
+    configure
+    smoke_test
+    summary
+}
+
 main

@@ -58,11 +58,11 @@ func (h *PoolAPIHandler) SubmitJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	job := &ScanJob{
-		ID:        generateJobID(),
-		RepoURL:   req.RepoURL,
-		FilePath:  req.FilePath,
-		Content:   req.Content,
-		Priority:  req.Priority,
+		ID:         generateJobID(),
+		RepoURL:    req.RepoURL,
+		FilePath:   req.FilePath,
+		Content:    req.Content,
+		Priority:   req.Priority,
 		MaxRetries: 3,
 	}
 
@@ -81,9 +81,9 @@ func (h *PoolAPIHandler) SubmitJob(w http.ResponseWriter, r *http.Request) {
 func (h *PoolAPIHandler) GetQueueStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	status := map[string]interface{}{
-		"queue_length":   h.pool.QueueLength(),
-		"active_jobs":    h.pool.ActiveJobs(),
-		"is_busy":        h.pool.IsBusy(),
+		"queue_length": h.pool.QueueLength(),
+		"active_jobs":  h.pool.ActiveJobs(),
+		"is_busy":      h.pool.IsBusy(),
 	}
 	json.NewEncoder(w).Encode(status)
 }
@@ -111,9 +111,9 @@ func (h *PoolAPIHandler) Resize(w http.ResponseWriter, r *http.Request) {
 	// This is a simplified API - full implementation would handle graceful resize
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message": "Resize would require pool restart",
+		"message":         "Resize would require pool restart",
 		"current_workers": h.pool.workers,
-		"requested_size": size,
+		"requested_size":  size,
 	})
 }
 

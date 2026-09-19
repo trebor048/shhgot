@@ -14,8 +14,8 @@ type MatchFile struct {
 	Filename  string
 	Extension string
 	Contents  []byte
-	Size      int64  // Add file size
-	loaded    bool   // Track if contents are loaded
+	Size      int64 // Add file size
+	loaded    bool  // Track if contents are loaded
 }
 
 // Buffer pool for reading files to reduce allocations
@@ -31,7 +31,7 @@ func NewMatchFile(path string) MatchFile {
 	path = filepath.ToSlash(path)
 	_, filename := filepath.Split(path)
 	extension := filepath.Ext(path)
-	
+
 	// Get file size WITHOUT reading contents
 	stat, err := os.Stat(path)
 	var size int64
@@ -43,7 +43,7 @@ func NewMatchFile(path string) MatchFile {
 		Path:      path,
 		Filename:  filename,
 		Extension: extension,
-		Contents:  nil,  // Don't load yet
+		Contents:  nil, // Don't load yet
 		Size:      size,
 		loaded:    false,
 	}
@@ -60,7 +60,7 @@ func (m *MatchFile) GetContents() []byte {
 			m.loaded = true
 			return m.Contents
 		}
-		
+
 		// Use buffered reading for better I/O performance
 		file, err := os.Open(m.Path)
 		if err != nil {
@@ -69,16 +69,16 @@ func (m *MatchFile) GetContents() []byte {
 			return m.Contents
 		}
 		defer file.Close()
-		
+
 		// Pre-allocate slice to exact size to avoid reallocations
 		m.Contents = make([]byte, m.Size)
-		
+
 		reader := bufio.NewReaderSize(file, 64*1024) // 64KB buffer
 		_, err = io.ReadFull(reader, m.Contents)
 		if err != nil && err != io.ErrUnexpectedEOF {
 			m.Contents = []byte{}
 		}
-		
+
 		m.loaded = true
 	}
 	return m.Contents
@@ -97,7 +97,7 @@ func initBlacklists() {
 		for _, ext := range session.Config.BlacklistedExtensions {
 			blacklistExtMap[strings.ToLower(ext)] = true
 		}
-		
+
 		blacklistPathMap = make(map[string]bool, len(session.Config.BlacklistedPaths))
 		for _, path := range session.Config.BlacklistedPaths {
 			normalized := strings.Replace(path, "{sep}", string(os.PathSeparator), -1)
@@ -108,7 +108,7 @@ func initBlacklists() {
 
 func IsSkippableFile(path string) bool {
 	initBlacklists()
-	
+
 	extension := strings.ToLower(filepath.Ext(path))
 
 	// Fast map lookup instead of linear search
@@ -144,7 +144,7 @@ func (match MatchFile) CanCheckEntropy() bool {
 func GetMatchingFiles(dir string) []MatchFile {
 	fileList := make([]MatchFile, 0, 1000) // Pre-allocate with reasonable capacity
 	maxFileSize := *session.Options.MaximumFileSize * 1024
-	
+
 	initBlacklists() // Ensure blacklists are ready
 
 	filepath.Walk(dir, func(path string, f os.FileInfo, err error) error {
@@ -161,7 +161,7 @@ func GetMatchingFiles(dir string) []MatchFile {
 		if IsSkippableFile(path) {
 			return nil
 		}
-		
+
 		fileList = append(fileList, NewMatchFile(path))
 		return nil
 	})

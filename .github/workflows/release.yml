@@ -1,23 +1,74 @@
-on: 
+name: Release
+
+# Fires when you publish a release, and uploads the cross-platform binaries
+# to it. The tag you release must point at a commit on main.
+#
+# Also runnable by hand: Actions -> Release -> Run workflow, giving a tag.
+on:
   release:
-    types: [created]
+    types: [ created ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach binaries to"
+        required: true
+
+permissions:
+  contents: write
 
 jobs:
-  releases-matrix:
-    name: Release Go Binary
+  release:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        goos: [linux, windows, darwin]
-        goarch: [amd64]
+        include:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+
     steps:
-    - uses: actions/checkout@v2
-    - uses: wangyoucao577/go-release-action@master
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        goos: ${{ matrix.goos }}
-        goarch: ${{ matrix.goarch }}
-        goversion: "https://dl.google.com/go/go1.15.2.linux-amd64.tar.gz"
-        project_path: "."
-        binary_name: "shhgit"
-        extra_files: LICENSE README.md
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build and package
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          ext=""
+          [ "$GOOS" = "windows" ] && ext=".exe"
+          name="shhgit-${GOOS}-${GOARCH}${ext}"
+          go build -trimpath -ldflags="-s -w" -o "$name" .
+
+          extras="LICENSE README.md config.yaml.example"
+          if [ "$GOOS" = "windows" ]; then
+            zip -q "${name%.exe}.zip" "$name" $extras
+            rm -f "$name"
+          else
+            tar czf "${name}.tar.gz" "$name" $extras
+            rm -f "$name"
+          fi
+          ls -lh shhgit-*.{zip,tar.gz} 2>/dev/null || ls -lh shhgit-*
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            shhgit-*.tar.gz
+            shhgit-*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

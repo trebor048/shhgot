@@ -8,14 +8,14 @@ import (
 // Pre-compiled regex patterns for semantic analysis (performance optimization)
 var (
 	// Python patterns
-	pythonVarRegex        = regexp.MustCompile(`(?i)(password|passwd|pwd|secret|token|api_key|apikey|auth|credential|key|private_key|privatekey|access_key|accesskey)\s*=\s*["\']([^\'"]+)["\']`)
-	pythonEnvRegex        = regexp.MustCompile(`os\.environ\[["\']([A-Z_]+)["\']\]\s*=\s*["\']([^\'"]+)["\']`)
-	pythonAuthRegex       = regexp.MustCompile(`auth\s*=\s*\(["\']([^\'"]+)["\'],\s*["\']([^\'"]+)["\']\)`)
-	
-	// JavaScript patterns  
-	jsVarRegex            = regexp.MustCompile(`(?i)(const|let|var)\s+(password|passwd|pwd|secret|token|api_key|apikey|auth|credential|key|private_key|privatekey|access_key|accesskey)\s*=\s*["\']([^\'"]+)["\']`)
-	jsProcessEnvRegex     = regexp.MustCompile(`process\.env\.([A-Z_]+)\s*=\s*["\']([^\'"]+)["\']`)
-	jsAuthRegex           = regexp.MustCompile(`Authorization["\']?\s*:\s*["\']Bearer\s+([^\'"]+)["\']`)
+	pythonVarRegex  = regexp.MustCompile(`(?i)(password|passwd|pwd|secret|token|api_key|apikey|auth|credential|key|private_key|privatekey|access_key|accesskey)\s*=\s*["\']([^\'"]+)["\']`)
+	pythonEnvRegex  = regexp.MustCompile(`os\.environ\[["\']([A-Z_]+)["\']\]\s*=\s*["\']([^\'"]+)["\']`)
+	pythonAuthRegex = regexp.MustCompile(`auth\s*=\s*\(["\']([^\'"]+)["\'],\s*["\']([^\'"]+)["\']\)`)
+
+	// JavaScript patterns
+	jsVarRegex        = regexp.MustCompile(`(?i)(const|let|var)\s+(password|passwd|pwd|secret|token|api_key|apikey|auth|credential|key|private_key|privatekey|access_key|accesskey)\s*=\s*["\']([^\'"]+)["\']`)
+	jsProcessEnvRegex = regexp.MustCompile(`process\.env\.([A-Z_]+)\s*=\s*["\']([^\'"]+)["\']`)
+	jsAuthRegex       = regexp.MustCompile(`Authorization["\']?\s*:\s*["\']Bearer\s+([^\'"]+)["\']`)
 )
 
 // SemanticAnalyzer performs context-aware analysis of code to detect credentials

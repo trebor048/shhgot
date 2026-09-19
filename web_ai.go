@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/eth0izzle/shhgit/aireview"
-	"github.com/eth0izzle/shhgit/core"
+	"github.com/trebor048/shhgot/aireview"
+	"github.com/trebor048/shhgot/core"
 	git "gopkg.in/src-d/go-git.v4"
 )
 
@@ -76,13 +76,16 @@ func dashboardBaseURL() string {
 
 // registerAIRoutes registers the /api/ai/* endpoints.
 func registerAIRoutes() {
-	http.HandleFunc("/api/ai/flag", corsMiddleware(aiFlag))
-	http.HandleFunc("/api/ai/jobs", corsMiddleware(aiJobs))
-	http.HandleFunc("/api/ai/jobs/", corsMiddleware(aiJobPath))
-	http.HandleFunc("/api/ai/jobs/archive/", corsMiddleware(aiArchiveDownload))
-	http.HandleFunc("/api/ai/cases", corsMiddleware(aiCases))
-	http.HandleFunc("/api/ai/notifications", corsMiddleware(aiNotifications))
-	http.HandleFunc("/api/ai/notifications/read", corsMiddleware(aiNotificationsRead))
+	// These routes return plaintext detected secrets (Job.Secret) in their list,
+	// detail and archive responses, so they carry the same loopback guard the AI
+	// review chat routes use instead of relying on CORS alone.
+	http.HandleFunc("/api/ai/flag", corsMiddleware(aiLocalGuard(aiFlag)))
+	http.HandleFunc("/api/ai/jobs", corsMiddleware(aiLocalGuard(aiJobs)))
+	http.HandleFunc("/api/ai/jobs/", corsMiddleware(aiLocalGuard(aiJobPath)))
+	http.HandleFunc("/api/ai/jobs/archive/", corsMiddleware(aiLocalGuard(aiArchiveDownload)))
+	http.HandleFunc("/api/ai/cases", corsMiddleware(aiLocalGuard(aiCases)))
+	http.HandleFunc("/api/ai/notifications", corsMiddleware(aiLocalGuard(aiNotifications)))
+	http.HandleFunc("/api/ai/notifications/read", corsMiddleware(aiLocalGuard(aiNotificationsRead)))
 }
 
 func requireAI() (*aireview.Service, error) {

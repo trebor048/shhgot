@@ -14,12 +14,12 @@ import (
 
 // WebhookQueueItem represents a single webhook message to send
 type WebhookQueueItem struct {
-	URL         string
-	Payload     string
-	Timestamp   time.Time
-	Hash        string // For deduplication
-	RetryCount  int
-	MaxRetries  int
+	URL        string
+	Payload    string
+	Timestamp  time.Time
+	Hash       string // For deduplication
+	RetryCount int
+	MaxRetries int
 }
 
 // WebhookQueue manages webhook delivery with deduplication, rate limiting, and retries
@@ -143,7 +143,7 @@ func (wq *WebhookQueue) processItem(item *WebhookQueueItem) {
 		}
 
 		// Exponential backoff before retry
-		backoff := time.Duration((1 << uint(item.RetryCount)) * 100) * time.Millisecond
+		backoff := time.Duration((1<<uint(item.RetryCount))*100) * time.Millisecond
 		fmt.Printf("[webhook-queue] Retry %d/%d after %v (hash: %s)\n", item.RetryCount, item.MaxRetries, backoff, item.Hash)
 		time.Sleep(backoff)
 	}

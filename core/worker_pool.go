@@ -9,15 +9,15 @@ import (
 
 // ScanJob represents a single scanning job
 type ScanJob struct {
-	ID          string
-	RepoURL     string
-	FilePath    string
-	Content     string
-	Priority    int
-	RetryCount  int
-	MaxRetries  int
-	CreatedAt   time.Time
-	ResultChan  chan *ScanResult
+	ID         string
+	RepoURL    string
+	FilePath   string
+	Content    string
+	Priority   int
+	RetryCount int
+	MaxRetries int
+	CreatedAt  time.Time
+	ResultChan chan *ScanResult
 }
 
 // ScanResult contains the result of scanning a job
@@ -42,18 +42,18 @@ type WorkerPool struct {
 	wg             sync.WaitGroup
 
 	// Metrics
-	jobsProcessed    int64
-	jobsSuccessful   int64
-	jobsFailed       int64
-	totalDuration    int64
-	avgJobDuration   time.Duration
+	jobsProcessed  int64
+	jobsSuccessful int64
+	jobsFailed     int64
+	totalDuration  int64
+	avgJobDuration time.Duration
 
 	// Control
-	done           chan struct{}
-	paused         bool
-	pauseMutex     sync.RWMutex
-	activeJobs     int32
-	maxActiveJobs  int32
+	done          chan struct{}
+	paused        bool
+	pauseMutex    sync.RWMutex
+	activeJobs    int32
+	maxActiveJobs int32
 }
 
 // GlobalWorkerPool is the singleton worker pool instance
@@ -70,8 +70,8 @@ func InitGlobalWorkerPool(numWorkers int, queueSize int, regexOpt *RegexOptimize
 // NewWorkerPool creates a new worker pool
 func NewWorkerPool(numWorkers int, queueSize int, regexOpt *RegexOptimizer) *WorkerPool {
 	return &WorkerPool{
-		workers:         numWorkers,
-		jobQueue:        make(chan *ScanJob, queueSize),
+		workers:        numWorkers,
+		jobQueue:       make(chan *ScanJob, queueSize),
 		resultQueue:    make(chan *ScanResult, queueSize),
 		regexOptimizer: regexOpt,
 		done:           make(chan struct{}),
@@ -257,17 +257,17 @@ func (wp *WorkerPool) Stats() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"workers":            wp.workers,
-		"queue_size":         len(wp.jobQueue),
-		"result_queue_size":  len(wp.resultQueue),
-		"active_jobs":        atomic.LoadInt32(&wp.activeJobs),
-		"jobs_processed":     atomic.LoadInt64(&wp.jobsProcessed),
-		"jobs_successful":    atomic.LoadInt64(&wp.jobsSuccessful),
-		"jobs_failed":        atomic.LoadInt64(&wp.jobsFailed),
-		"success_rate":       successRate,
-		"avg_job_duration":   avgDuration.String(),
-		"total_duration":     totalDuration.String(),
-		"is_paused":          wp.paused,
+		"workers":           wp.workers,
+		"queue_size":        len(wp.jobQueue),
+		"result_queue_size": len(wp.resultQueue),
+		"active_jobs":       atomic.LoadInt32(&wp.activeJobs),
+		"jobs_processed":    atomic.LoadInt64(&wp.jobsProcessed),
+		"jobs_successful":   atomic.LoadInt64(&wp.jobsSuccessful),
+		"jobs_failed":       atomic.LoadInt64(&wp.jobsFailed),
+		"success_rate":      successRate,
+		"avg_job_duration":  avgDuration.String(),
+		"total_duration":    totalDuration.String(),
+		"is_paused":         wp.paused,
 	}
 }
 

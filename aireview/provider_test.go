@@ -1,6 +1,7 @@
 package aireview
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -54,10 +55,48 @@ func TestProviderVerifierGithub(t *testing.T) {
 func TestProviderVerifierUnknown(t *testing.T) {
 	p := NewProviderVerifier(&http.Client{Transport: fakeTransport{}})
 	valid, _, err := p.Check("Google API Key", "AIzaSy...")
-	if err != nil {
-		t.Fatalf("unknown type must be inconclusive without error, got %v", err)
+	if !errors.Is(err, ErrUnsupportedProvider) {
+		t.Fatalf("unknown type must be inconclusive, got err=%v", err)
 	}
 	if valid {
 		t.Fatal("unknown type must not report valid")
+	}
+}
+
+// Webhook URLs and public-by-design keys are not bearer credentials: sending
+// them as one leaks the value to the provider and reports a valid public key as
+// revoked.
+func TestProviderVerifierSkipsNonCredentials(t *testing.T) {
+	p := NewProviderVerifier(&http.Client{Transport: fakeTransport{}})
+	for _, sig := range []string{
+		"Discord Webhook URL",
+		"Slack Webhook URL",
+		"Stripe Live Publishable Key",
+	} {
+		if _, _, err := p.Check(sig, "https://hooks.example.com/services/x"); !errors.Is(err, ErrUnsupportedProvider) {
+			t.Errorf("%s: got err=%v, want ErrUnsupportedProvider", sig, err)
+		}
+	}
+}
+
+// 403 is how GitHub rate-limits, so it is inconclusive rather than revoked.
+func TestProviderVerifierForbiddenIsInconclusive(t *testing.T) {
+	p := NewProviderVerifier(&http.Client{Transport: fakeTransport{}})
+	valid, _, err := p.Check("Huggingface Token", "hf_x")
+	if err == nil || valid {
+		t.Fatalf("403 must be inconclusive: valid=%v err=%v", valid, err)
+	}
+}
+
+// Signature names spell one provider several ways; "Hugging Face" must still
+// reach the huggingface endpoint.
+func TestProviderVerifierMatchesNamingStyle(t *testing.T) {
+	p := NewProviderVerifier(&http.Client{Transport: fakeTransport{}})
+	_, _, err := p.Check("Hugging Face API Token", "hf_x")
+	if errors.Is(err, ErrUnsupportedProvider) {
+		t.Fatal("'Hugging Face' should match the huggingface provider despite the space")
+	}
+	if err == nil {
+		t.Fatal("the fake transport answers 403 for huggingface, so this must be inconclusive")
 	}
 }

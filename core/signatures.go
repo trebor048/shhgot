@@ -132,7 +132,7 @@ func (s PatternSignature) Match(file MatchFile) (bool, string) {
 
 func (s PatternSignature) GetContentsMatches(file MatchFile) []string {
 	matches := make([]string, 0)
-	
+
 	// Lazy load contents only when needed
 	contents := (&file).GetContents()
 

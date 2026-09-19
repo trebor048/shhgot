@@ -5,13 +5,14 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/eth0izzle/shhgit/aireview"
+	"github.com/trebor048/shhgot/aireview"
 )
 
 // Match represents a detected secret match.
@@ -69,6 +70,33 @@ type SignatureStat struct {
 	Count int    `json:"count"`
 }
 
+// snapshot returns a deep copy of the statistics that is safe to encode after
+// matchesMutex has been released.
+//
+// json.Marshal walks maps, so handing the live value to an encoder while
+// WebHub.run mutates it is a data race that aborts the whole process with
+// "fatal error: concurrent map read and map write" — not a recoverable 500.
+// Every caller that encodes outside the lock must use this copy.
+func (s Stats) snapshot() Stats {
+	cp := s
+	cp.MatchesBySource = copyStringIntMap(s.MatchesBySource)
+	cp.MatchesBySignature = copyStringIntMap(s.MatchesBySignature)
+	cp.MatchesByPriority = make(map[int]int, len(s.MatchesByPriority))
+	for k, v := range s.MatchesByPriority {
+		cp.MatchesByPriority[k] = v
+	}
+	cp.TopSignatures = append([]SignatureStat(nil), s.TopSignatures...)
+	return cp
+}
+
+func copyStringIntMap(m map[string]int) map[string]int {
+	cp := make(map[string]int, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
+}
+
 // WebHub manages matches and broadcasts.
 type WebHub struct {
 	clients      map[*WebClient]bool
@@ -92,9 +120,9 @@ var (
 	maxMatches = 10000
 
 	// Log ring buffer served at /api/logs.
-	logMu      sync.Mutex
-	logBuffer  []string
-	maxLogs    = 1000
+	logMu     sync.Mutex
+	logBuffer []string
+	maxLogs   = 1000
 
 	// Token validation results served at /api/tokens.
 	tokenMu      sync.Mutex
@@ -296,15 +324,17 @@ func (h *WebHub) run() {
 			h.stats.LastUpdated = time.Now()
 
 			h.updateTopSignatures()
-			statsCopy := h.stats
+			statsCopy := h.stats.snapshot()
 			h.matchesMutex.Unlock()
 
 			broadcastFeed(FeedEvent{Type: "match", Match: match, Stats: &statsCopy})
 
+			// statsCopy, not h.stats: this value is encoded later by the
+			// per-client writer goroutine, outside the lock.
 			data := map[string]interface{}{
 				"type":  "match",
 				"match": match,
-				"stats": h.stats,
+				"stats": statsCopy,
 			}
 			for client := range h.clients {
 				select {
@@ -368,7 +398,7 @@ func receiveMatch(w http.ResponseWriter, r *http.Request) {
 func getStats(w http.ResponseWriter, r *http.Request) {
 	hub := ensureWebHub()
 	hub.matchesMutex.RLock()
-	stats := hub.stats
+	stats := hub.stats.snapshot()
 	hub.matchesMutex.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -407,9 +437,11 @@ func getMatches(w http.ResponseWriter, r *http.Request) {
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	hub := ensureWebHub()
 	hub.matchesMutex.RLock()
+	// Copy both the slice and the statistics: everything below is encoded
+	// after the lock is released.
 	data := map[string]interface{}{
-		"matches": hub.matches,
-		"stats":   hub.stats,
+		"matches": append([]*Match(nil), hub.matches...),
+		"stats":   hub.stats.snapshot(),
 	}
 	hub.matchesMutex.RUnlock()
 
@@ -523,9 +555,25 @@ func health(w http.ResponseWriter, r *http.Request) {
 }
 
 // CORS middleware.
+//
+// Same-origin only. The dashboard serves captured secrets, so a wildcard
+// Access-Control-Allow-Origin meant any web page the operator happened to visit
+// could read /api/matches and inject fake findings through /api/push. Requests
+// with no Origin header (curl, the CLI push path, same-origin navigations) are
+// still allowed.
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if origin := r.Header.Get("Origin"); origin != "" {
+			u, err := url.Parse(origin)
+			if err != nil || !strings.EqualFold(u.Host, r.Host) {
+				w.Header().Set("Vary", "Origin")
+				http.Error(w, "cross-origin requests are not allowed", http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+		}
+
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
@@ -569,6 +617,23 @@ func StartWebServer(host, port string) error {
 
 // serveEmbeddedWeb serves the embedded web interface.
 func serveEmbeddedWeb(w http.ResponseWriter, r *http.Request) {
+	// Only "/" is the dashboard. Unknown paths used to receive a 200 carrying
+	// dashboard HTML, so a missing API route looked like success to any JSON
+	// client and typos were impossible to spot.
+	if r.URL.Path != "/" {
+		switch {
+		case r.URL.Path == "/favicon.ico":
+			w.WriteHeader(http.StatusNoContent)
+		case strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/metrics":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprintf(w, `{"error":"no such endpoint","path":%q}`, r.URL.Path)
+		default:
+			http.NotFound(w, r)
+		}
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	// Never cache the dashboard: a stale cached copy from an older build has
 	// caused "matches not showing" reports when the new UI was already live.
@@ -899,7 +964,8 @@ func getEmbeddedDashboard() string {
 		`</div>`,
 		`<script>`,
 		`function makeParticles(){var colors=['34,211,238','34,197,94','249,115,22','167,139,250','244,114,182','96,165,250'];for(var i=0;i<48;i++){var p=document.createElement('div');p.className='particle';var size=(Math.random()*3.5+2).toFixed(1);p.style.width=size+'px';p.style.height=size+'px';p.style.left=(Math.random()*100).toFixed(2)+'%';p.style.background='rgba('+colors[i%colors.length]+',.7)';p.style.boxShadow='0 0 6px rgba('+colors[i%colors.length]+',.9)';p.style.animationDuration=(Math.random()*14+10).toFixed(1)+'s';p.style.animationDelay=(Math.random()*12).toFixed(1)+'s';document.body.appendChild(p);}}makeParticles();`,
-		`var state={q:'',source:'',sig:'',p3:true,p2:true,p1:true,p0:true,tab:'matches'};`,
+		`var state={q:'',source:'',sig:'',p3:true,p2:true,p1:true,p0:true,tab:'matches',paused:false};`,
+		`var pendingMatches=[];`,
 		`var matches=[],tokens=[],logs=[],stats={},activityData={fetching:[],scanning:[]};`,
 		`function setTab(t){state.tab=t;document.querySelectorAll('.tab').forEach(function(e){e.classList.remove('active')});document.getElementById('tab-'+t).classList.add('active');document.getElementById('panel-matches').style.display=t==='matches'?'block':'none';document.getElementById('panel-tokens').style.display=t==='tokens'?'block':'none';document.getElementById('panel-activity').style.display=t==='activity'?'block':'none';document.getElementById('panel-logs').style.display=t==='logs'?'block':'none';}`,
 		`function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}`,
@@ -1236,7 +1302,7 @@ func getEmbeddedDashboard() string {
 		`}`,
 		`function applyStats(s){stats=s||{};document.getElementById('total').textContent=stats.total_matches||0;document.getElementById('crit').textContent=(stats.matches_by_priority&&stats.matches_by_priority[3])||0;document.getElementById('high').textContent=(stats.matches_by_priority&&stats.matches_by_priority[2])||0;document.getElementById('med').textContent=(stats.matches_by_priority&&stats.matches_by_priority[1])||0;document.getElementById('low').textContent=(stats.matches_by_priority&&stats.matches_by_priority[0])||0;document.getElementById('s-crit').textContent=(stats.matches_by_priority&&stats.matches_by_priority[3])||0;document.getElementById('s-high').textContent=(stats.matches_by_priority&&stats.matches_by_priority[2])||0;document.getElementById('s-med').textContent=(stats.matches_by_priority&&stats.matches_by_priority[1])||0;document.getElementById('s-low').textContent=(stats.matches_by_priority&&stats.matches_by_priority[0])||0;}`,
 		`function handleEvent(ev){`,
-		`if(ev.type==='match'){if(ev.match)matches.push(ev.match);if(ev.stats)applyStats(ev.stats);updateSigSelect();render();}`,
+		`if(ev.type==='match'){if(state.paused){pendingMatches.push(ev);return;}if(ev.match)matches.push(ev.match);if(ev.stats)applyStats(ev.stats);updateSigSelect();render();}`,
 		`else if(ev.type==='token'){if(ev.token)tokens.push(ev.token);renderTokens();}`,
 		`else if(ev.type==='log'){if(ev.log)logs.push(ev.log);renderLogs();}`,
 		`else if(ev.type==='activity'){if(ev.activity)activityData=ev.activity;renderActivity();}`,
@@ -1269,6 +1335,8 @@ func getEmbeddedDashboard() string {
 		`var es=new EventSource('/api/events');`,
 		`es.onmessage=function(e){try{handleEvent(JSON.parse(e.data));}catch(err){}};`,
 		`es.onerror=function(){/* EventSource auto-reconnects */};`,
+		`/* Pause freezes the live table: events are buffered and replayed on resume. */`,
+		`(function(){var p=document.getElementById('pause');if(!p)return;p.onchange=function(){state.paused=p.checked;if(state.paused){var s=document.getElementById('showing');if(s)s.textContent='paused — '+matches.length+' matches shown, new ones buffered';return;}for(var i=0;i<pendingMatches.length;i++){var ev=pendingMatches[i];if(ev.match)matches.push(ev.match);if(ev.stats)applyStats(ev.stats);}pendingMatches.length=0;updateSigSelect();render();};})();`,
 		`/* ---- AI review chat ---- */`,
 		`var aiConfig={backend:'deepseek'};`,
 		`var chats={};`,

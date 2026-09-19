@@ -12,16 +12,16 @@ type MatchModel struct {
 	Timestamp time.Time `gorm:"index:idx_timestamp"`
 	Source    string    `gorm:"index:idx_source"`
 	URL       string
-	File      string    `gorm:"index:idx_file"`
-	Signature string    `gorm:"index:idx_signature"`
-	Priority  int       `gorm:"index:idx_priority"`
-	Matches   string    `gorm:"type:text"` // JSON-encoded []string
-	Secret    string    `gorm:"type:text"`
+	File      string `gorm:"index:idx_file"`
+	Signature string `gorm:"index:idx_signature"`
+	Priority  int    `gorm:"index:idx_priority"`
+	Matches   string `gorm:"type:text"` // JSON-encoded []string
+	Secret    string `gorm:"type:text"`
 	Line      int
 	Stars     int
 	Color     string
-	Content   string    `gorm:"type:text"`
-	Archived  bool      `gorm:"default:false;index:idx_archived"`
+	Content   string `gorm:"type:text"`
+	Archived  bool   `gorm:"default:false;index:idx_archived"`
 	CreatedAt time.Time
 	UpdatedAt time.Time
 	DeletedAt gorm.DeletedAt `gorm:"index"`
@@ -29,9 +29,9 @@ type MatchModel struct {
 
 // TokenModel represents a validated API token
 type TokenModel struct {
-	ID        string    `gorm:"primaryKey"`
-	UserID    string    `gorm:"index"`
-	Token     string    `gorm:"index"`
+	ID        string `gorm:"primaryKey"`
+	UserID    string `gorm:"index"`
+	Token     string `gorm:"index"`
 	Valid     bool
 	Provider  string
 	Timestamp time.Time `gorm:"index"`
@@ -40,12 +40,12 @@ type TokenModel struct {
 
 // AuditLog represents an audit trail entry
 type AuditLog struct {
-	ID        string    `gorm:"primaryKey"`
-	UserID    string    `gorm:"index"`
-	Action    string    `gorm:"index"` // VIEW, DELETE, EXPORT, etc.
+	ID        string `gorm:"primaryKey"`
+	UserID    string `gorm:"index"`
+	Action    string `gorm:"index"` // VIEW, DELETE, EXPORT, etc.
 	Resource  string
-	OldValue  string    `gorm:"type:text"`
-	NewValue  string    `gorm:"type:text"`
+	OldValue  string `gorm:"type:text"`
+	NewValue  string `gorm:"type:text"`
 	IPAddress string
 	Timestamp time.Time `gorm:"index"`
 	CreatedAt time.Time
@@ -53,14 +53,14 @@ type AuditLog struct {
 
 // APIKey represents an API key for authentication
 type APIKey struct {
-	ID        string    `gorm:"primaryKey"`
-	UserID    string    `gorm:"index"`
-	Key       string    `gorm:"index;uniqueIndex"`
+	ID        string `gorm:"primaryKey"`
+	UserID    string `gorm:"index"`
+	Key       string `gorm:"index;uniqueIndex"`
 	Name      string
-	Scopes    string    // Comma-separated: read:matches, write:matches, delete:matches
+	Scopes    string // Comma-separated: read:matches, write:matches, delete:matches
 	LastUsed  *time.Time
 	ExpiresAt *time.Time
-	Revoked   bool      `gorm:"default:false;index"`
+	Revoked   bool `gorm:"default:false;index"`
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

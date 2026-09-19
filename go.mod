@@ -1,4 +1,4 @@
-module github.com/eth0izzle/shhgit
+module github.com/trebor048/shhgot
 
 go 1.26.0
 

@@ -2,6 +2,7 @@ package aireview
 
 import (
 	"errors"
+	"net/http"
 	"regexp"
 	"testing"
 )
@@ -71,5 +72,32 @@ func TestGateLikelyReal(t *testing.T) {
 	j := &Job{Secret: "AIzaSy00000000000000000000000000000000000", MatchContext: "", Signature: "Google API Key"}
 	if v, _ := g.Evaluate(j); v != VerdictLikelyReal {
 		t.Fatalf("verdict = %q, want likely-real", v)
+	}
+}
+
+// The two tests below drive the real ProviderVerifier through the gate. The
+// fakeVerifier above always returns an explicit error, which is why CI missed
+// the original bug: ProviderVerifier answered a clean (false, nil) for every
+// signature type it had no endpoint for, and Evaluate turns that into the
+// terminal VerdictRevoked.
+
+func TestGateUnsupportedProviderStaysReviewable(t *testing.T) {
+	g := NewGate(nil, nil, nil, NewProviderVerifier(&http.Client{Transport: fakeTransport{}}))
+	j := &Job{
+		Secret:       "AKIAIOSFODNN7EXAMPLE",
+		MatchContext: "aws_access_key_id = AKIAIOSFODNN7EXAMPLE",
+		Signature:    "AWS Access Key ID",
+	}
+	v, reason := g.Evaluate(j)
+	if v != VerdictLikelyReal {
+		t.Fatalf("verdict = %q (%s): a signature type with no auth endpoint must remain reviewable", v, reason)
+	}
+}
+
+func TestGateRateLimitedProviderStaysReviewable(t *testing.T) {
+	g := NewGate(nil, nil, nil, NewProviderVerifier(&http.Client{Transport: fakeTransport{}}))
+	j := &Job{Secret: "hf_abcdefghijklmnop", MatchContext: "", Signature: "Huggingface Token"}
+	if v, reason := g.Evaluate(j); v == VerdictRevoked {
+		t.Fatalf("verdict = %q (%s): a 403 is rate limiting, not revocation", v, reason)
 	}
 }

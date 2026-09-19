@@ -27,12 +27,12 @@ type Match struct {
 
 // Stats holds aggregated statistics
 type Stats struct {
-	TotalMatches      int                `json:"total_matches"`
-	MatchesBySource   map[string]int     `json:"matches_by_source"`
-	MatchesBySignature map[string]int    `json:"matches_by_signature"`
-	MatchesByPriority map[int]int        `json:"matches_by_priority"`
-	TopSignatures     []SignatureStat    `json:"top_signatures"`
-	LastUpdated       time.Time          `json:"last_updated"`
+	TotalMatches       int             `json:"total_matches"`
+	MatchesBySource    map[string]int  `json:"matches_by_source"`
+	MatchesBySignature map[string]int  `json:"matches_by_signature"`
+	MatchesByPriority  map[int]int     `json:"matches_by_priority"`
+	TopSignatures      []SignatureStat `json:"top_signatures"`
+	LastUpdated        time.Time       `json:"last_updated"`
 }
 
 // SignatureStat represents a signature with its match count
@@ -54,9 +54,9 @@ type Hub struct {
 
 // Client represents a WebSocket connection
 type Client struct {
-	hub      *Hub
-	conn     interface{} // Will be replaced with actual WebSocket conn in handler
-	send     chan interface{}
+	hub  *Hub
+	conn interface{} // Will be replaced with actual WebSocket conn in handler
+	send chan interface{}
 }
 
 var (

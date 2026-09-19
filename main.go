@@ -16,8 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/eth0izzle/shhgit/core"
 	"github.com/fatih/color"
+	"github.com/trebor048/shhgot/core"
 )
 
 // ═══════════════════════════════════════════════════════════════
@@ -1343,12 +1343,14 @@ func runWebMode() {
 		}
 	}
 
-	// Route token-validation results into the web "Tokens" view.
-	// if getSession().TokenValidator != nil {
-	// 	getSession().TokenValidator.OnTokenResult = func(token string, valid bool, provider string) {
-	// 		pushTokenResult(token, valid, provider)
-	// 	}
-	// }
+	// Route token-validation results into the web "Tokens" view. Without this
+	// hook the tab is permanently empty: /api/tokens always returns
+	// {"tokens":[]} and no "token" feed event is ever published.
+	if getSession().TokenValidator != nil {
+		getSession().TokenValidator.OnTokenResult = func(token string, valid bool, provider string) {
+			pushTokenResult(token, valid, provider)
+		}
+	}
 
 	addr := fmt.Sprintf("http://%s:%s", modeConfig.WebHost, modeConfig.WebPort)
 	fmt.Printf("🌐 Starting web server on %s\n", addr)

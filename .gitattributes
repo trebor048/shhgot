@@ -1,0 +1,26 @@
+# ===========================================================================
+# Repository line-ending and file-type policy
+#
+# Without this, a Windows checkout with core.autocrlf=true produces CRLF in
+# the working tree while git stores LF, which makes gofmt and shell scripts
+# behave inconsistently between machines and CI.
+# ===========================================================================
+
+* text=auto
+
+# Source and scripts must stay LF everywhere.
+*.go        text eol=lf
+*.sh        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.md        text eol=lf
+*.json      text eol=lf
+Makefile    text eol=lf
+Dockerfile  text eol=lf
+
+# Binary assets are never converted.
+*.png       binary
+*.jpg       binary
+*.gif       binary
+*.ico       binary
+*.exe       binary
