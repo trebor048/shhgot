@@ -2,6 +2,7 @@ package core
 
 import (
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path"
@@ -56,16 +57,36 @@ func (p PerformanceConfig) Int(v *int, def int) int {
 	return def
 }
 
-// AIReviewConfig configures the interactive AI-review chat (secret + file +
-// repo analysis) launched from each match card in the dashboard. Backend is
-// "deepseek" or "ollama".
+// AIReviewConfig supplies the startup defaults for the AI security review.
+//
+// Precedence, highest first:
+//  1. what the operator saves in the dashboard's Settings tab (persisted to
+//     ai_review/settings.json),
+//  2. the environment variables read by aiproviders (DEEPSEEK_API_KEY,
+//     OPENAI_API_KEY, AI_BASE_URL, AI_API_KEY, AI_MODEL, OLLAMA_URL,
+//     OLLAMA_MODEL),
+//  3. the values below,
+//  4. the built-in per-provider defaults.
+//
+// Provider is one of deepseek, openai, custom or ollama.
 type AIReviewConfig struct {
-	Backend       string `yaml:"backend" json:"backend"`
-	DeepseekKey   string `yaml:"deepseek_api_key" json:"deepseek_api_key"`
-	DeepseekModel string `yaml:"deepseek_model" json:"deepseek_model"`
-	OllamaURL     string `yaml:"ollama_url" json:"ollama_url"`
-	OllamaModel   string `yaml:"ollama_model" json:"ollama_model"`
-	SystemPrompt  string `yaml:"system_prompt" json:"system_prompt"`
+	Provider     string `yaml:"provider,omitempty" json:"provider"`
+	APIKey       string `yaml:"api_key,omitempty" json:"api_key"`
+	BaseURL      string `yaml:"base_url,omitempty" json:"base_url"`
+	Model        string `yaml:"model,omitempty" json:"model"`
+	SystemPrompt string `yaml:"system_prompt,omitempty" json:"system_prompt"`
+
+	// ReviewDir is where reviews and AI settings are stored. Defaults to
+	// ai_review, which is gitignored because reviews contain plaintext secrets.
+	ReviewDir string `yaml:"review_dir,omitempty" json:"review_dir"`
+
+	// Legacy single-backend keys. Still honoured so an existing config.yaml
+	// keeps working; the keys above win when both are set.
+	Backend       string `yaml:"backend,omitempty" json:"backend"`
+	DeepseekKey   string `yaml:"deepseek_api_key,omitempty" json:"deepseek_api_key"`
+	DeepseekModel string `yaml:"deepseek_model,omitempty" json:"deepseek_model"`
+	OllamaURL     string `yaml:"ollama_url,omitempty" json:"ollama_url"`
+	OllamaModel   string `yaml:"ollama_model,omitempty" json:"ollama_model"`
 }
 
 type CleanupConfig struct {
@@ -105,7 +126,7 @@ func ParseConfig(options *Options) (*Config, error) {
 	if len(*options.ConfigPath) > 0 {
 		data, err = ioutil.ReadFile(path.Join(*options.ConfigPath, "config.yaml"))
 		if err != nil {
-			return config, err
+			return config, fmt.Errorf("no config.yaml found in %s (copy config.yaml.example there and fill in a GitHub token, or drop --config-path to search the default locations): %w", *options.ConfigPath, err)
 		}
 	} else {
 		// Trying to first find the configuration next to executable
@@ -117,18 +138,18 @@ func ParseConfig(options *Options) (*Config, error) {
 			dir, _ = os.Getwd()
 			data, err = ioutil.ReadFile(path.Join(dir, "config.yaml"))
 			if err != nil {
-				return config, err
+				return config, fmt.Errorf("no config.yaml found next to the binary or in the working directory (copy config.yaml.example to config.yaml and fill in a GitHub token): %w", err)
 			}
 		}
 	}
 
 	err = yaml.Unmarshal(data, config)
 	if err != nil {
-		return config, err
+		return config, fmt.Errorf("config.yaml is not valid YAML: %w", err)
 	}
 
 	if len(*options.Local) <= 0 && (len(config.GitHubAccessTokens) < 1 || strings.TrimSpace(strings.Join(config.GitHubAccessTokens, "")) == "") {
-		return config, errors.New("You need to provide at least one GitHub Access Token. See https://help.github.com/en/articles/creating-a-personal-access-token-for-the-command-line")
+		return config, errors.New("config.yaml needs at least one GitHub access token under github_access_tokens (see https://help.github.com/en/articles/creating-a-personal-access-token-for-the-command-line), or pass --local to scan a local directory instead")
 	}
 
 	for i := 0; i < len(config.GitHubAccessTokens); i++ {

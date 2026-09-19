@@ -27,14 +27,34 @@ performance:
 
 logFormat: "fancy"                 # minimal | fancy | ultra fancy | even more fancy | neon
 
-# Interactive AI-review chat (launched from each match card).
+# ---------------------------------------------------------------------------
+# AI security review
+# ---------------------------------------------------------------------------
+# A "Review" action on any match sends that finding (secret, file and file
+# content) to the configured LLM, which returns an impact, exploitability and
+# remediation assessment, and then answers follow-up questions about it.
+#
+# provider is one of: deepseek | openai | custom | ollama
+#
+# These settings only SEED the AI configuration the first time shhgit runs.
+# After that the dashboard's Settings tab owns them, persisted to
+# ai_review/settings.json. Environment variables act as per-field fallbacks:
+# DEEPSEEK_API_KEY, OPENAI_API_KEY, AI_BASE_URL, AI_API_KEY, AI_MODEL,
+# OLLAMA_URL, OLLAMA_MODEL (and SHHGIT_AI_* equivalents).
+#
+# Prefer the environment variables for the key so no secret lives in this file.
+#
+# PRIVACY: a cloud provider receives the detected credential and the surrounding
+# file content in plain text. Use provider: ollama to keep everything local.
 ai_review:
-  backend: deepseek               # deepseek | ollama
-  deepseek_api_key: ''            # or set the DEEPSEEK_API_KEY env var
-  deepseek_model: deepseek-chat
-  ollama_url: http://localhost:11434
-  ollama_model: hf.co/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive:Q5_K_M
-  # system_prompt: ''            # optional override; a sensible default is built in
+  provider: deepseek              # deepseek | openai | custom | ollama
+  api_key: ''                     # or DEEPSEEK_API_KEY / OPENAI_API_KEY / AI_API_KEY
+  base_url: ''                    # blank = the provider's default endpoint
+  model: ''                       # blank = the provider's default model
+  review_dir: ai_review           # where reviews and AI settings are stored (gitignored)
+  # system_prompt: ''             # optional override; a security-review prompt is built in
+  # Legacy single-backend keys (backend, deepseek_api_key, deepseek_model,
+  # ollama_url, ollama_model) are still read when the keys above are unset.
 
 ai_tokens:
   # OpenAI and related

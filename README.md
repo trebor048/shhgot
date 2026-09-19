@@ -49,10 +49,10 @@ something looks like a secret.
 | **Live GitHub monitoring** | Polls the public event firehose (commits, Gists, comments) with your token, at a rate you control. |
 | **Local scanning** | `--local ./some/dir` walks a directory tree. No GitHub token needed. |
 | **Terminal UI** | The default mode: a live, colour-coded match feed as findings arrive. |
-| **Web dashboard** | `--web` serves a self-contained dashboard — live feed, filters, log tail, activity view, full-file viewer, per-match AI chat. |
+| **Web dashboard** | `--web` serves a self-contained dashboard — live feed, filters, log tail, activity view, full-file viewer, AI review workspace, provider settings. |
 | **Alerts** | Discord or Telegram, with separate routing for AI-token and crypto findings. |
 | **Live credential checks** | Optional provider auth-checks (OpenAI, Anthropic, AWS, Stripe, GitHub, Discord) to confirm a found key actually works. |
-| **AI review** | Ask a model to triage a hit — DeepSeek (cloud) or Ollama (local). |
+| **AI review** | One click on any hit gets a streamed assessment — what the credential is, what it grants, how exploitable it is, how to fix it — then answers follow-up questions. DeepSeek, OpenAI, any OpenAI-compatible endpoint, or local Ollama. |
 | **Entropy and allowlists** | Cuts noise with `blacklisted_strings`, extension/path filters and Shannon-entropy scoring. |
 | **Zero dependencies** | One static Go binary. No runtime, no cgo, no external services. |
 
@@ -317,12 +317,23 @@ long run cannot fill the disk.
 
 ### Environment variables
 
-Only three environment variables are read:
+The AI provider is configured from the dashboard's Settings tab first; these
+environment variables act as per-field fallbacks below it (see
+[AI review](#ai-review)):
 
 | Variable | Effect |
 |---|---|
-| `DEEPSEEK_API_KEY` | DeepSeek key for AI review. Overrides `ai_review.deepseek_api_key`. |
-| `SHHGIT_PORT` | Host port published by `docker compose` (compose only, not the binary). |
+| `DEEPSEEK_API_KEY` | DeepSeek API key. |
+| `OPENAI_API_KEY` | OpenAI API key. |
+| `AI_API_KEY`, `AI_BASE_URL`, `AI_MODEL` | Generic overrides for any provider. |
+| `OLLAMA_URL`, `OLLAMA_MODEL` | Local Ollama endpoint and model. |
+
+Deployment-only variables, read by the tooling around the binary rather than by
+shhgit itself:
+
+| Variable | Effect |
+|---|---|
+| `SHHGIT_PORT` | Host port published by `docker compose`. |
 | `CLOUDFLARE_TUNNEL_TOKEN` | Cloudflare Tunnel token for the optional compose profile. |
 
 Config values go through `os.ExpandEnv`, so secrets can stay out of the file:
@@ -372,8 +383,11 @@ step, no separate frontend server, nothing extra to deploy.
   repositories are deleted afterwards.
 - **Tokens tab** — live credential-validation results.
 - **Logs and activity tabs** — the scanner log tail and an activity view.
-- **AI review** — a "review" button on each match opens a chat window for that
-  finding (see [AI review](#ai-review)).
+- **Review tab** — the AI security-review workspace: a job list of current and
+  past reviews, the streamed assessment for the selected finding, and a
+  follow-up chat (see [AI review](#ai-review)).
+- **Settings tab** — pick the AI provider and key from inside the UI; no config
+  file edit or restart needed.
 
 **HTTP endpoints**
 
@@ -381,12 +395,17 @@ step, no separate frontend server, nothing extra to deploy.
 |---|---|
 | `/` | The dashboard. |
 | `/health` | Liveness probe — `{"status":"healthy"}`. |
-| `/api/events` | SSE stream of live events. |
+| `/api/events` | SSE stream of live events, including review status changes. |
 | `/api/stats`, `/api/matches`, `/api/logs`, `/api/tokens`, `/api/signatures`, `/api/activity` | JSON data for the UI. |
 | `/api/ws` | JSON snapshot of matches and stats (despite the name, it is not a WebSocket). |
 | `/api/file?id=<match-id>` | Stored file content behind a match. |
 | `/api/push` | `POST` a match in from an external tool. |
-| `/api/ai/review/*` | AI review chat (config, history, streaming, opencode). |
+| `/api/review` | `GET` the review history, `POST` to start a review of a finding. |
+| `/api/review/<id>` | `GET` one review with its chat, `DELETE` it. |
+| `/api/review/<id>/stream` | SSE: the assessment as the model writes it. |
+| `/api/review/<id>/chat` | `POST` a follow-up question; streams the reply. |
+| `/api/settings` | `GET` the AI configuration (the key is never sent back), `PUT` to save it. |
+| `/api/settings/test` | `POST` to make one real call against the configured provider. |
 
 Unknown paths get a real `404` with a JSON body, so a mistyped endpoint is
 obvious instead of silently returning dashboard HTML.
@@ -398,6 +417,12 @@ obvious instead of silently returning dashboard HTML.
 - **Same-origin only.** Cross-origin requests are rejected with `403`, so a page
   you happen to visit cannot read `/api/matches` or inject findings via
   `/api/push`. Requests with no `Origin` header (curl, the CLI) still work.
+- **`/api/settings` and `/api/review` are additionally local-only.** While the
+  dashboard is bound to a loopback address, those routes also require a loopback
+  `Host`, which defeats DNS rebinding — an attacker hostname resolving to
+  `127.0.0.1` would otherwise look same-origin. Binding a routable address
+  (`--web-host 0.0.0.0`) is treated as an explicit opt-in to exposure, and only
+  the same-origin check applies.
 - **The feed contains live secrets.** Treat the dashboard as a secrets console:
   do not screen-share it, do not put it on a public interface.
 
@@ -463,38 +488,86 @@ the GitHub API. Tune in this order.
 
 ## AI review
 
-Optional. Configured, it adds a **review** button to every match card in the web
-dashboard, opening a chat window for that finding.
+Optional. Configure a provider and a **Review** action appears on every match:
+clicking it sends that finding to the model, which explains what the credential
+is, what an attacker could do with it, how reachable it really is, and how to fix
+it — then answers your follow-up questions about it.
+
+Reviews live in the dashboard's **Review** tab: a job list of everything you have
+reviewed, the streamed assessment for the selected finding, and a chat box.
+
+### Configure it in the UI (recommended)
+
+```bash
+./shhgit --web
+```
+
+Open the **Settings** tab, choose a provider, paste a key, and press **Test
+Connection**. Saving writes `ai_review/settings.json` (mode `0600`, gitignored)
+and takes effect immediately — no restart. The API key is never sent back to the
+browser; the UI only learns whether one is stored.
+
+### Configure it in `config.yaml`
 
 ```yaml
 ai_review:
-  backend: deepseek                  # deepseek | ollama
-  deepseek_api_key: ''               # or set DEEPSEEK_API_KEY
-  deepseek_model: deepseek-chat
-  ollama_url: http://localhost:11434
-  ollama_model: llama3.1
+  provider: deepseek              # deepseek | openai | custom | ollama
+  api_key: ''                     # prefer the environment variables instead
+  base_url: ''                    # blank = the provider's default
+  model: ''                       # blank = the provider's default
+  review_dir: ai_review           # where reviews and settings are stored
 ```
 
-**DeepSeek (cloud).** Set `backend: deepseek` and supply a key in `config.yaml` or
-via `DEEPSEEK_API_KEY` (the environment variable wins). Use a model name your
-account can actually call — `deepseek-chat` is the safe default. A wrong model
-name shows up as a `400` in the chat window.
+These values only **seed** the settings the first time shhgit runs. After that the
+Settings tab owns them, so switching provider in the UI is not undone on restart.
 
-**Ollama (local).** Set `backend: ollama` and pull the model you name. Better for
-privacy: nothing leaves the machine. `ollama_url` must be a **loopback** host, so
-a remote or LAN Ollama server is refused by design.
+### Providers
 
-Reviews stream token by token over SSE, per-match history is kept, and the
-"copy + opencode" button copies the conversation for pasting into an agent
-workflow.
+| Provider | Endpoint | Key | Default model |
+|---|---|---|---|
+| `deepseek` | `https://api.deepseek.com/v1` | required | `deepseek-chat` |
+| `openai` | `https://api.openai.com/v1` | required | `gpt-4o-mini` |
+| `custom` | whatever you set as `base_url` | optional | you set it (required) |
+| `ollama` | `http://localhost:11434` | none | `llama3.1` |
+
+All four go through one OpenAI-compatible client; `ollama` talks to the native
+`/api/chat` endpoint unless you point `base_url` at a `/v1` route. `custom` is for
+any other OpenAI-compatible gateway (vLLM, LiteLLM, OpenRouter, a company proxy).
+
+### Environment variables
+
+Read as per-field fallbacks, below the UI settings and above `config.yaml`:
+
+```bash
+DEEPSEEK_API_KEY=...      OPENAI_API_KEY=...
+AI_API_KEY=...            AI_BASE_URL=...           AI_MODEL=...
+OLLAMA_URL=...            OLLAMA_MODEL=...
+```
+
+Prefer these for keys so no secret sits in a file.
+
+### What the model is sent
+
+The signature name, the repository and file, the **detected value**, and the
+**full contents of the file it was found in** (captured at scan time, because
+cloned repositories are deleted afterwards). Reviews are stored as JSON in
+`review_dir`, so that directory is gitignored by default.
 
 ### Privacy — read this before enabling
 
-AI review sends **the detected secret value and the full contents of the file it
-was found in** to whichever backend you configured. With `backend: deepseek` that
-means real credentials leave your machine for a third-party API. If that is not
-acceptable, use `backend: ollama`, or leave AI review unconfigured — scanning,
-the dashboard and webhooks all work fully without it.
+With any cloud provider, **real credentials and the surrounding file contents
+leave your machine**. The model is instructed never to repeat the value back, and
+that is all that can be promised for a third-party API. If that is not acceptable,
+use `provider: ollama` so nothing leaves the host, or leave AI review
+unconfigured — scanning, the dashboard and webhooks all work fully without it.
+
+### Failure behaviour
+
+A review that fails (bad key, wrong model, provider down) is stored with
+`status: failed` and the provider's own error message, visible in the Review tab
+and replayed on its stream endpoint. A failed review never blocks the dashboard,
+and setting `review_dir` to a read-only location only disables AI review — the
+scanner keeps running.
 
 ---
 
@@ -602,12 +675,18 @@ Layout:
 |---|---|
 | `main.go` | Startup, terminal UI, log styles, scan loop. |
 | `modes.go` | Mode selection (`--web`, `--tui`, `--scanner`). |
-| `web.go` | Web server, embedded dashboard, HTTP API. |
-| `web_ai_chat.go`, `web_ai.go` | AI review chat and the review job API. |
+| `web.go` | Web server, HTTP API, stats, SSE feed, origin and loopback guards. |
+| `dashboard.go`, `dashboard/index.html` | The embedded dashboard (one self-contained file, compiled in with `go:embed`). |
+| `web_review.go` | AI security review: routes, prompt assembly, in-flight review broker. |
+| `web_settings.go` | The `/api/settings` and `/api/settings/test` routes. |
+| `aiproviders/` | One client for DeepSeek, OpenAI, any OpenAI-compatible endpoint and Ollama, plus the settings store. |
+| `reviewstore/` | On-disk review and chat history (one JSON file per review). |
 | `core/` | Scanner, signatures, validators, config, webhooks. |
-| `aireview/` | AI review pipeline: gate, cases, fingerprints, job store. |
 | `cmd/apikey-check/` | Standalone API-key checking utility. |
-| `frontend/`, `www/`, `server/` | Legacy dashboards — not part of the build (see below). |
+
+To change the dashboard, edit `dashboard/index.html` and rebuild — there is no
+build step, package manager or bundler, and no network access is needed at
+runtime.
 
 CI (`go.yml`) checks formatting, runs `go vet`, runs the tests including under
 `-race`, and builds all six OS/arch combinations. Releases attach binaries for
@@ -619,24 +698,18 @@ Windows, Linux and macOS on amd64 and arm64.
 
 Recorded honestly, so nobody has to rediscover them:
 
-- **The AI review job pipeline is not wired up.** The flag → gate → clone → stage
-  → result flow in `aireview/` and `web_ai.go` has no caller in the shipped UI,
-  runs no model, and never reaches a terminal `done` state. The part of AI review
-  that *does* work end to end is the per-match chat described above.
-- **Legacy dashboards are not served.** The reachable dashboard is the embedded
-  one in `web.go`. The React app in `frontend/` (served only by the separate,
-  unbuilt `server/` module) and the vanilla page in `www/public/` are unreachable
-  and kept for reference only.
-- **`web_v2.go` is dead code.** Its Prometheus `/metrics` endpoint, TLS support,
-  pagination and WebSocket upgrade are never registered, because
-  `StartWebServerV2` has no caller.
-- **No database backend.** `core/database.go` defines a GORM/PostgreSQL/SQLite
-  layer that nothing calls. Any documentation mentioning a database, Redis,
-  Prometheus or Grafana describes the old stack, not this one.
+- **No authentication on the dashboard.** It is protected by loopback binding,
+  a same-origin check and a local-only guard on the AI routes — not by a login.
+  Put it behind an authenticating proxy before exposing it.
+- **Reviews need a reachable provider.** With no provider configured the Review
+  tab works, but every review fails with the provider's error; the Settings tab's
+  **Test Connection** tells you why.
 - **`webhook_queue` settings are ignored** — the live queue uses fixed values in
   `core/validators.go`.
 - **Token pruning needs a writable `config.yaml`.** With a read-only mount,
   pruning is skipped.
+- **`--local` scans once.** The directory is scanned and the results are fed to
+  the dashboard; there is no watch mode and no follow-up GitHub scan in that mode.
 
 ---
 

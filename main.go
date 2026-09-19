@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -1366,13 +1365,12 @@ func runWebMode() {
 	// Start scanner in background AND serve the web UI concurrently.
 	go runScanner()
 
-	// Wire the AI review service (from config) before the web server starts.
-	if err := InitAIReview(getSession().Config); err != nil {
-		log.Printf("[web] AI review init failed: %v", err)
+	// Wire the AI security review (settings store + review store) before the
+	// web server starts. It is optional: on failure the dashboard still runs and
+	// the Review and Settings tabs report that it is unavailable.
+	if err := initAIReview(getSession().Config); err != nil {
+		fmt.Printf("⚠️  AI review unavailable: %v\n", err)
 	}
-
-	// Wire the interactive AI-review chat (secret + file + repo analysis).
-	initAIChat(getSession().Config)
 
 	// Start web server (blocking)
 	if err := modeConfig.SetupIntegratedUI(); err != nil {
@@ -1598,6 +1596,14 @@ func executeScanner() {
 		}
 		getSession().MatchLogger.Close()
 		exitScanner(rc)
+
+		// --local scans the given directory and nothing else, so there is no
+		// GitHub work to start. Falling through to the workers below would make
+		// them demand a GitHub token that --local explicitly does not require,
+		// which killed the process - and with it the web dashboard - the moment
+		// a local scan finished. In console mode exitScanner has already
+		// exited; in web mode this keeps the dashboard serving the results.
+		return
 	}
 
 	if *getSession().Options.SearchQuery != "" {

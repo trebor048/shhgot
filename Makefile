@@ -2,7 +2,8 @@
 # shhgit — build, test and run targets
 #
 # The product is a single static Go binary built from the repo root.
-# `server/` is a legacy standalone module and is NOT part of the build.
+# The dashboard is embedded from dashboard/index.html; there is no build step
+# for it and no JavaScript toolchain to install.
 # ===========================================================================
 
 SHELL    := /bin/sh
@@ -16,7 +17,7 @@ GOFLAGS  := CGO_ENABLED=0
 .DEFAULT_GOAL := help
 .PHONY: help build build-all test test-race vet fmt fmt-check tidy clean \
         run run-web run-tui run-scanner scan test-tokens \
-        frontend docker-build docker-up docker-down docker-logs
+        docker-build docker-up docker-down docker-logs
 
 help: ## Show this help
 	@echo "shhgit targets:"
@@ -89,11 +90,6 @@ scan: ## Scan a local directory, e.g. make scan DIR=/path/to/code
 
 test-tokens: ## Validate AI provider tokens from config.yaml (no scanning)
 	./$(BINARY)$(GOEXE) --test-tokens --config-path .
-
-# --- Frontend (legacy, optional) -------------------------------------------
-
-frontend: ## Build the legacy React dashboard into frontend/dist
-	cd frontend && npm install && npm run build
 
 # --- Docker ----------------------------------------------------------------
 

@@ -15,8 +15,19 @@
 *.yaml      text eol=lf
 *.md        text eol=lf
 *.json      text eol=lf
+*.html      text eol=lf
+*.css       text eol=lf
+*.js        text eol=lf
 Makefile    text eol=lf
 Dockerfile  text eol=lf
+
+# Templates whose names do not end in a listed extension; without these,
+# `* text=auto` plus core.autocrlf=true rewrites them to CRLF on Windows.
+config.yaml.example text eol=lf
+.env.example        text eol=lf
+.gitattributes      text eol=lf
+.gitignore          text eol=lf
+.dockerignore       text eol=lf
 
 # Binary assets are never converted.
 *.png       binary

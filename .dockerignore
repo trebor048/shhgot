@@ -14,7 +14,6 @@ config.yaml.*
 shhgit
 shhgit.exe
 shhgit-*
-frontend/node_modules
 node_modules
 dist
 build
@@ -29,7 +28,6 @@ remote_connection_strings.txt
 
 # Local/agent workspace state
 ai_review
-aireview/jobs
 .swarm
 .opencode
 .superpowers
