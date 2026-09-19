@@ -232,31 +232,41 @@ type reviewRequest struct {
 }
 
 // reviewView is what the dashboard receives for a review.
+//
+// Secret and Assessment are omitted unless the view is full. The list endpoint
+// omits them deliberately: the dashboard polls it every few seconds and renders
+// only metadata from it (id, status, signature, file, repo, provider, model), so
+// sending the credential and the whole assessment on every poll would put live
+// secrets on a hot path for nothing. The detail endpoint carries them.
 type reviewView struct {
 	ID         string                `json:"id"`
 	CreatedAt  time.Time             `json:"created_at"`
 	UpdatedAt  time.Time             `json:"updated_at"`
 	Signature  string                `json:"signature"`
-	Secret     string                `json:"secret"`
+	Secret     string                `json:"secret,omitempty"`
 	File       string                `json:"file"`
 	URL        string                `json:"url"`
 	Repo       string                `json:"repo"`
 	Provider   string                `json:"provider"`
 	Model      string                `json:"model"`
 	Status     reviewstore.Status    `json:"status"`
-	Assessment string                `json:"assessment"`
-	Error      string                `json:"error"`
+	Assessment string                `json:"assessment,omitempty"`
+	Error      string                `json:"error,omitempty"`
 	Messages   []reviewstore.Message `json:"messages,omitempty"`
 }
 
-func viewOf(r *reviewstore.Review, withMessages bool) reviewView {
+// viewOf builds the JSON view of a review. full includes the credential, the
+// assessment and the chat history; without it only list metadata is returned.
+func viewOf(r *reviewstore.Review, full bool) reviewView {
 	v := reviewView{
 		ID: r.ID, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
-		Signature: r.Signature, Secret: r.Secret, File: r.File, URL: r.URL, Repo: r.Repo,
+		Signature: r.Signature, File: r.File, URL: r.URL, Repo: r.Repo,
 		Provider: r.Provider, Model: r.Model, Status: r.Status,
-		Assessment: r.Assessment, Error: r.Error,
+		Error: r.Error,
 	}
-	if withMessages {
+	if full {
+		v.Secret = r.Secret
+		v.Assessment = r.Assessment
 		v.Messages = r.Messages
 	}
 	return v

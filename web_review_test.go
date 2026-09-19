@@ -324,6 +324,62 @@ func TestReviewAPIHappyPath(t *testing.T) {
 	}
 }
 
+// The dashboard polls the list every few seconds and renders only metadata from
+// it, so the response must not carry the credential or the assessment text: that
+// would put live secrets on a hot path for no reason. The detail endpoint still
+// has to carry both, or the detail pane would have nothing to show.
+func TestReviewListOmitsCredentialAndAssessment(t *testing.T) {
+	withReviewEnv(t)
+
+	rev := &reviewstore.Review{
+		Signature:  "Stripe Live Secret Key",
+		Secret:     "sk_live_leakedCredentialValue",
+		File:       "billing/stripe.go",
+		Repo:       "acme/app",
+		Status:     reviewstore.StatusQueued,
+		Provider:   "ollama",
+		Model:      "test-model",
+		Context:    "stripe.Key = sk_live_leakedCredentialValue",
+		Assessment: "## What it is\nA live Stripe secret key.",
+	}
+	if err := reviewStore.Create(rev); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	reviewCollectionHandler(rec, localRequest(http.MethodGet, "/api/review", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "sk_live_leakedCredentialValue") {
+		t.Error("the list response leaked the plaintext credential")
+	}
+	if strings.Contains(body, "live Stripe secret key") {
+		t.Error("the list response carried the assessment text")
+	}
+	// ...while still carrying everything the list rows actually render.
+	for _, want := range []string{"id", "status", "signature", "created_at", "file", "repo", "provider", "model"} {
+		if !strings.Contains(body, `"`+want+`"`) {
+			t.Errorf("the list response is missing %q, which the list rows render", want)
+		}
+	}
+
+	// The detail view must still carry both, or the detail pane breaks.
+	rec = httptest.NewRecorder()
+	reviewItemHandler(rec, localRequest(http.MethodGet, "/api/review/"+rev.ID, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d", rec.Code)
+	}
+	detail := rec.Body.String()
+	if !strings.Contains(detail, "sk_live_leakedCredentialValue") {
+		t.Error("the detail response dropped the credential the detail pane displays")
+	}
+	if !strings.Contains(detail, "live Stripe secret key") {
+		t.Error("the detail response dropped the assessment the detail pane displays")
+	}
+}
+
 func TestReviewAPICreatesFromStoredMatchFile(t *testing.T) {
 	withReviewEnv(t)
 
