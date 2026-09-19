@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -80,16 +82,47 @@ const (
 // defaultProvider is used when nothing has configured a provider yet.
 const defaultProvider = ProviderDeepSeek
 
-// Timeouts. chatTimeout bounds a complete (non-streaming) Chat call;
-// Stream additionally honours ctx so a long generation can outlive it.
+// Timeouts.
+//
+// chatTimeout bounds a complete non-streaming Chat call, response body included,
+// so it is applied as http.Client.Timeout.
+//
+// Streaming must NOT use it. http.Client.Timeout covers the whole exchange
+// including reading the body, so a long generation would be killed mid-stream
+// no matter how much time the caller's context allows. The streaming client
+// below therefore sets no total timeout and is bounded instead by connection
+// and header timeouts, with the caller's context as the real budget.
 const (
 	chatTimeout       = 60 * time.Second
 	testConnTimeout   = 15 * time.Second
-	maxErrorBodyBytes = 4 << 10 // 4KB
+	streamDialTimeout = 10 * time.Second
+	// streamHeaderTimeout leaves room for a cold model load before the first
+	// byte, which a local Ollama can take a while over, while still failing a
+	// genuinely dead endpoint instead of hanging.
+	streamHeaderTimeout = 60 * time.Second
+	maxErrorBodyBytes   = 4 << 10 // 4KB
 	// maxStreamLine is the largest single SSE/NDJSON line the stream parsers
 	// accept. Long delta lines must not abort a stream.
 	maxStreamLine = 4 << 20 // 4MB
 )
+
+// streamHTTPClient is shared by every provider's streaming path. It
+// deliberately has no Timeout: see the note above.
+var streamHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   streamDialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   streamDialTimeout,
+		ResponseHeaderTimeout: streamHeaderTimeout,
+		ExpectContinueTimeout: time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          16,
+		MaxIdleConnsPerHost:   4,
+	},
+}
 
 // providerSpec describes the built-in defaults for one provider.
 type providerSpec struct {

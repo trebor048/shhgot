@@ -20,15 +20,19 @@ type openAICompatClient struct {
 	baseURL string
 	model   string
 	http    *http.Client
+	// streamHTTP has no total timeout; a long generation must be bounded by the
+	// caller's context, not by http.Client.Timeout.
+	streamHTTP *http.Client
 }
 
 func newOpenAICompatClient(s Settings) *openAICompatClient {
 	return &openAICompatClient{
-		name:    s.Provider,
-		apiKey:  s.APIKey,
-		baseURL: s.BaseURL,
-		model:   s.Model,
-		http:    &http.Client{Timeout: chatTimeout},
+		name:       s.Provider,
+		apiKey:     s.APIKey,
+		baseURL:    s.BaseURL,
+		model:      s.Model,
+		http:       &http.Client{Timeout: chatTimeout},
+		streamHTTP: streamHTTPClient,
 	}
 }
 
@@ -80,7 +84,7 @@ func (c *openAICompatClient) chat(ctx context.Context, msgs []Message, maxTokens
 		return "", fmt.Errorf("%s: encode request: %w", c.name, err)
 	}
 
-	resp, err := c.post(ctx, "chat/completions", body)
+	resp, err := c.post(ctx, "chat/completions", body, c.http)
 	if err != nil {
 		return "", err
 	}
@@ -124,7 +128,7 @@ func (c *openAICompatClient) Stream(ctx context.Context, msgs []Message, onDelta
 		return fmt.Errorf("%s: encode request: %w", c.name, err)
 	}
 
-	resp, err := c.post(ctx, "chat/completions", body)
+	resp, err := c.post(ctx, "chat/completions", body, c.streamHTTP)
 	if err != nil {
 		return err
 	}
@@ -189,8 +193,9 @@ func (c *openAICompatClient) Stream(ctx context.Context, msgs []Message, onDelta
 
 // post sends one JSON request to {base}/{path}. The Authorization header is
 // only added when a key is set, which is what lets keyless custom endpoints and
-// Ollama work.
-func (c *openAICompatClient) post(ctx context.Context, path string, body []byte) (*http.Response, error) {
+// Ollama work. hc selects the timeout policy: c.http for a bounded Chat call,
+// c.streamHTTP for a stream whose budget is the caller's context.
+func (c *openAICompatClient) post(ctx context.Context, path string, body []byte, hc *http.Client) (*http.Response, error) {
 	url := joinURL(c.baseURL, path)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -202,7 +207,7 @@ func (c *openAICompatClient) post(ctx context.Context, path string, body []byte)
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 
-	resp, err := c.http.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		// Never surface the API key, even if the transport echoed the request.
 		return nil, fmt.Errorf("%s: request failed: %w", c.name, redactError(err, c.apiKey))

@@ -22,14 +22,19 @@ type ollamaClient struct {
 	baseURL string
 	model   string
 	http    *http.Client
+	// streamHTTP has no total timeout; a local model generating a long
+	// assessment must be bounded by the caller's context, not by the 60s
+	// whole-response limit that would otherwise cut it off mid-stream.
+	streamHTTP *http.Client
 }
 
 func newOllamaClient(s Settings) *ollamaClient {
 	return &ollamaClient{
-		name:    s.Provider,
-		baseURL: s.BaseURL,
-		model:   s.Model,
-		http:    &http.Client{Timeout: chatTimeout},
+		name:       s.Provider,
+		baseURL:    s.BaseURL,
+		model:      s.Model,
+		http:       &http.Client{Timeout: chatTimeout},
+		streamHTTP: streamHTTPClient,
 	}
 }
 
@@ -79,7 +84,7 @@ func (c *ollamaClient) chat(ctx context.Context, msgs []Message, maxTokens int) 
 		return "", fmt.Errorf("%s: encode request: %w", c.name, err)
 	}
 
-	resp, err := c.post(ctx, "api/chat", body)
+	resp, err := c.post(ctx, "api/chat", body, c.http)
 	if err != nil {
 		return "", err
 	}
@@ -119,7 +124,7 @@ func (c *ollamaClient) Stream(ctx context.Context, msgs []Message, onDelta func(
 		return fmt.Errorf("%s: encode request: %w", c.name, err)
 	}
 
-	resp, err := c.post(ctx, "api/chat", body)
+	resp, err := c.post(ctx, "api/chat", body, c.streamHTTP)
 	if err != nil {
 		return err
 	}
@@ -168,8 +173,10 @@ func (c *ollamaClient) Stream(ctx context.Context, msgs []Message, onDelta func(
 }
 
 // post sends one JSON request to {base}/{path}. Ollama's native API takes no
-// credentials, so no Authorization header is ever sent.
-func (c *ollamaClient) post(ctx context.Context, path string, body []byte) (*http.Response, error) {
+// credentials, so no Authorization header is ever sent. hc selects the timeout
+// policy: c.http for a bounded Chat call, c.streamHTTP for a stream whose
+// budget is the caller's context.
+func (c *ollamaClient) post(ctx context.Context, path string, body []byte, hc *http.Client) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL(c.baseURL, path), bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("%s: build request: %w", c.name, err)
@@ -177,7 +184,7 @@ func (c *ollamaClient) post(ctx context.Context, path string, body []byte) (*htt
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/x-ndjson, application/json")
 
-	resp, err := c.http.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%s: request failed: %w", c.name, err)
 	}
