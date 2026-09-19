@@ -22,22 +22,22 @@ import (
 // ─── ANSI / Color Constants ───────────────────────────────────────────
 
 const (
-	reset      = "\033[0m"
-	bold       = "\033[1m"
-	dim        = "\033[2m"
-	red        = "\033[31m"
-	green      = "\033[32m"
-	yellow     = "\033[33m"
-	blue       = "\033[34m"
-	magenta    = "\033[35m"
-	cyan       = "\033[36m"
-	white      = "\033[37m"
-	brightRed  = "\033[91m"
+	reset       = "\033[0m"
+	bold        = "\033[1m"
+	dim         = "\033[2m"
+	red         = "\033[31m"
+	green       = "\033[32m"
+	yellow      = "\033[33m"
+	blue        = "\033[34m"
+	magenta     = "\033[35m"
+	cyan        = "\033[36m"
+	white       = "\033[37m"
+	brightRed   = "\033[91m"
 	brightGreen = "\033[92m"
 	brightCyan  = "\033[96m"
-	bgRed      = "\033[41m"
-	bgGreen    = "\033[42m"
-	bgYellow   = "\033[43m"
+	bgRed       = "\033[41m"
+	bgGreen     = "\033[42m"
+	bgYellow    = "\033[43m"
 
 	iconCheck   = "✅"
 	iconCross   = "❌"
@@ -87,20 +87,20 @@ type CheckResult struct {
 }
 
 type Provider struct {
-	ID          string   // internal ID
-	DisplayName string   // pretty name
-	Category    string   // "AI/LLM", "Cloud", "DevTools", etc.
-	BaseURL     string   // API base URL
-	CheckPath   string   // endpoint to check key validity
-	CheckMethod string   // GET, POST, etc.
-	AuthType    AuthType // how to authenticate
-	AuthHeader  string   // header name for auth
-	AuthPrefix  string   // "Bearer ", "token ", etc.
-	EnvVars     []string // environment variable names
-	KeyPrefixes []string // known key prefix patterns
-	DocsURL     string   // provider docs link
-	CanCheckBalance bool // whether balance/usage can be queried
-	BalancePath     string // path for balance/usage info
+	ID              string   // internal ID
+	DisplayName     string   // pretty name
+	Category        string   // "AI/LLM", "Cloud", "DevTools", etc.
+	BaseURL         string   // API base URL
+	CheckPath       string   // endpoint to check key validity
+	CheckMethod     string   // GET, POST, etc.
+	AuthType        AuthType // how to authenticate
+	AuthHeader      string   // header name for auth
+	AuthPrefix      string   // "Bearer ", "token ", etc.
+	EnvVars         []string // environment variable names
+	KeyPrefixes     []string // known key prefix patterns
+	DocsURL         string   // provider docs link
+	CanCheckBalance bool     // whether balance/usage can be queried
+	BalancePath     string   // path for balance/usage info
 }
 
 // ─── Provider Registry ─────────────────────────────────────────────────
@@ -111,45 +111,45 @@ var providers = []Provider{
 		ID: "openai", DisplayName: "OpenAI", Category: "AI/LLM",
 		BaseURL: "https://api.openai.com", CheckPath: "/v1/models", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars: []string{"OPENAI_API_KEY", "OPENAI_KEY", "OPENAI_SECRET_KEY"},
-		KeyPrefixes: []string{"sk-"},
+		EnvVars:         []string{"OPENAI_API_KEY", "OPENAI_KEY", "OPENAI_SECRET_KEY"},
+		KeyPrefixes:     []string{"sk-"},
 		CanCheckBalance: true, BalancePath: "/v1/organization/usage?date=",
 	},
 	{
 		ID: "anthropic", DisplayName: "Anthropic", Category: "AI/LLM",
 		BaseURL: "https://api.anthropic.com", CheckPath: "/v1/messages", CheckMethod: "POST",
 		AuthType: AuthAnthropicKey, AuthHeader: "x-api-key", AuthPrefix: "",
-		EnvVars: []string{"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"},
-		KeyPrefixes: []string{"sk-ant-"},
+		EnvVars:         []string{"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"},
+		KeyPrefixes:     []string{"sk-ant-"},
 		CanCheckBalance: true, BalancePath: "/v1/messages?beta=true",
 	},
 	{
 		ID: "google", DisplayName: "Google/Gemini", Category: "AI/LLM",
 		BaseURL: "https://generativelanguage.googleapis.com", CheckPath: "/v1beta/models", CheckMethod: "GET",
 		AuthType: AuthURLParam, AuthHeader: "", AuthPrefix: "",
-		EnvVars: []string{"GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_AI_STUDIO_KEY"},
+		EnvVars:     []string{"GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_AI_STUDIO_KEY"},
 		KeyPrefixes: []string{"AIza"},
 	},
 	{
 		ID: "xai", DisplayName: "xAI / Grok", Category: "AI/LLM",
 		BaseURL: "https://api.x.ai", CheckPath: "/v1/models", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars: []string{"XAI_API_KEY", "GROK_API_KEY"},
+		EnvVars:     []string{"XAI_API_KEY", "GROK_API_KEY"},
 		KeyPrefixes: []string{"xai-"},
 	},
 	{
 		ID: "deepseek", DisplayName: "DeepSeek", Category: "AI/LLM",
 		BaseURL: "https://api.deepseek.com", CheckPath: "/v1/models", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars: []string{"DEEPSEEK_API_KEY", "DEEPSEEK_KEY"},
+		EnvVars:     []string{"DEEPSEEK_API_KEY", "DEEPSEEK_KEY"},
 		KeyPrefixes: []string{"sk-"},
 	},
 	{
 		ID: "openrouter", DisplayName: "OpenRouter", Category: "AI/LLM",
 		BaseURL: "https://openrouter.ai", CheckPath: "/api/v1/auth/key", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars: []string{"OPENROUTER_API_KEY", "OPENROUTER_KEY"},
-		KeyPrefixes: []string{"sk-or-v1-"},
+		EnvVars:         []string{"OPENROUTER_API_KEY", "OPENROUTER_KEY"},
+		KeyPrefixes:     []string{"sk-or-v1-"},
 		CanCheckBalance: true, BalancePath: "/api/v1/auth/key",
 	},
 
@@ -158,14 +158,14 @@ var providers = []Provider{
 		ID: "groq", DisplayName: "Groq", Category: "AI/LLM",
 		BaseURL: "https://api.groq.com", CheckPath: "/openai/v1/models", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars: []string{"GROQ_API_KEY", "GROQ_KEY"},
+		EnvVars:     []string{"GROQ_API_KEY", "GROQ_KEY"},
 		KeyPrefixes: []string{"gsk_"},
 	},
 	{
 		ID: "together", DisplayName: "Together AI", Category: "AI/LLM",
 		BaseURL: "https://api.together.xyz", CheckPath: "/v1/models", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars: []string{"TOGETHER_API_KEY", "TOGETHER_KEY"},
+		EnvVars:     []string{"TOGETHER_API_KEY", "TOGETHER_KEY"},
 		KeyPrefixes: []string{"sk-"},
 	},
 	{
@@ -204,14 +204,14 @@ var providers = []Provider{
 		ID: "alibaba", DisplayName: "Alibaba / Qwen", Category: "AI/LLM",
 		BaseURL: "https://dashscope.aliyuncs.com/compatible-mode", CheckPath: "/v1/models", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars: []string{"DASHSCOPE_API_KEY", "ALIBABA_API_KEY", "QWEN_API_KEY"},
+		EnvVars:     []string{"DASHSCOPE_API_KEY", "ALIBABA_API_KEY", "QWEN_API_KEY"},
 		KeyPrefixes: []string{"sk-"},
 	},
 	{
 		ID: "kimi", DisplayName: "Kimi / Moonshot", Category: "AI/LLM",
 		BaseURL: "https://api.moonshot.cn", CheckPath: "/v1/models", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars: []string{"MOONSHOT_API_KEY", "KIMI_API_KEY"},
+		EnvVars:     []string{"MOONSHOT_API_KEY", "KIMI_API_KEY"},
 		KeyPrefixes: []string{"sk-"},
 	},
 	{
@@ -232,14 +232,14 @@ var providers = []Provider{
 		ID: "perplexity", DisplayName: "Perplexity", Category: "AI/LLM",
 		BaseURL: "https://api.perplexity.ai", CheckPath: "/models", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars: []string{"PERPLEXITY_API_KEY", "PERPLEXITY_KEY", "PPLX_API_KEY"},
+		EnvVars:     []string{"PERPLEXITY_API_KEY", "PERPLEXITY_KEY", "PPLX_API_KEY"},
 		KeyPrefixes: []string{"pplx-"},
 	},
 	{
 		ID: "replicate", DisplayName: "Replicate", Category: "AI/LLM",
 		BaseURL: "https://api.replicate.com", CheckPath: "/v1/account", CheckMethod: "GET",
 		AuthType: AuthToken, AuthHeader: "Authorization", AuthPrefix: "Token ",
-		EnvVars: []string{"REPLICATE_API_KEY", "REPLICATE_API_TOKEN"},
+		EnvVars:     []string{"REPLICATE_API_KEY", "REPLICATE_API_TOKEN"},
 		KeyPrefixes: []string{"r8_"},
 	},
 	{
@@ -264,7 +264,7 @@ var providers = []Provider{
 		ID: "huggingface", DisplayName: "Hugging Face", Category: "AI/LLM",
 		BaseURL: "https://huggingface.co", CheckPath: "/api/whoami", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars: []string{"HF_API_KEY", "HUGGINGFACE_API_KEY", "HF_TOKEN", "HUGGINGFACE_TOKEN"},
+		EnvVars:     []string{"HF_API_KEY", "HUGGINGFACE_API_KEY", "HF_TOKEN", "HUGGINGFACE_TOKEN"},
 		KeyPrefixes: []string{"hf_"},
 	},
 	{
@@ -277,7 +277,7 @@ var providers = []Provider{
 		ID: "stability", DisplayName: "Stability AI", Category: "AI/LLM",
 		BaseURL: "https://api.stability.ai", CheckPath: "/v1/user/account", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars: []string{"STABILITY_API_KEY", "STABILITY_KEY"},
+		EnvVars:     []string{"STABILITY_API_KEY", "STABILITY_KEY"},
 		KeyPrefixes: []string{"sk-"},
 	},
 
@@ -292,7 +292,7 @@ var providers = []Provider{
 		ID: "digitalocean", DisplayName: "DigitalOcean", Category: "Cloud",
 		BaseURL: "https://api.digitalocean.com", CheckPath: "/v2/account", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars: []string{"DIGITALOCEAN_ACCESS_TOKEN", "DO_API_TOKEN", "DO_PAT"},
+		EnvVars:     []string{"DIGITALOCEAN_ACCESS_TOKEN", "DO_API_TOKEN", "DO_PAT"},
 		KeyPrefixes: []string{"dop_v1_"},
 	},
 	{
@@ -313,21 +313,21 @@ var providers = []Provider{
 		ID: "github", DisplayName: "GitHub", Category: "DevTools",
 		BaseURL: "https://api.github.com", CheckPath: "/user", CheckMethod: "GET",
 		AuthType: AuthGitHubToken, AuthHeader: "Authorization", AuthPrefix: "token ",
-		EnvVars: []string{"GITHUB_TOKEN", "GITHUB_ACCESS_TOKEN", "GH_TOKEN"},
+		EnvVars:     []string{"GITHUB_TOKEN", "GITHUB_ACCESS_TOKEN", "GH_TOKEN"},
 		KeyPrefixes: []string{"ghp_", "gho_", "github_pat_"},
 	},
 	{
 		ID: "copilot", DisplayName: "GitHub Copilot", Category: "DevTools",
 		BaseURL: "https://api.github.com", CheckPath: "/copilot/chat/diagnostics", CheckMethod: "GET",
 		AuthType: AuthGitHubToken, AuthHeader: "Authorization", AuthPrefix: "token ",
-		EnvVars: []string{"COPILOT_TOKEN", "GITHUB_COPILOT_TOKEN", "GH_COPILOT_TOKEN"},
+		EnvVars:     []string{"COPILOT_TOKEN", "GITHUB_COPILOT_TOKEN", "GH_COPILOT_TOKEN"},
 		KeyPrefixes: []string{"ghu_", "gho_"},
 	},
 	{
 		ID: "gitlab", DisplayName: "GitLab", Category: "DevTools",
 		BaseURL: "https://gitlab.com", CheckPath: "/api/v4/user", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars: []string{"GITLAB_TOKEN", "GITLAB_ACCESS_TOKEN"},
+		EnvVars:     []string{"GITLAB_TOKEN", "GITLAB_ACCESS_TOKEN"},
 		KeyPrefixes: []string{"glpat-"},
 	},
 
@@ -431,7 +431,7 @@ func discoverKeys() map[string][]string {
 				keys[p.ID] = appendIfUnique(keys[p.ID], val)
 			}
 		}
-		if vars := envLike(os.Getenv(p.ID+"_API_KEY")); vars != "" {
+		if vars := envLike(os.Getenv(p.ID + "_API_KEY")); vars != "" {
 			keys[p.ID] = appendIfUnique(keys[p.ID], vars)
 		}
 	}
@@ -630,7 +630,7 @@ func (c *Checker) checkKey(ctx context.Context, p Provider, key string) CheckRes
 	result := CheckResult{
 		Provider: p.ID, DisplayName: p.DisplayName,
 		Endpoint: p.BaseURL + p.CheckPath,
-		Status: "error",
+		Status:   "error",
 	}
 
 	start := time.Now()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -18,11 +19,54 @@ type GitHubClientWrapper struct {
 }
 
 const (
-	perPage    = 100             // Increased from 300 for better performance
-	sleep      = 5 * time.Second // Faster polling for more results
-	maxPages   = 3               // Get more events per cycle
-	workerPool = 20              // More concurrent workers
+	defaultPerPage    = 100             // GitHub API max page size
+	defaultSleep      = 5 * time.Second // Default event-poll interval
+	defaultMaxPages   = 3               // Default pages of events per cycle
+	defaultWorkerPool = 20              // Default concurrent event processors
 )
+
+// perfTuning resolves the "performance" section of config.yaml into the
+// values used by the event-poll loops, falling back to the compiled-in
+// defaults. api_sleep_seconds is floored at 1s because time.Tick panics on a
+// non-positive interval.
+func perfTuning(s *Session) (perPage int, sleep time.Duration, maxPages, workerPool int) {
+	perPage, sleep, maxPages, workerPool = defaultPerPage, defaultSleep, defaultMaxPages, defaultWorkerPool
+	if s == nil || s.Config == nil {
+		return
+	}
+	p := s.Config.Performance
+	perPage = clampInt(p.Int(p.APIPerPage, perPage), 1, 100)
+	maxPages = clampInt(p.Int(p.APIPagesPerCycle, maxPages), 1, 100)
+	workerPool = clampInt(p.Int(p.WorkerPoolSize, workerPool), 1, 1000)
+	if secs := p.Int(p.APISleepSeconds, int(defaultSleep/time.Second)); secs >= 1 {
+		sleep = time.Duration(secs) * time.Second
+	}
+	return
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// isUnauthorized reports whether a GitHub API call was rejected with HTTP 401
+// (bad credentials — revoked or expired token). The raw *github.Response is
+// checked first, then the wrapped *github.ErrorResponse, because some callers
+// observe a nil response on transport errors.
+func isUnauthorized(err error, resp *github.Response) bool {
+	if resp != nil && resp.StatusCode == http.StatusUnauthorized {
+		return true
+	}
+	if er, ok := err.(*github.ErrorResponse); ok && er.Response != nil {
+		return er.Response.StatusCode == http.StatusUnauthorized
+	}
+	return false
+}
 
 // RateLimitManager tracks and manages rate limits across tokens
 type RateLimitManager struct {
@@ -44,6 +88,8 @@ func GetRepositories(session *Session) {
 	localCtx, cancel := context.WithCancel(session.Context)
 	defer cancel()
 
+	perPage, sleep, maxPages, workerPool := perfTuning(session)
+
 	observedKeys := map[string]bool{}
 	var observedKeysMutex sync.Mutex
 	pageCount := 0
@@ -60,46 +106,54 @@ func GetRepositories(session *Session) {
 
 			// Rotate through tokens to distribute rate limit usage
 			client := session.GetClient()
-			
+
 			// Add timeout to API call
 			ctx, cancel := context.WithTimeout(localCtx, 10*time.Second)
 			events, resp, err := client.Activity.ListEvents(ctx, opt)
 			cancel()
 
-		if err != nil {
-			if _, ok := err.(*github.RateLimitError); ok {
-				client.RateLimitedUntil = resp.Rate.Reset.Time
+			if err != nil {
+				// A revoked/expired token is dropped from config.yaml and the
+				// pool immediately so it is never retried.
+				if isUnauthorized(err, resp) {
+					session.RemoveUnauthorizedToken(client.Token)
+					session.FreeClient(client) // no-op: removed clients are dropped
+					continue
+				}
+
+				if _, ok := err.(*github.RateLimitError); ok {
+					client.RateLimitedUntil = resp.Rate.Reset.Time
+					session.FreeClient(client)
+					session.Progress.IncrementRateLimited()
+					tokenIndex++
+					continue
+				}
+
+				if _, ok := err.(*github.AbuseRateLimitError); ok {
+					session.FreeClient(client)
+					session.Progress.IncrementRateLimited()
+					time.Sleep(5 * time.Second)
+					continue
+				}
+
+				// Check for 422 Unprocessable Entity (pagination limit)
+				if resp != nil && resp.StatusCode == 422 {
+					session.Log.Debug("Pagination limit reached for events API")
+					session.FreeClient(client)
+					break
+				}
+
+				session.Log.Debug("Error getting GitHub events: %s", err)
 				session.FreeClient(client)
-				session.Progress.IncrementRateLimited()
-				tokenIndex++
+				noDataCount++
+				if noDataCount > 3 {
+					session.Log.Debug("Resetting after errors...")
+					noDataCount = 0
+					break
+				}
+				time.Sleep(1 * time.Second)
 				continue
 			}
-
-			if _, ok := err.(*github.AbuseRateLimitError); ok {
-				session.FreeClient(client)
-				session.Progress.IncrementRateLimited()
-				time.Sleep(5 * time.Second)
-				continue
-			}
-
-			// Check for 422 Unprocessable Entity (pagination limit)
-			if resp != nil && resp.StatusCode == 422 {
-				session.Log.Debug("Pagination limit reached for events API")
-				session.FreeClient(client)
-				break
-			}
-
-			session.Log.Debug("Error getting GitHub events: %s", err)
-			session.FreeClient(client)
-			noDataCount++
-			if noDataCount > 3 {
-				session.Log.Debug("Resetting after errors...")
-				noDataCount = 0
-				break
-			}
-			time.Sleep(1 * time.Second)
-			continue
-		}
 
 			session.FreeClient(client)
 			noDataCount = 0
@@ -108,9 +162,9 @@ func GetRepositories(session *Session) {
 				tokenMessage := fmt.Sprintf("[?] Token %s[..] has %d/%d calls remaining.", client.Token[:10], resp.Rate.Remaining, resp.Rate.Limit)
 
 				if resp.Rate.Remaining < 50 {
-					session.Log.Warn(tokenMessage)
+					session.Log.Warn("%s", tokenMessage)
 				} else {
-					session.Log.Debug(tokenMessage)
+					session.Log.Debug("%s", tokenMessage)
 				}
 			}
 
@@ -212,6 +266,8 @@ func GetGists(session *Session) {
 	localCtx, cancel := context.WithCancel(session.Context)
 	defer cancel()
 
+	_, sleep, _, _ := perfTuning(session)
+
 	observedKeys := map[string]bool{}
 	opt := &github.GistListOptions{}
 
@@ -225,6 +281,13 @@ func GetGists(session *Session) {
 		gists, resp, err := client.Gists.ListAll(localCtx, opt)
 
 		if err != nil {
+			if isUnauthorized(err, resp) {
+				session.RemoveUnauthorizedToken(client.Token)
+				// Client is dropped at the top of the next iteration; skip the
+				// rest of this pass and keep polling with any remaining tokens.
+				continue
+			}
+
 			if _, ok := err.(*github.RateLimitError); ok {
 				client.RateLimitedUntil = resp.Rate.Reset.Time
 				session.FreeClient(client)
@@ -274,6 +337,9 @@ func GetRepository(session *Session, id int64) (*github.Repository, error) {
 	repo, resp, err := client.Repositories.GetByID(session.Context, id)
 
 	if err != nil {
+		if isUnauthorized(err, resp) {
+			session.RemoveUnauthorizedToken(client.Token)
+		}
 		return nil, err
 	}
 

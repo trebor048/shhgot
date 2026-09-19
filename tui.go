@@ -41,10 +41,11 @@ func StartTUI() error {
 	// Print header
 	fmt.Println("\n╔════════════════════════════════════════════════════════════════╗")
 	fmt.Println("║         🔍 shhgit Terminal UI - Real-time Secret Scanner     ║")
-	fmt.Println("╚════════════════════════════════════════════════════════════════╝\n")
+	fmt.Println("╚════════════════════════════════════════════════════════════════╝")
+	fmt.Println("")
 
 	fmt.Println("📊 LIVE MATCH FEED")
-	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 	fmt.Println("Time        │ Priority │ Source   │ Repository              │ Signature")
 	fmt.Println("────────────┼──────────┼──────────┼─────────────────────────┼──────────────────────────")
@@ -83,7 +84,7 @@ func AddTUIMatch(match *TUIMatch) {
 	displayMatch(match)
 }
 
-// displayMatch displays a single match in real-time
+// displayMatch displays a single match in real-time with better formatting
 func displayMatch(m *TUIMatch) {
 	time := m.Timestamp.Format("15:04:05")
 	priority := getPriorityDisplay(m.Priority)
@@ -96,7 +97,11 @@ func displayMatch(m *TUIMatch) {
 	repoName = padRight(truncate(repoName, 23), 23)
 	sig := truncate(m.Signature, 26)
 
+	// Print the match row
 	fmt.Printf("%s │ %s │ %s │ %s │ %s\n", time, priority, source, repoName, sig)
+
+	// Print separator after each match for clarity
+	fmt.Println("────────────┼──────────┼──────────┼─────────────────────────┼──────────────────────────")
 }
 
 // displayStatsLoop periodically shows statistics

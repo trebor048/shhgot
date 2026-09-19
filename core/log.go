@@ -45,7 +45,7 @@ func GetColorFromHex(hex string) *color.Color {
 	// Use a simple approach - map common colors to ANSI codes
 	// For full RGB support, would need a newer version of fatih/color
 	hex = strings.ToLower(hex)
-	
+
 	switch hex {
 	case "#10a37f": // OpenAI green
 		return color.New(color.FgGreen).Add(color.Bold)

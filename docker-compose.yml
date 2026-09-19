@@ -1,51 +1,177 @@
 version: '3.8'
 
 services:
-  shhgit-server:
+  # Main shhgit application
+  shhgit:
     build:
-      context: ./server
+      context: .
       dockerfile: Dockerfile
-    container_name: shhgit.server
+    container_name: shhgit-app
     ports:
-      - "8000:8000"
+      - "${SHHGIT_PORT:-8080}:8080"
     environment:
-      - PORT=8000
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - shhgit
-
-  shhgit-web:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    container_name: shhgit.web
-    ports:
-      - "80:80"
+      - JWT_SECRET=${JWT_SECRET:-your-secret-key-change-this}
+      - DB_TYPE=${DB_TYPE:-postgres}
+      - DB_URL=postgres://${DB_USER:-shhgit}:${DB_PASSWORD:-shhgit}@postgres:5432/${DB_NAME:-shhgit}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
+      - ENABLE_AUTH=${ENABLE_AUTH:-false}
+      - ENABLE_TUNNEL=${ENABLE_TUNNEL:-false}
+      - TUNNEL_NAME=${TUNNEL_NAME:-shhgit}
+      - CLOUDFLARE_TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
     depends_on:
-      shhgit-server:
+      postgres:
         condition: service_healthy
-    networks:
-      - shhgit
-
-  shhgit-app:
-    build: .
-    container_name: shhgit.app
-    entrypoint: ["/app/shhgit", "--live=http://shhgit-server:8000/api/push"]
-    depends_on:
-      shhgit-server:
+      redis:
         condition: service_healthy
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./logs:/app/logs
+      - shhgit-cache:/app/cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     networks:
-      - shhgit
+      - shhgit-network
+    labels:
+      - "com.shhgit.description=shhgit Secret Scanner"
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: shhgit-db
     environment:
-      - TERM=xterm-256color
+      - POSTGRES_DB=${DB_NAME:-shhgit}
+      - POSTGRES_USER=${DB_USER:-shhgit}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-shhgit}
+      - POSTGRES_INITDB_ARGS=-c shared_buffers=256MB -c max_connections=200
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-shhgit}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - shhgit-network
+    labels:
+      - "com.shhgit.description=PostgreSQL Database"
+
+  # Redis Cache & Session Store
+  redis:
+    image: redis:7-alpine
+    container_name: shhgit-cache
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis-password}
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - shhgit-network
+    labels:
+      - "com.shhgit.description=Redis Cache"
+
+  # Prometheus Metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: shhgit-prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    restart: unless-stopped
+    networks:
+      - shhgit-network
+    depends_on:
+      - shhgit
+    labels:
+      - "com.shhgit.description=Prometheus Metrics"
+
+  # Grafana Dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: shhgit-grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    restart: unless-stopped
+    networks:
+      - shhgit-network
+    depends_on:
+      - prometheus
+    labels:
+      - "com.shhgit.description=Grafana Dashboards"
+
+  # Cloudflare Tunnel (optional)
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: shhgit-tunnel
+    command: tunnel run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    restart: unless-stopped
+    depends_on:
+      - shhgit
+    networks:
+      - shhgit-network
+    profiles:
+      - tunnel  # Only starts if: docker-compose --profile tunnel up
+    labels:
+      - "com.shhgit.description=Cloudflare Tunnel (optional)"
+
+  # Nginx Reverse Proxy (optional)
+  nginx:
+    image: nginx:alpine
+    container_name: shhgit-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    restart: unless-stopped
+    networks:
+      - shhgit-network
+    depends_on:
+      - shhgit
+    profiles:
+      - proxy  # Only starts if: docker-compose --profile proxy up
+    labels:
+      - "com.shhgit.description=Nginx Reverse Proxy (optional)"
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  shhgit-cache:
+    driver: local
 
 networks:
-  shhgit:
+  shhgit-network:
     driver: bridge

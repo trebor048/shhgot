@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { ExternalLink, ChevronDown, Copy } from 'lucide-react'
+import { ExternalLink, ChevronDown, Copy, Trash2, Sparkles } from 'lucide-react'
 
 export default function MatchTable({ matches, totalMatches, filters, setFilters }) {
   const [expandedId, setExpandedId] = useState(null)
@@ -32,6 +32,20 @@ export default function MatchTable({ matches, totalMatches, filters, setFilters 
 
   const copyToClipboard = (text) => {
     navigator.clipboard.writeText(text)
+  }
+
+  const deleteMatch = (matchId) => {
+    // TODO: Add API call to delete match
+    console.log('Delete match:', matchId)
+  }
+
+  const analyzeWithAI = (match) => {
+    // TODO: Add AI analysis functionality
+    console.log('Analyze with AI:', match)
+  }
+
+  const toggleExpanded = (matchId) => {
+    setExpandedId(expandedId === matchId ? null : matchId)
   }
 
   const getRepoName = (url) => {
@@ -132,9 +146,12 @@ export default function MatchTable({ matches, totalMatches, filters, setFilters 
                     </td>
                     <td className="px-4 py-3">
                       <button
-                        onClick={() => setExpandedId(expandedId === match.id ? null : match.id)}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          toggleExpanded(match.id)
+                        }}
                         className="p-1 hover:bg-slate-700 rounded transition"
-                        title="View details"
+                        title={expandedId === match.id ? "Hide details" : "View details"}
                       >
                         <ChevronDown size={18} className={`transition-transform ${expandedId === match.id ? 'rotate-180' : ''}`} />
                       </button>
@@ -143,7 +160,8 @@ export default function MatchTable({ matches, totalMatches, filters, setFilters 
                   {expandedId === match.id && (
                     <tr className="bg-slate-800/30 border-slate-700">
                       <td colSpan="8" className="px-4 py-4">
-                        <div className="space-y-3">
+                        <div className="space-y-4">
+                          {/* Repository Information */}
                           <div>
                             <p className="text-xs text-slate-400 uppercase tracking-wide mb-1">Repository URL</p>
                             <div className="flex items-center gap-2">
@@ -153,11 +171,14 @@ export default function MatchTable({ matches, totalMatches, filters, setFilters 
                               <button
                                 onClick={() => copyToClipboard(match.url)}
                                 className="p-2 hover:bg-slate-700 rounded transition"
+                                title="Copy URL"
                               >
                                 <Copy size={16} />
                               </button>
                             </div>
                           </div>
+                          
+                          {/* File Path */}
                           <div>
                             <p className="text-xs text-slate-400 uppercase tracking-wide mb-1">File Path</p>
                             <div className="flex items-center gap-2">
@@ -167,41 +188,82 @@ export default function MatchTable({ matches, totalMatches, filters, setFilters 
                               <button
                                 onClick={() => copyToClipboard(match.file)}
                                 className="p-2 hover:bg-slate-700 rounded transition"
+                                title="Copy file path"
                               >
                                 <Copy size={16} />
                               </button>
                             </div>
                           </div>
+                          
+                          {/* Detected Secrets */}
                           <div>
-                            <p className="text-xs text-slate-400 uppercase tracking-wide mb-1">Detected Secrets ({match.matches.length})</p>
-                            <div className="space-y-2">
+                            <p className="text-xs text-slate-400 uppercase tracking-wide mb-2">
+                              Detected Secrets ({match.matches.length})
+                            </p>
+                            <div className="space-y-3">
                               {match.matches.map((m, i) => (
-                                <div key={i} className="flex items-center gap-2">
-                                  <code className="flex-1 bg-slate-900 px-3 py-2 rounded text-xs break-all text-green-300">
-                                    {m.substring(0, 1)}{'*'.repeat(Math.max(0, m.length - 8))}{m.substring(Math.max(0, m.length - 4))}
+                                <div key={i} className="bg-slate-900/50 rounded-lg p-3 border border-slate-700">
+                                  <div className="flex items-start justify-between mb-2">
+                                    <span className="text-xs text-slate-400">Match #{i + 1}</span>
+                                    <div className="flex gap-1">
+                                      <button
+                                        onClick={() => copyToClipboard(m)}
+                                        className="p-1 hover:bg-slate-700 rounded transition text-slate-400 hover:text-slate-200"
+                                        title="Copy secret"
+                                      >
+                                        <Copy size={14} />
+                                      </button>
+                                      <button
+                                        onClick={() => analyzeWithAI(match)}
+                                        className="p-1 hover:bg-blue-600 rounded transition text-blue-400 hover:text-blue-300"
+                                        title="Analyze with AI"
+                                      >
+                                        <Sparkles size={14} />
+                                      </button>
+                                      <button
+                                        onClick={() => deleteMatch(match.id)}
+                                        className="p-1 hover:bg-red-600 rounded transition text-red-400 hover:text-red-300"
+                                        title="Delete match"
+                                      >
+                                        <Trash2 size={14} />
+                                      </button>
+                                    </div>
+                                  </div>
+                                  <code className="block bg-slate-900 px-3 py-2 rounded text-xs break-all text-green-300 font-mono">
+                                    {m.length > 100 ? (
+                                      <>
+                                        {m.substring(0, 30)}
+                                        <span className="text-slate-500">{'*'.repeat(Math.max(0, m.length - 60))}</span>
+                                        {m.substring(Math.max(0, m.length - 30))}
+                                      </>
+                                    ) : (
+                                      <>
+                                        {m.substring(0, 8)}
+                                        <span className="text-slate-500">{'*'.repeat(Math.max(0, m.length - 16))}</span>
+                                        {m.substring(Math.max(0, m.length - 8))}
+                                      </>
+                                    )}
                                   </code>
-                                  <button
-                                    onClick={() => copyToClipboard(m)}
-                                    className="p-2 hover:bg-slate-700 rounded transition"
-                                  >
-                                    <Copy size={16} />
-                                  </button>
                                 </div>
                               ))}
                             </div>
                           </div>
-                          <div className="grid grid-cols-3 gap-4 pt-2 border-t border-slate-700">
+                          
+                          {/* Match Metadata */}
+                          <div className="grid grid-cols-3 gap-4 pt-3 border-t border-slate-700">
                             <div>
-                              <p className="text-xs text-slate-400">Detected</p>
-                              <p className="text-sm font-medium">{new Date(match.timestamp).toLocaleString()}</p>
+                              <p className="text-xs text-slate-400 mb-1">Detected</p>
+                              <p className="text-sm font-medium text-slate-300">{new Date(match.timestamp).toLocaleString()}</p>
                             </div>
                             <div>
-                              <p className="text-xs text-slate-400">Priority</p>
-                              <p className="text-sm font-medium">{getPriorityLabel(match.priority)}</p>
+                              <p className="text-xs text-slate-400 mb-1">Priority</p>
+                              <span className={`inline-flex px-2 py-1 rounded text-xs font-medium ${getPriorityColor(match.priority)}`}>
+                                {getPriorityLabel(match.priority)}
+                              </span>
                             </div>
                             <div>
-                              <p className="text-xs text-slate-400">Stars</p>
-                              <p className="text-sm font-medium">{match.stars > 0 ? match.stars.toLocaleString() : 'N/A'}</p>
+                              <p className="text-xs text-slate-400 mb-1">Repository Stars</p>
+                              <p className="text-sm font-medium text-slate-300">{match.stars > 0 ? match.stars.toLocaleString() : 'N/A'}</p>
                             </div>
                           </div>
                         </div>

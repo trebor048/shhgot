@@ -3,10 +3,12 @@ import Dashboard from './components/Dashboard'
 import Sidebar from './components/Sidebar'
 import MatchTable from './components/MatchTable'
 import StatsPanel from './components/StatsPanel'
+import ScanProgress from './components/ScanProgress'
 import { AlertCircle, Menu, X } from 'lucide-react'
 
 export default function App() {
   const [matches, setMatches] = useState([])
+  const [isScanning, setIsScanning] = useState(false)
   const [stats, setStats] = useState({
     total_matches: 0,
     matches_by_source: {},
@@ -24,13 +26,21 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [activeTab, setActiveTab] = useState('matches')
 
-  // Polling for updates (since WebSocket isn't required for this)
+  // Polling for updates - preserve existing matches and merge with new ones
   useEffect(() => {
     const pollInterval = setInterval(async () => {
       try {
-        const response = await fetch('/api/ws')
+        const response = await fetch('/api/matches?page=1&limit=1000')
         const data = await response.json()
-        setMatches(data.matches || [])
+        
+        // Merge new matches with existing ones (avoid duplicates)
+        setMatches(prevMatches => {
+          const newMatches = data.matches || []
+          const existingIds = new Set(prevMatches.map(m => m.id))
+          const uniqueNew = newMatches.filter(m => !existingIds.has(m.id))
+          return [...prevMatches, ...uniqueNew]
+        })
+        
         if (data.stats) {
           setStats(data.stats)
         }
@@ -39,7 +49,7 @@ export default function App() {
         console.error('Polling error:', err)
         setConnected(false)
       }
-    }, 1000)
+    }, 5000) // Increased to 5 seconds to reduce API calls
 
     return () => clearInterval(pollInterval)
   }, [])
@@ -89,6 +99,9 @@ export default function App() {
 
   return (
     <div className="flex h-screen bg-slate-950 text-slate-100">
+      {/* Scan Progress Indicator */}
+      <ScanProgress isScanning={isScanning} />
+
       {/* Mobile sidebar toggle */}
       <button
         onClick={() => setSidebarOpen(!sidebarOpen)}

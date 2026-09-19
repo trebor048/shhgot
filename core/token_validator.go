@@ -123,13 +123,13 @@ const (
 	ProviderChainstack  = "Chainstack"
 
 	// Security/Other
-	ProviderShodan     = "Shodan"
-	ProviderVirusTotal = "VirusTotal"
-	ProviderIPInfo     = "IPInfo"
+	ProviderShodan      = "Shodan"
+	ProviderVirusTotal  = "VirusTotal"
+	ProviderIPInfo      = "IPInfo"
 	ProviderAbstractAPI = "AbstractAPI"
-	ProviderJWT        = "JWT"
-	ProviderGeneric    = "Generic API Key"
-	ProviderUnknown    = "Unknown"
+	ProviderJWT         = "JWT"
+	ProviderGeneric     = "Generic API Key"
+	ProviderUnknown     = "Unknown"
 )
 
 // TokenValidator handles validation of AI API tokens and other secrets
@@ -199,6 +199,87 @@ func (tv *TokenValidator) MarkAsTested(token string) {
 	tv.testedTokens[token] = true
 }
 
+// CRITICAL PERFORMANCE FIX: Pre-compile all token extraction regexes at package init
+// This avoids compiling 40+ regexes on EVERY match, which was causing massive slowdown
+var (
+	// AI/ML Tokens
+	openaiProjRegex      = regexp.MustCompile(`sk-proj-[a-zA-Z0-9_-]{20,}`)
+	openaiSvcRegex       = regexp.MustCompile(`sk-svcacct-[a-zA-Z0-9_-]{20,}`)
+	openaiRegex          = regexp.MustCompile(`sk-[a-zA-Z0-9_-]{20,}`)
+	anthropicRegex       = regexp.MustCompile(`sk-ant-[a-zA-Z0-9_-]{20,}`)
+	googleRegex          = regexp.MustCompile(`AIzaSy[A-Za-z0-9_-]{33}`)
+	xaiRegex             = regexp.MustCompile(`xai-[A-Za-z0-9]{75,}`)
+	openrouterRegex      = regexp.MustCompile(`sk-or-v1-[a-z0-9]{60,}`)
+	hfRegex              = regexp.MustCompile(`hf_[A-Za-z0-9]{30,}`)
+	groqRegex            = regexp.MustCompile(`gsk_[A-Za-z0-9]{30,}`)
+	perplexityRegex      = regexp.MustCompile(`pplx-[A-Za-z0-9]{30,}`)
+	replicateRegex       = regexp.MustCompile(`r8_[A-Za-z0-9]{30,}`)
+	cohereRegex          = regexp.MustCompile(`[A-Za-z0-9]{40}(_[A-Za-z0-9]{10,})?`)
+	ai21Regex            = regexp.MustCompile(`[A-Za-z0-9]{32}`)
+	elevenRegex          = regexp.MustCompile(`sk_[a-z0-9]{48}`)
+	togetherRegex        = regexp.MustCompile(`sk-[a-zA-Z0-9]{86}`)
+	sambaRegex           = regexp.MustCompile(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
+	fireworksRegex       = regexp.MustCompile(`[A-Za-z0-9]{48}`)
+	pineconeRegex        = regexp.MustCompile(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
+	stabilityRegex       = regexp.MustCompile(`sk-[a-zA-Z0-9]{40,}`)
+	assemblyRegex        = regexp.MustCompile(`[a-f0-9]{32}`)
+	deepgramRegex        = regexp.MustCompile(`[a-f0-9]{40}`)
+	azureRegex           = regexp.MustCompile(`[a-f0-9]{32}`)
+	
+	// Cloud Providers
+	awsRegex             = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
+	awsSecretRegex       = regexp.MustCompile(`[A-Za-z0-9/+=]{40}`)
+	doRegex              = regexp.MustCompile(`dop_v1_[a-f0-9]{64}`)
+	herokuRegex          = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	cfRegex              = regexp.MustCompile(`[A-Za-z0-9_-]{40}`)
+	vercelRegex          = regexp.MustCompile(`[A-Za-z0-9]{24}`)
+	
+	// Developer Platforms
+	githubRegex          = regexp.MustCompile(`(ghp_[a-zA-Z0-9_]{36}|gho_[a-zA-Z0-9_]{36}|github_pat_[a-zA-Z0-9_]{82})`)
+	gitlabRegex          = regexp.MustCompile(`glpat-[A-Za-z0-9_\-]{20,}`)
+	dockerRegex          = regexp.MustCompile(`dckr_pat_[A-Za-z0-9_\-]{20,}`)
+	npmRegex             = regexp.MustCompile(`npm_[a-zA-Z0-9]{36}`)
+	pypiRegex            = regexp.MustCompile(`pypi-[A-Za-z0-9_\-]{20,}`)
+	
+	// Communication
+	discordRegex         = regexp.MustCompile(`([A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,})`)
+	slackRegex           = regexp.MustCompile(`xox[bpatrs]-[a-zA-Z0-9-]+`)
+	telegramRegex        = regexp.MustCompile(`\d+:[A-Za-z0-9_-]{35}`)
+	twilioRegex          = regexp.MustCompile(`SK[0-9a-f]{32}`)
+	sendgridRegex        = regexp.MustCompile(`SG\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}`)
+	mailgunRegex         = regexp.MustCompile(`key-[a-f0-9]{32}`)
+	postmarkRegex        = regexp.MustCompile(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
+	pusherRegex          = regexp.MustCompile(`[a-f0-9]{20}`)
+	pubnubRegex          = regexp.MustCompile(`pub-c-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
+	
+	// Payment Processors
+	stripeRegex          = regexp.MustCompile(`(sk|pk|rk)_(live|test)_[a-zA-Z0-9]{24,}`)
+	squareRegex          = regexp.MustCompile(`sq0[atcp][a-z]-[a-zA-Z0-9_-]{22,}`)
+	paypalRegex          = regexp.MustCompile(`[A-Za-z0-9]{80}`)
+	braintreeRegex       = regexp.MustCompile(`[a-z0-9]{32}`)
+	razorpayRegex        = regexp.MustCompile(`rzp_(live|test)_[A-Za-z0-9]{20}`)
+	plaidRegex           = regexp.MustCompile(`[a-f0-9]{24}`)
+	
+	// Social/Media
+	twitterRegex         = regexp.MustCompile(`[A-Za-z0-9%]{100,}`)
+	redditRegex          = regexp.MustCompile(`[A-Za-z0-9_-]{27}`)
+	spotifyRegex         = regexp.MustCompile(`[A-Za-z0-9]{32}`)
+	twitchRegex          = regexp.MustCompile(`[a-z0-9]{30}`)
+	youtubeRegex         = regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`)
+	linkedinRegex        = regexp.MustCompile(`[A-Za-z0-9]{80,}`)
+	alchemyRegex         = regexp.MustCompile(`[a-zA-Z0-9_-]{32}`)
+	infuraRegex          = regexp.MustCompile(`[a-f0-9]{32}`)
+	etherscanRegex       = regexp.MustCompile(`[A-Z0-9]{34}`)
+	coinbaseRegex        = regexp.MustCompile(`[a-f0-9]{32}`)
+	binanceRegex         = regexp.MustCompile(`[A-Za-z0-9]{64}`)
+	moralisRegex         = regexp.MustCompile(`[A-Za-z0-9]{64}`)
+	shodanRegex          = regexp.MustCompile(`[A-Za-z0-9]{32}`)
+	vtRegex              = regexp.MustCompile(`[a-f0-9]{64}`)
+	ipinfoRegex          = regexp.MustCompile(`[a-f0-9]{32}`)
+	jwtRegex             = regexp.MustCompile(`eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*`)
+	genericRegex         = regexp.MustCompile(`[A-Za-z0-9_-]{32,64}`)
+)
+
 // ExtractTokensFromMatch extracts tokens for ALL supported providers
 func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	var tokens []string
@@ -217,19 +298,16 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	// ═══════════════════════════════════════════════════════════════
 
 	// 1. OpenAI Project Keys (sk-proj-...)
-	openaiProjRegex := regexp.MustCompile(`sk-proj-[a-zA-Z0-9_-]{20,}`)
 	for _, t := range openaiProjRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 2. OpenAI Service Account Keys (sk-svcacct-...)
-	openaiSvcRegex := regexp.MustCompile(`sk-svcacct-[a-zA-Z0-9_-]{20,}`)
 	for _, t := range openaiSvcRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 3. OpenAI Standard Keys (sk-...) - but filter out others
-	openaiRegex := regexp.MustCompile(`sk-[a-zA-Z0-9_-]{20,}`)
 	for _, t := range openaiRegex.FindAllString(match, -1) {
 		// Skip if it's a provider-specific prefix we handle separately
 		if strings.HasPrefix(t, "sk-ant-") || strings.HasPrefix(t, "sk-or-") ||
@@ -240,55 +318,46 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 4. Anthropic (sk-ant-...)
-	anthropicRegex := regexp.MustCompile(`sk-ant-[a-zA-Z0-9_-]{20,}`)
 	for _, t := range anthropicRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 5. Google Gemini / MakerSuite (AIzaSy...)
-	googleRegex := regexp.MustCompile(`AIzaSy[A-Za-z0-9_-]{33}`)
 	for _, t := range googleRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 6. xAI / Grok (xai-...)
-	xaiRegex := regexp.MustCompile(`xai-[A-Za-z0-9]{75,}`)
 	for _, t := range xaiRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 7. OpenRouter (sk-or-v1-...)
-	openrouterRegex := regexp.MustCompile(`sk-or-v1-[a-z0-9]{60,}`)
 	for _, t := range openrouterRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 8. HuggingFace (hf_...)
-	hfRegex := regexp.MustCompile(`hf_[A-Za-z0-9]{30,}`)
 	for _, t := range hfRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 9. Groq (gsk_...)
-	groqRegex := regexp.MustCompile(`gsk_[A-Za-z0-9]{30,}`)
 	for _, t := range groqRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 10. Perplexity (pplx-...)
-	perplexityRegex := regexp.MustCompile(`pplx-[A-Za-z0-9]{30,}`)
 	for _, t := range perplexityRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 11. Replicate (r8_...)
-	replicateRegex := regexp.MustCompile(`r8_[A-Za-z0-9]{30,}`)
 	for _, t := range replicateRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 12. Cohere
-	cohereRegex := regexp.MustCompile(`[A-Za-z0-9]{40}(_[A-Za-z0-9]{10,})?`)
 	for _, t := range cohereRegex.FindAllString(match, -1) {
 		// Cohere keys are typically 40 chars
 		if len(t) == 40 || strings.Contains(t, "_") {
@@ -297,7 +366,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 13. AI21 / Mistral (32 alphanumeric)
-	ai21Regex := regexp.MustCompile(`[A-Za-z0-9]{32}`)
 	for _, t := range ai21Regex.FindAllString(match, -1) {
 		// Avoid common false positives (hex colors, UUID fragments, etc.)
 		if !isLikelyFalsePositive(t) {
@@ -306,25 +374,21 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 14. ElevenLabs (sk_... or 32 lowercase hex)
-	elevenRegex := regexp.MustCompile(`sk_[a-z0-9]{48}`)
 	for _, t := range elevenRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 15. Together AI (sk-... with specific length)
-	togetherRegex := regexp.MustCompile(`sk-[a-zA-Z0-9]{86}`)
 	for _, t := range togetherRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 16. SambaNova
-	sambaRegex := regexp.MustCompile(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
 	for _, t := range sambaRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 17. Fireworks
-	fireworksRegex := regexp.MustCompile(`[A-Za-z0-9]{48}`)
 	for _, t := range fireworksRegex.FindAllString(match, -1) {
 		if len(t) == 48 && !isLikelyFalsePositive(t) {
 			addUnique(t)
@@ -332,25 +396,21 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 18. Pinecone
-	pineconeRegex := regexp.MustCompile(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
 	for _, t := range pineconeRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 19. Stability AI
-	stabilityRegex := regexp.MustCompile(`sk-[a-zA-Z0-9]{40,}`)
 	for _, t := range stabilityRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 20. AssemblyAI
-	assemblyRegex := regexp.MustCompile(`[a-f0-9]{32}`)
 	for _, t := range assemblyRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 21. Deepgram
-	deepgramRegex := regexp.MustCompile(`[a-f0-9]{40}`)
 	for _, t := range deepgramRegex.FindAllString(match, -1) {
 		if len(t) == 40 {
 			addUnique(t)
@@ -358,7 +418,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 22. Azure OpenAI
-	azureRegex := regexp.MustCompile(`[a-f0-9]{32}`)
 	for _, t := range azureRegex.FindAllString(match, -1) {
 		if len(t) == 32 {
 			addUnique(t)
@@ -370,13 +429,11 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	// ═══════════════════════════════════════════════════════════════
 
 	// 23. AWS Access Keys (AKIA...)
-	awsRegex := regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
 	for _, t := range awsRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 24. AWS Secret Keys (paired with access key)
-	awsSecretRegex := regexp.MustCompile(`[A-Za-z0-9/+=]{40}`)
 	for _, t := range awsSecretRegex.FindAllString(match, -1) {
 		if len(t) == 40 && strings.Contains(match, "AKIA") {
 			addUnique(t)
@@ -384,19 +441,16 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 25. DigitalOcean
-	doRegex := regexp.MustCompile(`dop_v1_[a-f0-9]{64}`)
 	for _, t := range doRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 26. Heroku
-	herokuRegex := regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 	for _, t := range herokuRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 27. Cloudflare
-	cfRegex := regexp.MustCompile(`[A-Za-z0-9_-]{40}`)
 	for _, t := range cfRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "cloudflare") && len(t) == 40 {
 			addUnique(t)
@@ -404,7 +458,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 28. Vercel
-	vercelRegex := regexp.MustCompile(`[A-Za-z0-9]{24}`)
 	for _, t := range vercelRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "vercel") && len(t) == 24 {
 			addUnique(t)
@@ -416,31 +469,26 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	// ═══════════════════════════════════════════════════════════════
 
 	// 29. GitHub (ghp_..., gho_..., github_pat_...)
-	githubRegex := regexp.MustCompile(`(ghp_[a-zA-Z0-9_]{36}|gho_[a-zA-Z0-9_]{36}|github_pat_[a-zA-Z0-9_]{82})`)
 	for _, t := range githubRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 30. GitLab
-	gitlabRegex := regexp.MustCompile(`glpat-[A-Za-z0-9_\-]{20,}`)
 	for _, t := range gitlabRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 31. Docker Hub
-	dockerRegex := regexp.MustCompile(`dckr_pat_[A-Za-z0-9_\-]{20,}`)
 	for _, t := range dockerRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 32. NPM (npm_...)
-	npmRegex := regexp.MustCompile(`npm_[a-zA-Z0-9]{36}`)
 	for _, t := range npmRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 33. PyPI
-	pypiRegex := regexp.MustCompile(`pypi-[A-Za-z0-9_\-]{20,}`)
 	for _, t := range pypiRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
@@ -450,49 +498,41 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	// ═══════════════════════════════════════════════════════════════
 
 	// 34. Discord (Bot/Discord tokens)
-	discordRegex := regexp.MustCompile(`([A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,})`)
 	for _, t := range discordRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 35. Slack (xoxb-..., xoxp-..., xoxa-...)
-	slackRegex := regexp.MustCompile(`xox[bpatrs]-[a-zA-Z0-9-]+`)
 	for _, t := range slackRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 36. Telegram (Bot Token: 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11)
-	telegramRegex := regexp.MustCompile(`\d+:[A-Za-z0-9_-]{35}`)
 	for _, t := range telegramRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 37. Twilio
-	twilioRegex := regexp.MustCompile(`SK[0-9a-f]{32}`)
 	for _, t := range twilioRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 38. SendGrid
-	sendgridRegex := regexp.MustCompile(`SG\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}`)
 	for _, t := range sendgridRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 39. Mailgun
-	mailgunRegex := regexp.MustCompile(`key-[a-f0-9]{32}`)
 	for _, t := range mailgunRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 40. Postmark
-	postmarkRegex := regexp.MustCompile(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
 	for _, t := range postmarkRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 41. Pusher
-	pusherRegex := regexp.MustCompile(`[a-f0-9]{20}`)
 	for _, t := range pusherRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "pusher") && len(t) == 20 {
 			addUnique(t)
@@ -500,7 +540,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 42. PubNub
-	pubnubRegex := regexp.MustCompile(`pub-c-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
 	for _, t := range pubnubRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
@@ -510,19 +549,16 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	// ═══════════════════════════════════════════════════════════════
 
 	// 43. Stripe (sk_live_..., pk_live_..., rk_...)
-	stripeRegex := regexp.MustCompile(`(sk|pk|rk)_(live|test)_[a-zA-Z0-9]{24,}`)
 	for _, t := range stripeRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 44. Square (sq0atp-..., sq0csp-...)
-	squareRegex := regexp.MustCompile(`sq0[atcp][a-z]-[a-zA-Z0-9_-]{22,}`)
 	for _, t := range squareRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 45. PayPal
-	paypalRegex := regexp.MustCompile(`[A-Za-z0-9]{80}`)
 	for _, t := range paypalRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "paypal") && len(t) == 80 {
 			addUnique(t)
@@ -530,7 +566,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 46. Braintree
-	braintreeRegex := regexp.MustCompile(`[a-z0-9]{32}`)
 	for _, t := range braintreeRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "braintree") && len(t) == 32 {
 			addUnique(t)
@@ -538,13 +573,11 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 47. Razorpay
-	razorpayRegex := regexp.MustCompile(`rzp_(live|test)_[A-Za-z0-9]{20}`)
 	for _, t := range razorpayRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 48. Plaid
-	plaidRegex := regexp.MustCompile(`[a-f0-9]{24}`)
 	for _, t := range plaidRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "plaid") && len(t) == 24 {
 			addUnique(t)
@@ -556,7 +589,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	// ═══════════════════════════════════════════════════════════════
 
 	// 49. Twitter/X Bearer
-	twitterRegex := regexp.MustCompile(`[A-Za-z0-9%]{100,}`)
 	for _, t := range twitterRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "twitter") || strings.Contains(strings.ToLower(match), "x_api") {
 			addUnique(t)
@@ -564,7 +596,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 50. Reddit
-	redditRegex := regexp.MustCompile(`[A-Za-z0-9_-]{27}`)
 	for _, t := range redditRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "reddit") && len(t) == 27 {
 			addUnique(t)
@@ -572,7 +603,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 51. Spotify
-	spotifyRegex := regexp.MustCompile(`[A-Za-z0-9]{32}`)
 	for _, t := range spotifyRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "spotify") && len(t) == 32 {
 			addUnique(t)
@@ -580,21 +610,17 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 52. Twitch
-	twitchRegex := regexp.MustCompile(`[a-z0-9]{30}`)
 	for _, t := range twitchRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "twitch") && len(t) == 30 {
 			addUnique(t)
 		}
 	}
-
 	// 53. YouTube
-	youtubeRegex := regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`)
 	for _, t := range youtubeRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 54. LinkedIn
-	linkedinRegex := regexp.MustCompile(`[A-Za-z0-9]{80,}`)
 	for _, t := range linkedinRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "linkedin") && len(t) >= 80 {
 			addUnique(t)
@@ -606,7 +632,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	// ═══════════════════════════════════════════════════════════════
 
 	// 55. Alchemy
-	alchemyRegex := regexp.MustCompile(`[a-zA-Z0-9_-]{32}`)
 	for _, t := range alchemyRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "alchemy") && len(t) == 32 {
 			addUnique(t)
@@ -614,7 +639,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 56. Infura
-	infuraRegex := regexp.MustCompile(`[a-f0-9]{32}`)
 	for _, t := range infuraRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "infura") && len(t) == 32 {
 			addUnique(t)
@@ -622,7 +646,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 57. Etherscan
-	etherscanRegex := regexp.MustCompile(`[A-Z0-9]{34}`)
 	for _, t := range etherscanRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "etherscan") && len(t) == 34 {
 			addUnique(t)
@@ -630,7 +653,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 58. Coinbase
-	coinbaseRegex := regexp.MustCompile(`[a-f0-9]{32}`)
 	for _, t := range coinbaseRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "coinbase") && len(t) == 32 {
 			addUnique(t)
@@ -638,7 +660,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 59. Binance
-	binanceRegex := regexp.MustCompile(`[A-Za-z0-9]{64}`)
 	for _, t := range binanceRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "binance") && len(t) == 64 {
 			addUnique(t)
@@ -646,7 +667,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 60. Moralis
-	moralisRegex := regexp.MustCompile(`[A-Za-z0-9]{64}`)
 	for _, t := range moralisRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "moralis") && len(t) == 64 {
 			addUnique(t)
@@ -658,7 +678,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	// ═══════════════════════════════════════════════════════════════
 
 	// 61. Shodan
-	shodanRegex := regexp.MustCompile(`[A-Za-z0-9]{32}`)
 	for _, t := range shodanRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "shodan") && len(t) == 32 {
 			addUnique(t)
@@ -666,7 +685,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 62. VirusTotal
-	vtRegex := regexp.MustCompile(`[a-f0-9]{64}`)
 	for _, t := range vtRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "virustotal") && len(t) == 64 {
 			addUnique(t)
@@ -674,7 +692,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	}
 
 	// 63. IPInfo
-	ipinfoRegex := regexp.MustCompile(`[a-f0-9]{32}`)
 	for _, t := range ipinfoRegex.FindAllString(match, -1) {
 		if strings.Contains(strings.ToLower(match), "ipinfo") && len(t) == 32 {
 			addUnique(t)
@@ -686,13 +703,11 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 	// ═══════════════════════════════════════════════════════════════
 
 	// 64. JWT Tokens
-	jwtRegex := regexp.MustCompile(`eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*`)
 	for _, t := range jwtRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
 	// 65. Generic high-entropy API keys (last resort)
-	genericRegex := regexp.MustCompile(`[A-Za-z0-9_-]{32,64}`)
 	for _, t := range genericRegex.FindAllString(match, -1) {
 		if !isLikelyFalsePositive(t) && len(t) >= 32 {
 			addUnique(t)
@@ -754,7 +769,7 @@ func (tv *TokenValidator) DetectProvider(token string) string {
 		return ProviderOpenAI
 	case strings.HasPrefix(token, "sk-") && len(token) > 20:
 		// Could be OpenAI, DeepSeek, Together, Stability, etc.
-		if matched, _ := regexp.MatchString(`^sk-[a-f0-9]{32}$`, token); matched {
+		if FastMatch("deepseek_key", token) {
 			return ProviderDeepSeek
 		}
 		return ProviderOpenAI
@@ -804,12 +819,12 @@ func (tv *TokenValidator) DetectProvider(token string) string {
 		return ProviderShodan
 	case strings.Contains(token, ":") && len(strings.Split(token, ":")) == 2:
 		// Potential Telegram bot token
-		if matched, _ := regexp.MatchString(`^\d+:[A-Za-z0-9_-]{35}$`, token); matched {
+		if FastMatch("telegram_bot", token) {
 			return ProviderTelegram
 		}
 	case len(token) == 59 && strings.Count(token, ".") == 2:
 		// Potential Discord token
-		if matched, _ := regexp.MatchString(`^[MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27}$`, token); matched {
+		if FastMatch("discord_token", token) {
 			return ProviderDiscord
 		}
 	case strings.HasPrefix(token, "eyJ") && strings.Count(token, ".") == 2:
@@ -1142,6 +1157,9 @@ func (tv *TokenValidator) ValidateGithubToken(token string) (bool, string, strin
 	req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
 	req.Header.Set("Authorization", fmt.Sprintf("token %s", token))
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	// GitHub rejects requests without a User-Agent header (403) before even
+	// looking at the token, so without this every token would report invalid.
+	req.Header.Set("User-Agent", fmt.Sprintf("%s v%s", Name, Version))
 
 	resp, err := tv.httpClient.Do(req)
 	if err != nil {
@@ -1215,8 +1233,7 @@ func (tv *TokenValidator) ValidateStripeToken(token string) (bool, string, strin
 
 // ValidateAWSToken validates AWS Access Key ID (Format Check + Optional STS)
 func (tv *TokenValidator) ValidateAWSToken(token string) (bool, string, string) {
-	matched, _ := regexp.MatchString(`^AKIA[0-9A-Z]{16}$`, token)
-	if !matched {
+	if !FastMatch("aws_key", token) {
 		return false, ProviderAWS, "Invalid AWS Key Format"
 	}
 	return true, ProviderAWS, "Valid AWS Key Format (Secret Required for Full Auth)"

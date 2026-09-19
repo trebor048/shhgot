@@ -158,7 +158,7 @@ func (kv *KeyValidator) validateOpenAI(key string) *ValidatedKey {
 
 func (kv *KeyValidator) validateAWSKey(key string) *ValidatedKey {
 	// AWS keys need secret key too, just validate format
-	if matched, _ := regexp.MatchString(`^AKIA[0-9A-Z]{16}$`, key); matched {
+	if FastMatch("aws_key", key) {
 		return &ValidatedKey{
 			Key:      key,
 			Provider: "AWS",
@@ -290,7 +290,7 @@ func (kv *KeyValidator) validateStripe(key string) *ValidatedKey {
 	defer resp.Body.Close()
 
 	valid := resp.StatusCode == 200
-	
+
 	// Try to extract account info
 	if valid {
 		var result map[string]interface{}
@@ -310,7 +310,7 @@ func (kv *KeyValidator) validateStripe(key string) *ValidatedKey {
 
 func (kv *KeyValidator) validateStripePublic(key string) *ValidatedKey {
 	// Public keys can't be directly validated, just check format
-	if matched, _ := regexp.MatchString(`^pk_(live|test)_[a-zA-Z0-9]{24,}$`, key); matched {
+	if FastMatch("stripe_public", key) {
 		return &ValidatedKey{
 			Key:      key,
 			Provider: "STRIPE_PUBLIC",
@@ -328,7 +328,7 @@ func (kv *KeyValidator) validateStripePublic(key string) *ValidatedKey {
 
 func (kv *KeyValidator) validateStripeRestricted(key string) *ValidatedKey {
 	// Restricted keys can't be directly validated, just check format
-	if matched, _ := regexp.MatchString(`^rk_(live|test)_[a-zA-Z0-9]{24,}$`, key); matched {
+	if FastMatch("stripe_restricted", key) {
 		return &ValidatedKey{
 			Key:      key,
 			Provider: "STRIPE_RESTRICTED",
@@ -350,17 +350,17 @@ func (kv *KeyValidator) ScanDirectoryForKeys(dir string, session *Session) []Val
 	files := GetMatchingFiles(dir)
 
 	keyPatterns := map[string]*regexp.Regexp{
-		"OPENAI":             regexp.MustCompile(`sk-[a-zA-Z0-9]{48}`),
-		"ANTHROPIC":          regexp.MustCompile(`sk-ant-api03-[a-zA-Z0-9_-]{95}`),
-		"AWS":                regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
-		"GOOGLE_API":         regexp.MustCompile(`AIza[0-9A-Za-z_-]{35,40}`),
-		"XAI":                regexp.MustCompile(`xai-[A-Za-z0-9]{80}`),
-		"OPENROUTER":         regexp.MustCompile(`sk-or-v1-[a-z0-9]{64}`),
-		"HUGGINGFACE":        regexp.MustCompile(`hf_[A-Za-z0-9]{34}`),
-		"STRIPE_SECRET":      regexp.MustCompile(`sk_(live|test)_[a-zA-Z0-9]{24,}`),
-		"STRIPE_PUBLIC":      regexp.MustCompile(`pk_(live|test)_[a-zA-Z0-9]{24,}`),
-		"STRIPE_RESTRICTED":  regexp.MustCompile(`rk_(live|test)_[a-zA-Z0-9]{24,}`),
-		"GITHUB":             regexp.MustCompile(`(ghp_[A-Za-z0-9]{36}|github_pat_[0-9a-zA-Z_]{22}[0-9a-zA-Z_]{64})`),
+		"OPENAI":            regexp.MustCompile(`sk-[a-zA-Z0-9]{48}`),
+		"ANTHROPIC":         regexp.MustCompile(`sk-ant-api03-[a-zA-Z0-9_-]{95}`),
+		"AWS":               regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		"GOOGLE_API":        regexp.MustCompile(`AIza[0-9A-Za-z_-]{35,40}`),
+		"XAI":               regexp.MustCompile(`xai-[A-Za-z0-9]{80}`),
+		"OPENROUTER":        regexp.MustCompile(`sk-or-v1-[a-z0-9]{64}`),
+		"HUGGINGFACE":       regexp.MustCompile(`hf_[A-Za-z0-9]{34}`),
+		"STRIPE_SECRET":     regexp.MustCompile(`sk_(live|test)_[a-zA-Z0-9]{24,}`),
+		"STRIPE_PUBLIC":     regexp.MustCompile(`pk_(live|test)_[a-zA-Z0-9]{24,}`),
+		"STRIPE_RESTRICTED": regexp.MustCompile(`rk_(live|test)_[a-zA-Z0-9]{24,}`),
+		"GITHUB":            regexp.MustCompile(`(ghp_[A-Za-z0-9]{36}|github_pat_[0-9a-zA-Z_]{22}[0-9a-zA-Z_]{64})`),
 	}
 
 	foundKeys := make(map[string]bool)
@@ -371,14 +371,14 @@ func (kv *KeyValidator) ScanDirectoryForKeys(dir string, session *Session) []Val
 			for _, match := range matches {
 				if !foundKeys[match] {
 					foundKeys[match] = true
-					
+
 					// If it's a GitHub token and we have a session, try to add it
 					if provider == "GITHUB" && session != nil {
 						if session.AddGitHubToken(match) {
 							kv.log.Info("Added new GitHub token to scanning pool: %s[..]", match[:10])
 						}
 					}
-					
+
 					validated := kv.ValidateKey(match)
 					if validated != nil {
 						validatedKeys = append(validatedKeys, *validated)
@@ -418,7 +418,7 @@ func (kv *KeyValidator) TestMatchedTokens(matches []string, color string) {
 // TestGenericCredential tests a generic credential string
 func (kv *KeyValidator) TestGenericCredential(credential, credentialType string) bool {
 	credential = strings.TrimSpace(credential)
-	
+
 	// Skip empty or too short credentials
 	if len(credential) < 8 {
 		return false
@@ -430,40 +430,36 @@ func (kv *KeyValidator) TestGenericCredential(credential, credentialType string)
 		// Passwords are hard to validate without actual service
 		// Just check entropy
 		return len(credential) >= 8 && hasGoodEntropy(credential)
-	
+
 	case "token", "api_key", "apikey", "api-key":
 		// Check if it looks like a token (alphanumeric, hyphens, underscores)
-		matched, _ := regexp.MatchString(`^[A-Za-z0-9_-]{20,}$`, credential)
-		return matched
-	
+		return FastMatch("token_generic", credential)
+
 	case "private_key", "privatekey", "private-key":
 		// Check if it looks like a private key
 		if strings.Contains(credential, "-----BEGIN") {
 			return true
 		}
-		matched, _ := regexp.MatchString(`^[A-Fa-f0-9]{60,}$`, credential)
-		return matched
-	
+		return FastMatch("hex_60plus", credential)
+
 	case "ethereum", "wallet", "address":
 		// Check Ethereum address format
-		matched, _ := regexp.MatchString(`^0x[A-Fa-f0-9]{40}$`, credential)
-		return matched
-	
+		return FastMatch("ethereum_address", credential)
+
 	case "jwt", "bearer":
 		// JWT tokens have 3 parts separated by dots
 		parts := strings.Split(credential, ".")
 		return len(parts) == 3 && len(parts[0]) > 0 && len(parts[1]) > 0 && len(parts[2]) > 0
-	
+
 	case "url", "webhook", "endpoint":
 		// Check if it's a valid URL
-		matched, _ := regexp.MatchString(`^https?://[^\s]+$`, credential)
-		return matched
-	
+		return FastMatch("url_http", credential)
+
 	case "mnemonic", "seed", "phrase":
 		// Check if it looks like a seed phrase (words separated by spaces)
 		words := strings.Fields(credential)
 		return len(words) >= 12 && len(words) <= 24
-	
+
 	default:
 		// Generic check: must be alphanumeric with some special chars
 		return len(credential) >= 16 && hasGoodEntropy(credential)
@@ -507,6 +503,7 @@ func hasGoodEntropy(s string) bool {
 
 	return count >= 2
 }
+
 
 // min returns the minimum of two integers
 func min(a, b int) int {

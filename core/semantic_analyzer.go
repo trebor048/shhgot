@@ -5,6 +5,19 @@ import (
 	"strings"
 )
 
+// Pre-compiled regex patterns for semantic analysis (performance optimization)
+var (
+	// Python patterns
+	pythonVarRegex        = regexp.MustCompile(`(?i)(password|passwd|pwd|secret|token|api_key|apikey|auth|credential|key|private_key|privatekey|access_key|accesskey)\s*=\s*["\']([^\'"]+)["\']`)
+	pythonEnvRegex        = regexp.MustCompile(`os\.environ\[["\']([A-Z_]+)["\']\]\s*=\s*["\']([^\'"]+)["\']`)
+	pythonAuthRegex       = regexp.MustCompile(`auth\s*=\s*\(["\']([^\'"]+)["\'],\s*["\']([^\'"]+)["\']\)`)
+	
+	// JavaScript patterns  
+	jsVarRegex            = regexp.MustCompile(`(?i)(const|let|var)\s+(password|passwd|pwd|secret|token|api_key|apikey|auth|credential|key|private_key|privatekey|access_key|accesskey)\s*=\s*["\']([^\'"]+)["\']`)
+	jsProcessEnvRegex     = regexp.MustCompile(`process\.env\.([A-Z_]+)\s*=\s*["\']([^\'"]+)["\']`)
+	jsAuthRegex           = regexp.MustCompile(`Authorization["\']?\s*:\s*["\']Bearer\s+([^\'"]+)["\']`)
+)
+
 // SemanticAnalyzer performs context-aware analysis of code to detect credentials
 type SemanticAnalyzer struct {
 	log *Logger
@@ -19,11 +32,11 @@ func NewSemanticAnalyzer(log *Logger) *SemanticAnalyzer {
 
 // CredentialPattern represents a detected credential pattern
 type CredentialPattern struct {
-	Type        string   // password, api_key, private_key, etc.
-	Name        string   // variable name
-	Value       string   // the value
-	Context     string   // surrounding code context
-	Confidence  int      // 0-100
+	Type        string // password, api_key, private_key, etc.
+	Name        string // variable name
+	Value       string // the value
+	Context     string // surrounding code context
+	Confidence  int    // 0-100
 	LineNumber  int
 	ColumnStart int
 	ColumnEnd   int
@@ -68,8 +81,7 @@ func (sa *SemanticAnalyzer) analyzePython(content string) []CredentialPattern {
 	var patterns []CredentialPattern
 
 	// Pattern: variable = "value"
-	re := regexp.MustCompile(`(?i)(password|passwd|pwd|secret|token|api_key|apikey|auth|credential|key|private_key|privatekey|access_key|accesskey)\s*=\s*["\']([^\'"]+)["\']`)
-	matches := re.FindAllStringSubmatchIndex(content, -1)
+	matches := pythonVarRegex.FindAllStringSubmatchIndex(content, -1)
 
 	for _, match := range matches {
 		if len(match) >= 6 {
@@ -86,8 +98,7 @@ func (sa *SemanticAnalyzer) analyzePython(content string) []CredentialPattern {
 	}
 
 	// Pattern: os.environ["KEY"] = "value"
-	re = regexp.MustCompile(`os\.environ\[["\']([A-Z_]+)["\']\]\s*=\s*["\']([^\'"]+)["\']`)
-	matches = re.FindAllStringSubmatchIndex(content, -1)
+	matches = pythonEnvRegex.FindAllStringSubmatchIndex(content, -1)
 
 	for _, match := range matches {
 		if len(match) >= 6 {
@@ -104,8 +115,7 @@ func (sa *SemanticAnalyzer) analyzePython(content string) []CredentialPattern {
 	}
 
 	// Pattern: requests.post(url, auth=(user, pass))
-	re = regexp.MustCompile(`auth\s*=\s*\(["\']([^\'"]+)["\'],\s*["\']([^\'"]+)["\']\)`)
-	matches = re.FindAllStringSubmatchIndex(content, -1)
+	matches = pythonAuthRegex.FindAllStringSubmatchIndex(content, -1)
 
 	for _, match := range matches {
 		if len(match) >= 6 {
@@ -129,8 +139,7 @@ func (sa *SemanticAnalyzer) analyzeJavaScript(content string) []CredentialPatter
 	var patterns []CredentialPattern
 
 	// Pattern: const/let/var name = "value"
-	re := regexp.MustCompile(`(?i)(const|let|var)\s+(password|passwd|pwd|secret|token|api_key|apikey|auth|credential|key|private_key|privatekey|access_key|accesskey)\s*=\s*["\']([^\'"]+)["\']`)
-	matches := re.FindAllStringSubmatchIndex(content, -1)
+	matches := jsVarRegex.FindAllStringSubmatchIndex(content, -1)
 
 	for _, match := range matches {
 		if len(match) >= 8 {
@@ -147,8 +156,7 @@ func (sa *SemanticAnalyzer) analyzeJavaScript(content string) []CredentialPatter
 	}
 
 	// Pattern: process.env.KEY = "value"
-	re = regexp.MustCompile(`process\.env\.([A-Z_]+)\s*=\s*["\']([^\'"]+)["\']`)
-	matches = re.FindAllStringSubmatchIndex(content, -1)
+	matches = jsProcessEnvRegex.FindAllStringSubmatchIndex(content, -1)
 
 	for _, match := range matches {
 		if len(match) >= 6 {
@@ -165,8 +173,7 @@ func (sa *SemanticAnalyzer) analyzeJavaScript(content string) []CredentialPatter
 	}
 
 	// Pattern: axios.defaults.headers.common['Authorization'] = "Bearer token"
-	re = regexp.MustCompile(`Authorization["\']?\s*:\s*["\']Bearer\s+([^\'"]+)["\']`)
-	matches = re.FindAllStringSubmatchIndex(content, -1)
+	matches = jsAuthRegex.FindAllStringSubmatchIndex(content, -1)
 
 	for _, match := range matches {
 		if len(match) >= 4 {

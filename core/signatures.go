@@ -23,26 +23,28 @@ type Signature interface {
 	GetColor() string
 	GetExcludeInModes() []string
 	IsTokenType() bool
+	GetRegex() *regexp.Regexp
+	GetPart() string
 }
 
 type SimpleSignature struct {
-	part            string
-	match           string
-	name            string
-	verifier        string
-	priority        int
-	color           string
-	excludeInModes  []string
+	part           string
+	match          string
+	name           string
+	verifier       string
+	priority       int
+	color          string
+	excludeInModes []string
 }
 
 type PatternSignature struct {
-	part            string
-	match           *regexp.Regexp
-	name            string
-	verifier        string
-	priority        int
-	color           string
-	excludeInModes  []string
+	part           string
+	match          *regexp.Regexp
+	name           string
+	verifier       string
+	priority       int
+	color          string
+	excludeInModes []string
 }
 
 func (s SimpleSignature) Match(file MatchFile) (bool, string) {
@@ -92,6 +94,15 @@ func (s SimpleSignature) IsTokenType() bool {
 	return false
 }
 
+func (s SimpleSignature) GetRegex() *regexp.Regexp {
+	// Simple signatures are exact-match strings, not regexes
+	return nil
+}
+
+func (s SimpleSignature) GetPart() string {
+	return s.part
+}
+
 func (s PatternSignature) Match(file MatchFile) (bool, string) {
 	var (
 		haystack  *string
@@ -109,7 +120,9 @@ func (s PatternSignature) Match(file MatchFile) (bool, string) {
 		haystack = &file.Extension
 		matchPart = PartExtension
 	case PartContents:
-		return s.match.Match(file.Contents), PartContents
+		// Lazy load contents only when needed
+		contents := (&file).GetContents()
+		return s.match.Match(contents), PartContents
 	default:
 		return false, matchPart
 	}
@@ -119,8 +132,11 @@ func (s PatternSignature) Match(file MatchFile) (bool, string) {
 
 func (s PatternSignature) GetContentsMatches(file MatchFile) []string {
 	matches := make([]string, 0)
+	
+	// Lazy load contents only when needed
+	contents := (&file).GetContents()
 
-	for _, match := range s.match.FindAllSubmatch(file.Contents, -1) {
+	for _, match := range s.match.FindAllSubmatch(contents, -1) {
 		match := string(match[0])
 		blacklistedMatch := false
 
@@ -164,6 +180,14 @@ func (s PatternSignature) IsTokenType() bool {
 	// Check if this is a GitHub token signature
 	sigName := strings.ToLower(s.name)
 	return strings.Contains(sigName, "github") && strings.Contains(sigName, "token")
+}
+
+func (s PatternSignature) GetRegex() *regexp.Regexp {
+	return s.match
+}
+
+func (s PatternSignature) GetPart() string {
+	return s.part
 }
 
 func (s PatternSignature) applyVerifier(match string, file MatchFile) bool {

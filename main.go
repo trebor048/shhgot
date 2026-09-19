@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eth0izzle/shhgit/core"
@@ -43,11 +44,17 @@ const (
 	LogFormatNeon          = "neon"
 )
 
-var session = core.GetSession()
+var session *core.Session
 var formatOrder = []string{LogFormatMinimal, LogFormatFancy, LogFormatUltraFancy, LogFormatEvenMoreFancy, LogFormatNeon}
 var currentLogFormat = LogFormatFancy
 
-func getLogFormat() string { return currentLogFormat }
+// getSession lazily initializes the session on first use
+func getSession() *core.Session {
+	if session == nil {
+		session = core.GetSession()
+	}
+	return session
+}
 
 func setLogFormat(f string) {
 	for _, preset := range formatOrder {
@@ -59,8 +66,15 @@ func setLogFormat(f string) {
 	currentLogFormat = LogFormatFancy
 }
 
+// getLogFormat returns the current log format preset
+func getLogFormat() string {
+	return currentLogFormat
+}
+
 // --------------------------------------------------------------
-//  HELPERS
+//
+//	HELPERS
+//
 // --------------------------------------------------------------
 func isSignatureExcludedInMode(signature core.Signature, mode string) bool {
 	excludedModes := signature.GetExcludeInModes()
@@ -180,10 +194,15 @@ var (
 //  HELPERS
 // ──────────────────────────────────────────────────────────────
 
+// Pre-compiled regexes for performance (compiled once at startup)
+var (
+	githubURLRegex   = regexp.MustCompile(`https://github\.com/([^/]+)/([^/]+)`)
+	repoExtractRegex = regexp.MustCompile(`https://github\.com/([^/]+)/([^/]+?)(?:\.git)?(?:/|$)`)
+)
+
 // colorizeGitHubURL colors the username/repo portion of a GitHub URL magenta.
 func colorizeGitHubURL(url string) string {
-	re := regexp.MustCompile(`https://github\.com/([^/]+)/([^/]+)`)
-	matches := re.FindStringSubmatch(url)
+	matches := githubURLRegex.FindStringSubmatch(url)
 	if len(matches) == 3 {
 		return "https://github.com/" +
 			color.HiMagentaString(matches[1]) + "/" +
@@ -195,8 +214,7 @@ func colorizeGitHubURL(url string) string {
 // extractRepoName extracts the username/repo from a GitHub URL.
 // Thread-safe as it only works with local variables.
 func extractRepoName(url string) string {
-	re := regexp.MustCompile(`https://github\.com/([^/]+)/([^/]+?)(?:\.git)?(?:/|$)`)
-	matches := re.FindStringSubmatch(url)
+	matches := repoExtractRegex.FindStringSubmatch(url)
 	if len(matches) >= 3 {
 		return matches[1] + "/" + matches[2]
 	}
@@ -214,8 +232,7 @@ func createClickableLink(url, text string) string {
 // extractRepoInfo extracts username, repo, and creates GitHub URLs.
 // Thread-safe as it only works with local variables.
 func extractRepoInfo(url string) (username, repo, repoUrl string) {
-	re := regexp.MustCompile(`https://github\.com/([^/]+)/([^/]+?)(?:\.git)?(?:/|$)`)
-	matches := re.FindStringSubmatch(url)
+	matches := repoExtractRegex.FindStringSubmatch(url)
 	if len(matches) >= 3 {
 		username = matches[1]
 		repo = matches[2]
@@ -227,7 +244,7 @@ func extractRepoInfo(url string) (username, repo, repoUrl string) {
 // isAITokenSignature checks if a signature is an AI token (excluding Google)
 func isAITokenSignature(sig string) bool {
 	sigLower := strings.ToLower(sig)
-	
+
 	// AI providers to include
 	aiProviders := []string{
 		"openai", "anthropic", "claude", "hugging face", "xai", "grok",
@@ -243,28 +260,28 @@ func isAITokenSignature(sig string) bool {
 		"wolfram", "mathpix", "ocr", "clarifai", "imagga",
 		"ai21", "pinecone", "writer", "jasper",
 	}
-	
+
 	// Exclude Google
-	if strings.Contains(sigLower, "google") || strings.Contains(sigLower, "gemini") || 
-	   strings.Contains(sigLower, "palm") || strings.Contains(sigLower, "bard") ||
-	   strings.Contains(sigLower, "vertex") || strings.Contains(sigLower, "makersuite") {
+	if strings.Contains(sigLower, "google") || strings.Contains(sigLower, "gemini") ||
+		strings.Contains(sigLower, "palm") || strings.Contains(sigLower, "bard") ||
+		strings.Contains(sigLower, "vertex") || strings.Contains(sigLower, "makersuite") {
 		return false
 	}
-	
+
 	// Check if signature contains any AI provider
 	for _, provider := range aiProviders {
 		if strings.Contains(sigLower, provider) {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
 // isCryptoSignature checks if a signature is crypto-related
 func isCryptoSignature(sig string) bool {
 	sigLower := strings.ToLower(sig)
-	
+
 	cryptoKeywords := []string{
 		"ethereum", "bitcoin", "wallet", "private key", "seed", "mnemonic",
 		"recovery", "bip39", "solana", "cardano", "ripple", "polkadot",
@@ -277,13 +294,13 @@ func isCryptoSignature(sig string) bool {
 		"ontology", "waves", "eos", "telos", "crypto", "blockchain",
 		"web3", "nft", "defi", "token", "address", "keypair",
 	}
-	
+
 	for _, keyword := range cryptoKeywords {
 		if strings.Contains(sigLower, keyword) {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
@@ -297,12 +314,12 @@ func createFileLink(repoUrl, filePath, branch string) string {
 	if strings.Contains(branch, "refs/heads/") {
 		branch = strings.Replace(branch, "refs/heads/", "", 1)
 	}
-	
+
 	// Clean up the file path - remove leading slashes and convert backslashes to forward slashes
 	filePath = strings.TrimPrefix(filePath, "/")
 	filePath = strings.TrimPrefix(filePath, "\\")
 	filePath = strings.ReplaceAll(filePath, "\\", "/")
-	
+
 	fileUrl := fmt.Sprintf("%s/blob/%s/%s", repoUrl, branch, filePath)
 	maskedText := fmt.Sprintf("📄 %s", filepath.Base(filePath))
 	return createClickableLink(fileUrl, maskedText)
@@ -347,7 +364,7 @@ func cosmicBox(borderColor func(...interface{}) string, titleColor func(...inter
 func switchLogFormat() {}
 
 func initLogFormat() {
-	f := strings.ToLower(strings.TrimSpace(session.Config.LogFormat))
+	f := strings.ToLower(strings.TrimSpace(getSession().Config.LogFormat))
 	setLogFormat(f)
 
 	// Announce the active preset with its own style
@@ -380,7 +397,7 @@ func logSearch(count int, url, file, matches, branch string) {
 	plural := core.Pluralize(count, "match", "matches")
 	userRepo, _, fileLink := getEnhancedLinkInfo(url, file, branch)
 
-	switch 	getLogFormat() {
+	switch getLogFormat() {
 
 	// ── 1. MINIMAL ────────────────────────────────────────────
 	case LogFormatMinimal:
@@ -391,18 +408,22 @@ func logSearch(count int, url, file, matches, branch string) {
 			minInfo(file),
 			userRepo)
 		lockPrintf("       %s  %s\n", minDim(matches), fileLink)
+		lockPrintln(minDim(strings.Repeat("─", 80)))
 
 	// ── 2. FANCY ──────────────────────────────────────────────
 	case LogFormatFancy:
+		lockPrintln()
 		lockPrintf("%s %d %s in %s  %s\n",
 			fancySearch("🔍 [SEARCH]"),
 			count, plural,
 			fancyFile(file),
 			userRepo)
 		lockPrintf("  %s %s  %s\n", fancyArrow("→"), matches, fileLink)
+		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
 
 	// ── 3. ULTRA FANCY ────────────────────────────────────────
 	case LogFormatUltraFancy:
+		lockPrintln()
 		lockPrintf("%s  %s  %s %s  %s\n",
 			ultraBadge(" 🔍 SEARCH "),
 			ultraAccent(fmt.Sprintf("%d %s", count, plural)),
@@ -410,9 +431,11 @@ func logSearch(count int, url, file, matches, branch string) {
 			ultraFile(file),
 			userRepo)
 		lockPrintf("  %s %s  %s\n", ultraAccent("✦ →"), matches, fileLink)
+		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
 
 	// ── 4. EVEN MORE FANCY (Cosmic) ───────────────────────────
 	case LogFormatEvenMoreFancy:
+		lockPrintln()
 		cosmicBox(cosmicSearch, cosmicTitle, "🌌  🔍 SEARCH MATCH  🌌")
 		lockPrintf("  %s  %d %s in %s  %s\n",
 			cosmicSearch("◈"),
@@ -420,19 +443,22 @@ func logSearch(count int, url, file, matches, branch string) {
 			cosmicFile(file),
 			userRepo)
 		lockPrintf("  %s %s  %s\n", cosmicAccent("➜"), matches, fileLink)
+		lockPrintln(cosmicBorder(strings.Repeat("═", 80)))
 
 	// ── 5. NEON ───────────────────────────────────────────────
 	default:
+		lockPrintln()
 		lockPrintf("%s %s %s  %s\n",
 			neonSearchLabel(" 🔍 SEARCH "),
 			neonValue(fmt.Sprintf("%d %s", count, plural)),
 			neonDim("in "+file),
 			userRepo)
 		lockPrintf("  %s %s  %s\n", neonMatch("⟶"), matches, fileLink)
+		lockPrintln(neonEntropyLabel(strings.Repeat("─", 80)))
 	}
 }
 
-// logSecret logs a signature/secret match event.
+// logSecret logs a signature/secret match event with visual separation.
 func logSecret(count int, url, sig, file, matches, branch string, stars int) {
 	plural := core.Pluralize(count, "match", "matches")
 	starStr := ""
@@ -445,17 +471,16 @@ func logSecret(count int, url, sig, file, matches, branch string, stars int) {
 	// Hide preview for PEM keys and other large private keys
 	shouldHidePreview := strings.Contains(matches, "-----BEGIN") ||
 		strings.Contains(matches, "-----END") ||
-		len(matches) > 200 // Hide very long keys
-	
+		len(matches) > 200
+
 	displayMatches := matches
 	if shouldHidePreview {
 		displayMatches = "[REDACTED - Private key content hidden]"
 	}
 
-	switch 	getLogFormat() {
-
-	// ── 1. MINIMAL ────────────────────────────────────────────
+	switch getLogFormat() {
 	case LogFormatMinimal:
+		lockPrintln(minDim(strings.Repeat("─", 80)))
 		lockPrintf("%s %s  %s %s%s  %s\n",
 			minSecret("🚨"),
 			minDim(fmt.Sprintf("%d %s", count, plural)),
@@ -464,9 +489,13 @@ func logSecret(count int, url, sig, file, matches, branch string, stars int) {
 			minDim(starStr),
 			userRepo)
 		lockPrintf("       %s %s  %s\n", minEntropy(sig+":"), minDim(displayMatches), fileLink)
+		lockPrintln()
+		lockPrintf("  %s\n", minInfo("<match>"))
+		lockPrintf("    %s\n", minDim(displayMatches))
+		lockPrintf("  %s\n", minInfo("</match>"))
 
-	// ── 2. FANCY ──────────────────────────────────────────────
 	case LogFormatFancy:
+		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
 		lockPrintf("%s %d %s  %s  in %s%s  %s\n",
 			fancySecret("🚨 [SECRET]"),
 			count, plural,
@@ -475,9 +504,13 @@ func logSecret(count int, url, sig, file, matches, branch string, stars int) {
 			color.HiBlueString(starStr),
 			userRepo)
 		lockPrintf("  %s %s  %s\n", fancyArrow("→"), displayMatches, fileLink)
+		lockPrintln()
+		lockPrintf("  %s\n", fancyAccent("<match>"))
+		lockPrintf("    %s\n", color.HiYellowString(displayMatches))
+		lockPrintf("  %s\n", fancyAccent("</match>"))
 
-	// ── 3. ULTRA FANCY ────────────────────────────────────────
 	case LogFormatUltraFancy:
+		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
 		starsFormatted := ""
 		if stars > 0 {
 			starsFormatted = "  " + ultraAccent(fmt.Sprintf("⭐ %d", stars))
@@ -490,9 +523,14 @@ func logSecret(count int, url, sig, file, matches, branch string, stars int) {
 			starsFormatted,
 			userRepo)
 		lockPrintf("  %s %s  %s\n", ultraSecret("✦ →"), displayMatches, fileLink)
+		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
+		lockPrintln()
+		lockPrintf("  %s\n", ultraAccent("<match>"))
+		lockPrintf("    %s\n", ultraDanger(displayMatches))
+		lockPrintf("  %s\n", ultraAccent("</match>"))
 
-	// ── 4. EVEN MORE FANCY (Cosmic) ───────────────────────────
 	case LogFormatEvenMoreFancy:
+		lockPrintln()
 		cosmicBox(cosmicSecret, cosmicTitle, "🔥  🚨 LEGENDARY SECRET BREACH  🔥")
 		if stars > 0 {
 			lockPrintf("  %s ⭐ %d stars\n", cosmicSecret("║"), stars)
@@ -503,9 +541,14 @@ func logSecret(count int, url, sig, file, matches, branch string, stars int) {
 			cosmicAccent(sig))
 		lockPrintf("  %s file: %s  %s\n", cosmicSecret("║"), cosmicFile(file), userRepo)
 		lockPrintf("  %s %s  %s\n", cosmicAccent("➜"), displayMatches, fileLink)
+		lockPrintln(cosmicBorder(strings.Repeat("═", 80)))
+		lockPrintln()
+		lockPrintf("  %s\n", cosmicAccent("<match>"))
+		lockPrintf("    %s\n", cosmicSecret(displayMatches))
+		lockPrintf("  %s\n", cosmicAccent("</match>"))
 
-	// ── 5. NEON ───────────────────────────────────────────────
-	default:
+	default: // Neon
+		lockPrintln()
 		neonStars := ""
 		if stars > 0 {
 			neonStars = "  " + neonStar(fmt.Sprintf("⭐ %d", stars))
@@ -521,117 +564,166 @@ func logSecret(count int, url, sig, file, matches, branch string, stars int) {
 			neonMatch("⟶"),
 			displayMatches,
 			fileLink)
+		lockPrintln(neonEntropyLabel(strings.Repeat("─", 80)))
+		lockPrintln()
+		lockPrintf("  %s\n", neonValue("<match>"))
+		lockPrintf("    %s\n", neonMatch(displayMatches))
+		lockPrintf("  %s\n", neonValue("</match>"))
 	}
 }
 
-// logFile logs a file-pattern match event.
+// logFile logs a file-pattern match event with visual separation.
 func logFile(url, sig, file, branch string, stars int) {
 	userRepo, _, fileLink := getEnhancedLinkInfo(url, file, branch)
 
-	switch 	getLogFormat() {
+	// For .env files, show that we're including full content in webhook
+	isEnvFile := strings.HasSuffix(strings.ToLower(file), ".env") ||
+		strings.Contains(strings.ToLower(file), ".env.") ||
+		strings.HasPrefix(strings.ToLower(filepath.Base(file)), "env.")
 
-	// ── 1. MINIMAL ────────────────────────────────────────────
+	envNotice := ""
+	if isEnvFile {
+		envNotice = " [FULL CONTENT → WEBHOOK]"
+	}
+
+	switch getLogFormat() {
 	case LogFormatMinimal:
-		lockPrintf("%s %s %s %s  %s\n",
+		lockPrintln(minDim(strings.Repeat("─", 80)))
+		lockPrintf("%s %s %s %s  %s%s\n",
 			minFile("📄"),
 			minDim(sig),
 			minDim("→"),
 			minInfo(file),
-			userRepo)
+			userRepo,
+			minDim(envNotice))
 		lockPrintf("       %s\n", fileLink)
+		lockPrintln(minDim(""))
+		lockPrintf("  %s\n", minInfo("<match>"))
+		lockPrintf("    %s\n", minDim("📄 "+file))
+		lockPrintf("  %s\n", minInfo("</match>"))
 
-	// ── 2. FANCY ──────────────────────────────────────────────
 	case LogFormatFancy:
-		lockPrintf("%s %s  matches  %s  %s\n",
+		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
+		lockPrintf("%s %s  matches  %s  %s%s\n",
 			fancyFile("📄 [FILE]"),
 			fancyFile(file),
 			fancyAccent(sig),
-			userRepo)
+			userRepo,
+			color.HiGreenString(envNotice))
 		lockPrintf("  %s\n", fileLink)
+		lockPrintln()
+		lockPrintf("  %s\n", fancyFile("<match>"))
+		lockPrintf("    %s\n", fancyAccent("📄 "+file))
+		lockPrintf("  %s\n", fancyFile("</match>"))
 
-	// ── 3. ULTRA FANCY ────────────────────────────────────────
 	case LogFormatUltraFancy:
-		lockPrintf("%s  %s  %s %s  %s\n",
+		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
+		lockPrintf("%s  %s  %s %s  %s%s\n",
 			ultraBadge(" 📄 FILE "),
 			ultraFile(file),
 			ultraSearch("matches"),
 			ultraAccent(sig),
-			userRepo)
+			userRepo,
+			ultraSearch(envNotice))
 		lockPrintf("  %s\n", fileLink)
+		lockPrintln()
+		lockPrintf("  %s\n", ultraFile("<match>"))
+		lockPrintf("    %s\n", ultraAccent("📄 "+file))
+		lockPrintf("  %s\n", ultraFile("</match>"))
 
-	// ── 4. EVEN MORE FANCY (Cosmic) ───────────────────────────
 	case LogFormatEvenMoreFancy:
+		lockPrintln(cosmicBorder(strings.Repeat("═", 80)))
 		cosmicBox(cosmicFile, cosmicTitle, "📁  📄 EPIC FILE PATTERN MATCH  📁")
-		lockPrintf("  %s %s %s %s  %s\n",
+		lockPrintf("  %s %s %s %s  %s%s\n",
 			cosmicFile("◈"),
 			cosmicAccent(sig),
 			cosmicFile("→"),
 			cosmicFile(file),
-			userRepo)
+			userRepo,
+			cosmicSearch(envNotice))
 		lockPrintf("  %s\n", fileLink)
 		if stars > 0 {
 			lockPrintf("  %s ⭐ %d stars\n", cosmicFile("◈"), stars)
 		}
+		lockPrintln()
+		lockPrintf("  %s\n", cosmicFile("<match>"))
+		lockPrintf("    %s\n", cosmicAccent("📄 "+file))
+		lockPrintf("  %s\n", cosmicFile("</match>"))
 
-	// ── 5. NEON ───────────────────────────────────────────────
-	default:
-		neonStars := ""
-		if stars > 0 {
-			neonStars = "  " + neonStar(fmt.Sprintf("⭐ %d", stars))
-		}
-		lockPrintf("%s %s %s %s%s  %s\n",
+	default: // Neon
+		lockPrintln(neonEntropyLabel(strings.Repeat("─", 80)))
+		lockPrintf("%s %s  %s %s  %s%s\n",
 			neonFileLabel(" 📄 FILE "),
-			neonValue(file),
+			neonValue(sig),
+			neonDim(file),
 			neonDim("→"),
-			neonMatch(sig),
-			neonStars,
-			userRepo)
+			userRepo,
+			neonStar(envNotice))
 		lockPrintf("  %s\n", fileLink)
+		if stars > 0 {
+			lockPrintf("  %s ⭐ %d stars\n", neonStar("·"), stars)
+		}
+		lockPrintln()
+		lockPrintf("  %s\n", neonValue("<match>"))
+		lockPrintf("    %s\n", neonDim("📄 "+file))
+		lockPrintf("  %s\n", neonValue("</match>"))
 	}
 }
 
-// logEntropy logs a high-entropy string detection event.
+// logEntropy logs a high-entropy string detection event with visual separation.
 func logEntropy(url, file, line, branch string, stars int) {
 	userRepo, _, fileLink := getEnhancedLinkInfo(url, file, branch)
 
-	switch 	getLogFormat() {
-
-	// ── 1. MINIMAL ────────────────────────────────────────────
+	switch getLogFormat() {
 	case LogFormatMinimal:
+		lockPrintln(minDim(strings.Repeat("─", 80)))
 		lockPrintf("%s %s  %s\n",
 			minEntropy("⚡"),
 			minInfo(file),
 			userRepo)
 		lockPrintf("         %s  %s\n", minDim(line), fileLink)
 
-	// ── 2. FANCY ──────────────────────────────────────────────
 	case LogFormatFancy:
+		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
 		lockPrintf("%s potential secret in %s  %s\n",
 			fancyEntropy("⚡ [ENTROPY]"),
 			fancyFile(file),
 			userRepo)
 		lockPrintf("  %s %s  %s\n", fancyArrow("→"), line, fileLink)
 
-	// ── 3. ULTRA FANCY ────────────────────────────────────────
 	case LogFormatUltraFancy:
+		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
 		lockPrintf("%s  %s %s  %s\n",
 			ultraBadge(" ⚡ ENTROPY "),
-			ultraEntropy("high-entropy string in"),
 			ultraFile(file),
+			ultraEntropy("HIGH"),
 			userRepo)
-		fmt.Printf("  %s %s  %s\n", ultraEntropy("✦ ->"), line, fileLink)
+		lockPrintf("  %s %s  %s\n", ultraEntropy("✦ →"), line, fileLink)
 
-	// ── 4. EVEN MORE FANCY (Cosmic) ───────────────────────────
 	case LogFormatEvenMoreFancy:
-		cosmicBox(cosmicEntropy, cosmicTitle, "⚡  🌠 CHAOS ENTROPY BREACH  ⚡")
-		lockPrintf("  %s file: %s  %s\n", cosmicEntropy("║"), cosmicFile(file), userRepo)
-		lockPrintf("  %s %s  %s\n", cosmicAccent("➜"), line, fileLink)
+		lockPrintln(cosmicBorder(strings.Repeat("═", 80)))
+		cosmicBox(cosmicEntropy, cosmicTitle, "⚡  ⚙️  COSMIC HIGH ENTROPY DETECTED  ⚙️  ⚡")
+		lockPrintf("  %s %s  HIGH entropy string\n",
+			cosmicEntropy("◈"),
+			cosmicFile(file))
+		lockPrintf("  %s %s  %s\n", cosmicAccent("➜"), line, userRepo)
+		lockPrintf("  %s\n", fileLink)
+		if stars > 0 {
+			lockPrintf("  %s ⭐ %d stars\n", cosmicEntropy("◈"), stars)
+		}
 
-	// ── 5. NEON ───────────────────────────────────────────────
-	default:
-		lockPrintf("%s %s  %s\n",
+	default: // Neon
+		lockPrintln(neonEntropyLabel(strings.Repeat("─", 80)))
+		neonStars := ""
+		if stars > 0 {
+			neonStars = "  " + neonStar(fmt.Sprintf("⭐ %d", stars))
+		}
+		lockPrintf("%s %s %s %s%s  %s\n",
 			neonEntropyLabel(" ⚡ ENTROPY "),
 			neonValue(file),
+			neonDim("→"),
+			neonMatch("HIGH"),
+			neonStars,
 			userRepo)
 		lockPrintf("  %s %s  %s\n", neonMatch("⟶"), line, fileLink)
 	}
@@ -673,10 +765,10 @@ func secretLineNum(contents []byte, secret string) int {
 // ──────────────────────────────────────────────────────────────
 
 func ProcessRepositories() {
-	threadNum := *session.Options.Threads
-	// Limit threads to prevent overwhelming
-	if threadNum > 20 {
-		threadNum = 20
+	threadNum := *getSession().Options.Threads
+	// Cap from config (default 20) to prevent overwhelming the machine.
+	if cap := getSession().Config.Performance.Int(getSession().Config.Performance.MaxRepositoryThreads, 20); threadNum > cap {
+		threadNum = cap
 	}
 
 	// Create worker pool with buffered channels
@@ -694,30 +786,30 @@ func ProcessRepositories() {
 
 	// Distribute work
 	go func() {
-		for repository := range session.Repositories {
+		for repository := range getSession().Repositories {
 			repoQueue <- repository
 		}
 	}()
 }
 
 func processRepository(repository core.GitResource, workerID int) {
-	repo, err := core.GetRepository(session, repository.Id)
+	repo, err := core.GetRepository(getSession(), repository.Id)
 	if err != nil {
-		session.Log.Warn("Failed to retrieve repository %d: %s", repository.Id, err)
+		getSession().Log.Warn("Failed to retrieve repository %d: %s", repository.Id, err)
 		return
 	}
 	if repo.GetPermissions()["pull"] &&
-		uint(repo.GetStargazersCount()) >= *session.Options.MinimumStars &&
-		uint(repo.GetSize()) < *session.Options.MaximumRepositorySize {
+		uint(repo.GetStargazersCount()) >= *getSession().Options.MinimumStars &&
+		uint(repo.GetSize()) < *getSession().Options.MaximumRepositorySize {
 		processRepositoryOrGist(repo.GetCloneURL(), repository.Ref, repo.GetStargazersCount(), core.GITHUB_SOURCE, workerID)
 	}
 }
 
 func ProcessGists() {
-	threadNum := *session.Options.Threads
-	// Limit threads for gists to prevent rate limiting
-	if threadNum > 5 {
-		threadNum = 5
+	threadNum := *getSession().Options.Threads
+	// Cap from config (default 5) to avoid hammering the gist API.
+	if cap := getSession().Config.Performance.Int(getSession().Config.Performance.MaxGistThreads, 5); threadNum > cap {
+		threadNum = cap
 	}
 
 	// Create worker pool with buffered channels
@@ -735,17 +827,17 @@ func ProcessGists() {
 
 	// Distribute work
 	go func() {
-		for gistUrl := range session.Gists {
+		for gistUrl := range getSession().Gists {
 			gistQueue <- gistUrl
 		}
 	}()
 }
 
 func ProcessComments() {
-	threadNum := *session.Options.Threads
-	// Limit threads for comments to prevent rate limiting
-	if threadNum > 3 {
-		threadNum = 3
+	threadNum := *getSession().Options.Threads
+	// Cap from config (default 3) to avoid hammering the API.
+	if cap := getSession().Config.Performance.Int(getSession().Config.Performance.MaxCommentThreads, 3); threadNum > cap {
+		threadNum = cap
 	}
 
 	// Create worker pool with buffered channels
@@ -762,7 +854,7 @@ func ProcessComments() {
 
 	// Distribute work
 	go func() {
-		for comment := range session.Comments {
+		for comment := range getSession().Comments {
 			commentQueue <- comment
 		}
 	}()
@@ -776,9 +868,9 @@ func processComment(comment core.Comment) {
 	}
 
 	// Mark directory as processed and trigger cleanup
-	session.CleanupManager.MarkProcessed(dir)
-	if err := session.CleanupManager.CleanupIfNeeded(); err != nil {
-		session.Log.Debug("Cleanup error: %s", err.Error())
+	getSession().CleanupManager.MarkProcessed(dir)
+	if err := getSession().CleanupManager.CleanupIfNeeded(); err != nil {
+		getSession().Log.Debug("Cleanup error: %s", err.Error())
 	}
 }
 
@@ -789,27 +881,27 @@ func processRepositoryOrGist(url string, ref string, stars int, source core.GitR
 
 	var gitProgress *core.GitProgressWriter
 
-	_, err := core.CloneRepository(session, url, ref, dir, gitProgress)
+	_, err := core.CloneRepository(getSession(), url, ref, dir, gitProgress)
 	if err != nil {
-		session.Log.Debug("[%s] Cloning failed: %s", url, err.Error())
+		getSession().Log.Debug("[%s] Cloning failed: %s", url, err.Error())
 		os.RemoveAll(dir)
 		activity.FailRepo(url)
 		return
 	}
 	activity.StartScan(url)
-	session.Log.Debug("[%s] Cloning %s into %s",
+	getSession().Log.Debug("[%s] Cloning %s into %s",
 		url, ref,
-		strings.Replace(dir, *session.Options.TempDirectory, "", -1))
+		strings.Replace(dir, *getSession().Options.TempDirectory, "", -1))
 	core.ApplySandboxToRepo(dir)
 	checkSignatures(dir, url, ref, stars, source)
 	activity.FinishScan(url)
 
 	// Mark directory as processed for cleanup tracking
-	session.CleanupManager.MarkProcessed(dir)
+	getSession().CleanupManager.MarkProcessed(dir)
 
 	// Check if cleanup is needed
-	if err := session.CleanupManager.CleanupIfNeeded(); err != nil {
-		session.Log.Debug("Cleanup error: %s", err.Error())
+	if err := getSession().CleanupManager.CleanupIfNeeded(); err != nil {
+		getSession().Log.Debug("Cleanup error: %s", err.Error())
 	}
 }
 
@@ -887,6 +979,22 @@ func hasCompletePemBlock(contents string) bool {
 }
 
 func checkSignatures(dir string, url string, ref string, stars int, source core.GitResourceType) (matchedAny bool) {
+	// Count files first and skip if too many (prevents slowdowns on huge repos)
+	maxFileCount := getSession().Config.Performance.Int(getSession().Config.Performance.MaxFileCount, 10000)
+	scanner := core.NewDirectoryScanner(getSession().Log)
+	fileCount := scanner.GetFileCount(dir)
+
+	if fileCount > maxFileCount {
+		lockPrintf("[SKIP] Repository has %d files (max: %d): %s\n", fileCount, maxFileCount, url)
+		return false
+	}
+
+	// CRITICAL PERFORMANCE FIX: Pre-compile search query regex ONCE outside the file loop
+	var queryRegex *regexp.Regexp
+	if *getSession().Options.SearchQuery != "" {
+		queryRegex = regexp.MustCompile(*getSession().Options.SearchQuery)
+	}
+
 	for _, file := range core.GetMatchingFiles(dir) {
 		// Env files whose only assignments are public VITE_* variables (Vite
 		// client-side envs ship to the browser by design) are not findings.
@@ -903,38 +1011,42 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 		// file.Path is like: C:\Users\me\AppData\Local\Temp\shhgit\hash\path\to\file.txt
 		// We want: path/to/file.txt
 		relativeFileName = file.Path
-		
+
 		// Normalize paths to use forward slashes for consistent comparison
 		normalizedDir := strings.ReplaceAll(dir, "\\", "/")
 		normalizedFilePath := strings.ReplaceAll(relativeFileName, "\\", "/")
-		
+
 		// Ensure dir has a trailing separator for proper trimming
 		if !strings.HasSuffix(normalizedDir, "/") {
 			normalizedDir += "/"
 		}
-		
+
 		// Strip the directory prefix from the file path
 		relativeFileName = strings.TrimPrefix(normalizedFilePath, normalizedDir)
 		relativeFileName = strings.TrimPrefix(relativeFileName, "/")
 		relativeFileName = strings.TrimPrefix(relativeFileName, "\\")
 		relativeFileName = strings.ReplaceAll(relativeFileName, "\\", "/")
 
-		if *session.Options.SearchQuery != "" {
-			queryRegex := regexp.MustCompile(*session.Options.SearchQuery)
+		if queryRegex != nil {
+			// Use pre-compiled regex from outside the loop (PERFORMANCE FIX)
 			for _, match := range queryRegex.FindAllSubmatch(file.Contents, -1) {
 				matches = append(matches, string(match[0]))
 			}
 			if len(matches) > 0 {
 				count := len(matches)
 				m := strings.Join(matches, ", ")
+				// Search-query matches must feed the web dashboard too, exactly
+				// like signature matches — otherwise they show in the terminal
+				// but never appear in the Matches tab.
+				publish(&MatchEvent{Source: source, Url: url, Matches: matches, Signature: "Search Query", File: relativeFileName, Stars: stars, Priority: 0, Color: "", FileContent: string(file.Contents), Secret: matches[0], SecretLine: secretLineNum(file.Contents, matches[0])})
 				logSearch(count, url, relativeFileName, m, ref)
-				session.WriteToCsv([]string{url, "Search Query", relativeFileName, m})
-				session.LogMatch("Search Query", url, relativeFileName, matches)
+				getSession().WriteToCsv([]string{url, "Search Query", relativeFileName, m})
+				getSession().LogMatch("Search Query", url, relativeFileName, matches)
 			}
 		} else {
-			for _, signature := range session.Signatures {
+			for _, signature := range getSession().Signatures {
 				// Check if signature should be excluded in current mode
-				currentMode := 	getLogFormat()
+				currentMode := getLogFormat()
 				if isSignatureExcludedInMode(signature, currentMode) {
 					continue
 				}
@@ -959,7 +1071,7 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 							}
 							count := len(matches)
 							m := strings.Join(matches, ", ")
-							
+
 							// Capture the full file and the first raw secret so
 							// the web dashboard can render "view file" with
 							// syntax highlighting and the secret highlighted.
@@ -967,35 +1079,35 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 							// content must be captured here.
 							fileContent := string(file.Contents)
 							secret := matches[0]
-							
+
 							publish(&MatchEvent{Source: source, Url: url, Matches: matches, Signature: signature.Name(), File: relativeFileName, Stars: stars, Priority: signature.GetPriority(), Color: signature.GetColor(), FileContent: fileContent, Secret: secret, SecretLine: secretLineNum(file.Contents, secret)})
 							matchedAny = true
 							logSecret(count, url, signature.Name(), relativeFileName, m, ref, stars)
-							session.WriteToCsv([]string{url, signature.Name(), relativeFileName, m})
-							session.LogMatch(signature.Name(), url, relativeFileName, matches)
+							getSession().WriteToCsv([]string{url, signature.Name(), relativeFileName, m})
+							getSession().LogMatch(signature.Name(), url, relativeFileName, matches)
 
 							// Add GitHub tokens to session for dynamic fetching
 							if signature.IsTokenType() {
 								for _, token := range matches {
-									session.AddGitHubToken(token)
+									getSession().AddGitHubToken(token)
 								}
 							}
 
 							// Test tokens if this is an AI token signature
 							sigName := strings.ToLower(signature.Name())
 							if isAITokenSignature(sigName) {
-								session.TokenValidator.TestMatchedTokens(matches, signature.GetColor())
+								getSession().TokenValidator.TestMatchedTokens(matches, signature.GetColor())
 							}
 						}
 					} else {
-						if *session.Options.PathChecks {
+						if *getSession().Options.PathChecks {
 							publish(&MatchEvent{Source: source, Url: url, Matches: matches, Signature: signature.Name(), File: relativeFileName, Stars: stars, Priority: signature.GetPriority(), Color: signature.GetColor(), FileContent: string(file.Contents)})
 							matchedAny = true
 							logFile(url, signature.Name(), relativeFileName, ref, stars)
-							session.WriteToCsv([]string{url, signature.Name(), relativeFileName, ""})
-							session.LogMatch(signature.Name(), url, relativeFileName, []string{relativeFileName})
+							getSession().WriteToCsv([]string{url, signature.Name(), relativeFileName, ""})
+							getSession().LogMatch(signature.Name(), url, relativeFileName, []string{relativeFileName})
 						}
-						if *session.Options.EntropyThreshold > 0 && file.CanCheckEntropy() {
+						if *getSession().Options.EntropyThreshold > 0 && file.CanCheckEntropy() {
 							scanner := bufio.NewScanner(bytes.NewReader(file.Contents))
 							lineNo := 0
 							for scanner.Scan() {
@@ -1003,9 +1115,9 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 								line := scanner.Text()
 								if len(line) > 6 && len(line) < 100 {
 									entropy := core.GetEntropy(line)
-									if entropy >= *session.Options.EntropyThreshold {
+									if entropy >= *getSession().Options.EntropyThreshold {
 										blacklistedMatch := false
-										for _, blacklistedString := range session.Config.BlacklistedStrings {
+										for _, blacklistedString := range getSession().Config.BlacklistedStrings {
 											if strings.Contains(strings.ToLower(line), strings.ToLower(blacklistedString)) {
 												blacklistedMatch = true
 											}
@@ -1014,8 +1126,8 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 											publish(&MatchEvent{Source: source, Url: url, Matches: []string{line}, Signature: "High entropy string", File: relativeFileName, Stars: stars, Priority: 0, Color: "", FileContent: string(file.Contents), Secret: line, SecretLine: lineNo})
 											matchedAny = true
 											logEntropy(url, relativeFileName, line, ref, stars)
-											session.WriteToCsv([]string{url, "High entropy string", relativeFileName, line})
-											session.LogMatch("High entropy string", url, relativeFileName, []string{line})
+											getSession().WriteToCsv([]string{url, "High entropy string", relativeFileName, line})
+											getSession().LogMatch("High entropy string", url, relativeFileName, []string{line})
 										}
 									}
 								}
@@ -1026,7 +1138,7 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 			}
 		}
 
-		if !matchedAny && len(*session.Options.Local) <= 0 {
+		if !matchedAny && len(*getSession().Options.Local) <= 0 {
 			os.Remove(file.Path)
 		}
 	}
@@ -1053,11 +1165,25 @@ func sourceName(s core.GitResourceType) string {
 	}
 }
 
+// matchIDSeq guarantees uniqueness across concurrent publishers.
+var matchIDSeq int64
+
+// newMatchID returns a process-unique match ID. time.Now().UnixNano() alone
+// is NOT unique on Windows: the system clock has coarse resolution, so scan
+// threads publishing matches concurrently can land on the same tick and
+// produce duplicate IDs. The web dashboard keys match cards by ID, so
+// duplicate IDs silently collapse distinct matches into one card (matches
+// visibly "disappear"). The atomic counter makes every ID unique while the
+// UnixNano prefix keeps IDs monotonically increasing for list ordering.
+func newMatchID() string {
+	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), atomic.AddInt64(&matchIDSeq, 1))
+}
+
 func publish(event *MatchEvent) {
 	// Feed the in-process web dashboard (when running with --web).
 	if webHub != nil {
 		m := &Match{
-			ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
+			ID:        newMatchID(),
 			Timestamp: time.Now(),
 			Source:    sourceName(event.Source),
 			URL:       event.Url,
@@ -1083,7 +1209,7 @@ func publish(event *MatchEvent) {
 	// Feed the TUI (when running with --tui).
 	if tuiState != nil {
 		AddTUIMatch(&TUIMatch{
-			ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
+			ID:        newMatchID(),
 			Timestamp: time.Now(),
 			Source:    sourceName(event.Source),
 			URL:       event.Url,
@@ -1095,7 +1221,7 @@ func publish(event *MatchEvent) {
 		})
 	}
 
-	if len(*session.Options.Live) > 0 {
+	if len(*getSession().Options.Live) > 0 {
 		// Convert MatchEvent to server Match format
 		match := map[string]interface{}{
 			"timestamp": time.Now().Format(time.RFC3339),
@@ -1111,14 +1237,14 @@ func publish(event *MatchEvent) {
 			"color":     event.Color,
 		}
 		data, _ := json.Marshal(match)
-		http.Post(*session.Options.Live, "application/json", bytes.NewBuffer(data))
+		http.Post(*getSession().Options.Live, "application/json", bytes.NewBuffer(data))
 	}
 
 	// Send EVERY match to the main webhook.
-	if len(session.Config.Webhook) > 0 {
+	if len(getSession().Config.Webhook) > 0 {
 		go core.SendMatchWebhook(
-			session.Config.Webhook,
-			session.Config.WebhookPayload,
+			getSession().Config.Webhook,
+			getSession().Config.WebhookPayload,
 			event.Url,
 			event.Signature,
 			event.File,
@@ -1130,10 +1256,10 @@ func publish(event *MatchEvent) {
 	}
 
 	// Send AI tokens (excluding Google) to their dedicated webhook
-	if len(session.Config.WebhookAITokens) > 0 && isAITokenSignature(event.Signature) {
+	if len(getSession().Config.WebhookAITokens) > 0 && isAITokenSignature(event.Signature) {
 		go core.SendMatchWebhook(
-			session.Config.WebhookAITokens,
-			session.Config.WebhookPayload,
+			getSession().Config.WebhookAITokens,
+			getSession().Config.WebhookPayload,
 			event.Url,
 			event.Signature,
 			event.File,
@@ -1145,10 +1271,10 @@ func publish(event *MatchEvent) {
 	}
 
 	// Send crypto-related matches to their dedicated webhook
-	if len(session.Config.WebhookCrypto) > 0 && isCryptoSignature(event.Signature) {
+	if len(getSession().Config.WebhookCrypto) > 0 && isCryptoSignature(event.Signature) {
 		go core.SendMatchWebhook(
-			session.Config.WebhookCrypto,
-			session.Config.WebhookPayload,
+			getSession().Config.WebhookCrypto,
+			getSession().Config.WebhookPayload,
 			event.Url,
 			event.Signature,
 			event.File,
@@ -1165,14 +1291,12 @@ func publish(event *MatchEvent) {
 // ──────────────────────────────────────────────────────────────
 
 func main() {
-	initLogFormat()
-
-	// Print mode information
+	// Print mode information BEFORE initializing session
 	fmt.Println()
 	modeConfig.PrintModeInfo()
 	fmt.Println()
 
-	// Handle UI modes
+	// Handle UI modes - this will call initLogFormat() when needed
 	if modeConfig.Mode == ModeWeb {
 		runWebMode()
 		return
@@ -1196,6 +1320,7 @@ func exitScanner(code int) {
 // runWebMode starts the web dashboard and runs the scanner in-process,
 // feeding matches and logs into the embedded dark-mode UI.
 func runWebMode() {
+	initLogFormat()
 	// In --web mode the dashboard is the interface: hide the console window
 	// so only the browser UI is visible (scanner still runs in-process).
 	hideConsole()
@@ -1211,19 +1336,19 @@ func runWebMode() {
 
 	// Capture scanner log output (Logger writes) into the web log buffer so
 	// the dashboard's Logs tab shows everything.
-	if session.Log != nil {
-		session.Log.LogWriter = func(line string) {
+	if getSession().Log != nil {
+		getSession().Log.LogWriter = func(line string) {
 			fmt.Print(line)
 			appendLogLine(line)
 		}
 	}
 
 	// Route token-validation results into the web "Tokens" view.
-	if session.TokenValidator != nil {
-		session.TokenValidator.OnTokenResult = func(token string, valid bool, provider string) {
-			pushTokenResult(token, valid, provider)
-		}
-	}
+	// if getSession().TokenValidator != nil {
+	// 	getSession().TokenValidator.OnTokenResult = func(token string, valid bool, provider string) {
+	// 		pushTokenResult(token, valid, provider)
+	// 	}
+	// }
 
 	addr := fmt.Sprintf("http://%s:%s", modeConfig.WebHost, modeConfig.WebPort)
 	fmt.Printf("🌐 Starting web server on %s\n", addr)
@@ -1240,9 +1365,12 @@ func runWebMode() {
 	go runScanner()
 
 	// Wire the AI review service (from config) before the web server starts.
-	if err := InitAIReview(session.Config); err != nil {
+	if err := InitAIReview(getSession().Config); err != nil {
 		log.Printf("[web] AI review init failed: %v", err)
 	}
+
+	// Wire the interactive AI-review chat (secret + file + repo analysis).
+	initAIChat(getSession().Config)
 
 	// Start web server (blocking)
 	if err := modeConfig.SetupIntegratedUI(); err != nil {
@@ -1286,21 +1414,21 @@ func runScanner() {
 		case LogFormatMinimal:
 			lockPrintf("%s sigs:%s  threads:%s  tmp:%s\n\n",
 				minDim("◆"),
-				minSearch(fmt.Sprintf("%d", len(session.Signatures))),
-				minSearch(fmt.Sprintf("%d", *session.Options.Threads)),
-				minDim(*session.Options.TempDirectory))
+				minSearch(fmt.Sprintf("%d", len(getSession().Signatures))),
+				minSearch(fmt.Sprintf("%d", *getSession().Options.Threads)),
+				minDim(*getSession().Options.TempDirectory))
 		case LogFormatNeon:
 			lockPrintf("%s sigs %s  threads %s  tmp %s  style %s\n\n",
 				neonDim("◆"),
-				neonStar(fmt.Sprintf("%d", len(session.Signatures))),
-				neonStar(fmt.Sprintf("%d", *session.Options.Threads)),
-				neonDim(*session.Options.TempDirectory),
+				neonStar(fmt.Sprintf("%d", len(getSession().Signatures))),
+				neonStar(fmt.Sprintf("%d", *getSession().Options.Threads)),
+				neonDim(*getSession().Options.TempDirectory),
 				neonSearchLabel(" "+strings.ToUpper(getLogFormat())+" "))
 		default:
 			lockPrintf("[*] Loaded %s signatures  .  %s threads  .  tmp: %s  .  style: %s\n\n",
-				color.HiCyanString("%d", len(session.Signatures)),
-				color.HiCyanString("%d", *session.Options.Threads),
-				color.HiBlueString(*session.Options.TempDirectory),
+				color.HiCyanString("%d", len(getSession().Signatures)),
+				color.HiCyanString("%d", *getSession().Options.Threads),
+				color.HiBlueString(*getSession().Options.TempDirectory),
 				color.HiGreenString(strings.ToUpper(getLogFormat())))
 		}
 	}
@@ -1311,6 +1439,7 @@ func runScanner() {
 
 // runScannerCLI runs scanner with full CLI output
 func runScannerCLI() {
+	initLogFormat()
 	// ── Banner (preset-aware) ──────────────────────────────────
 	switch getLogFormat() {
 	case LogFormatMinimal:
@@ -1342,21 +1471,21 @@ func runScannerCLI() {
 	case LogFormatMinimal:
 		lockPrintf("%s sigs:%s  threads:%s  tmp:%s\n\n",
 			minDim("◆"),
-			minSearch(fmt.Sprintf("%d", len(session.Signatures))),
-			minSearch(fmt.Sprintf("%d", *session.Options.Threads)),
-			minDim(*session.Options.TempDirectory))
+			minSearch(fmt.Sprintf("%d", len(getSession().Signatures))),
+			minSearch(fmt.Sprintf("%d", *getSession().Options.Threads)),
+			minDim(*getSession().Options.TempDirectory))
 	case LogFormatNeon:
 		lockPrintf("%s sigs %s  threads %s  tmp %s  style %s\n\n",
 			neonDim("◆"),
-			neonStar(fmt.Sprintf("%d", len(session.Signatures))),
-			neonStar(fmt.Sprintf("%d", *session.Options.Threads)),
-			neonDim(*session.Options.TempDirectory),
+			neonStar(fmt.Sprintf("%d", len(getSession().Signatures))),
+			neonStar(fmt.Sprintf("%d", *getSession().Options.Threads)),
+			neonDim(*getSession().Options.TempDirectory),
 			neonSearchLabel(" "+strings.ToUpper(getLogFormat())+" "))
 	default:
 		lockPrintf("[*] Loaded %s signatures  .  %s threads  .  tmp: %s  .  style: %s\n\n",
-			color.HiCyanString("%d", len(session.Signatures)),
-			color.HiCyanString("%d", *session.Options.Threads),
-			color.HiBlueString(*session.Options.TempDirectory),
+			color.HiCyanString("%d", len(getSession().Signatures)),
+			color.HiCyanString("%d", *getSession().Options.Threads),
+			color.HiBlueString(*getSession().Options.TempDirectory),
 			color.HiGreenString(strings.ToUpper(getLogFormat())))
 	}
 
@@ -1365,21 +1494,27 @@ func runScannerCLI() {
 
 // executeScanner runs the scanner core logic
 func executeScanner() {
+	// ── Auto-prune invalid GitHub tokens from config (every startup) ─────
+	// Also install the runtime hook so a token that starts returning 401
+	// while the scanner runs is removed from config.yaml immediately.
+	installRuntimeTokenPruner()
+	pruneInvalidGitHubTokens()
+
 	// ── Dispatch ──────────────────────────────────────────────
-	if *session.Options.TestTokens {
-		validator := core.NewTokenValidator(session.Log)
+	if *getSession().Options.TestTokens {
+		validator := core.NewTokenValidator(getSession().Log)
 		var tokensToTest []string
 
 		// Collect tokens from all config sections and detect AI-related ones
 		allTokens := make(map[string]string) // token -> detected provider
 
 		// 1. Explicitly listed AI tokens
-		for _, token := range session.Config.AITokens {
+		for _, token := range getSession().Config.AITokens {
 			allTokens[token] = validator.DetectProvider(token)
 		}
 
 		// 2. Check github_access_tokens for any AI tokens via provider detection
-		for _, token := range session.Config.GitHubAccessTokens {
+		for _, token := range getSession().Config.GitHubAccessTokens {
 			provider := validator.DetectProvider(token)
 			if isAITokenSignature(provider) {
 				allTokens[token] = provider
@@ -1394,7 +1529,7 @@ func executeScanner() {
 		}
 
 		if len(tokensToTest) == 0 {
-			session.Log.Warn("No AI tokens found in config")
+			getSession().Log.Warn("No AI tokens found in config")
 			lockPrintf("[*] No AI tokens found in config. Add tokens to config.yaml under 'ai_tokens' or 'github_access_tokens'.\n")
 		} else {
 			lockPrintf("[*] Testing %d AI tokens from config...\n\n", len(tokensToTest))
@@ -1407,9 +1542,9 @@ func executeScanner() {
 		exitScanner(0)
 	}
 
-	if len(*session.Options.ScanKeys) > 0 {
-		lockPrintf("[*] Scanning directory for API keys: %s\n", color.HiYellowString(*session.Options.ScanKeys))
-		keyValidator := core.NewKeyValidator(session.Log)
+	if len(*getSession().Options.ScanKeys) > 0 {
+		lockPrintf("[*] Scanning directory for API keys: %s\n", color.HiYellowString(*getSession().Options.ScanKeys))
+		keyValidator := core.NewKeyValidator(getSession().Log)
 
 		// Open log file for keys
 		logFilename := fmt.Sprintf("found_keys_%d.txt", time.Now().Unix())
@@ -1420,7 +1555,7 @@ func executeScanner() {
 			defer keyValidator.CloseLogFile()
 		}
 
-		validatedKeys := keyValidator.ScanDirectoryForKeys(*session.Options.ScanKeys, session)
+		validatedKeys := keyValidator.ScanDirectoryForKeys(*getSession().Options.ScanKeys, getSession())
 
 		validCount := 0
 		invalidCount := 0
@@ -1430,13 +1565,13 @@ func executeScanner() {
 		lockPrintln(strings.Repeat("-", 90))
 
 		for _, vk := range validatedKeys {
-		status := "✓ VALID"
-		if !vk.Valid {
-			status = "✗ INVALID"
-			invalidCount++
-		} else {
-			validCount++
-		}
+			status := "✓ VALID"
+			if !vk.Valid {
+				status = "✗ INVALID"
+				invalidCount++
+			} else {
+				validCount++
+			}
 
 			keyDisplay := vk.Key
 			if len(keyDisplay) > 40 {
@@ -1451,30 +1586,30 @@ func executeScanner() {
 		exitScanner(0)
 	}
 
-	if len(*session.Options.Local) > 0 {
-		lockPrintf("[*] Scanning local: %s\n", color.HiYellowString(*session.Options.Local))
+	if len(*getSession().Options.Local) > 0 {
+		lockPrintf("[*] Scanning local: %s\n", color.HiYellowString(*getSession().Options.Local))
 		rc := 0
-		if checkSignatures(*session.Options.Local, *session.Options.Local, "", -1, core.LOCAL_SOURCE) {
+		if checkSignatures(*getSession().Options.Local, *getSession().Options.Local, "", -1, core.LOCAL_SOURCE) {
 			rc = 1
 		} else {
-			lockPrintf("[*] No secrets found in %s\n", color.HiBlueString(*session.Options.Local))
+			lockPrintf("[*] No secrets found in %s\n", color.HiBlueString(*getSession().Options.Local))
 		}
-		session.MatchLogger.Close()
+		getSession().MatchLogger.Close()
 		exitScanner(rc)
 	}
 
-	if *session.Options.SearchQuery != "" {
+	if *getSession().Options.SearchQuery != "" {
 		lockPrintf("[*] Search query %s — only returning matching results.\n",
-			color.HiYellowString(*session.Options.SearchQuery))
+			color.HiYellowString(*getSession().Options.SearchQuery))
 	}
 
 	// Start background workers
-	go core.GetRepositories(session)
+	go core.GetRepositories(getSession())
 	go ProcessRepositories()
 	go ProcessComments()
 
-	if *session.Options.ProcessGists {
-		go core.GetGists(session)
+	if *getSession().Options.ProcessGists {
+		go core.GetGists(getSession())
 		go ProcessGists()
 	}
 

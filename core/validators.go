@@ -4,8 +4,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -15,7 +18,22 @@ var (
 	httpClient = &http.Client{
 		Timeout: 10 * time.Second,
 	}
+	
+	// Global webhook queue for rate limiting and retry
+	globalWebhookQueue *WebhookQueue
+	webhookQueueOnce   sync.Once
 )
+
+// GetWebhookQueue returns the singleton webhook queue instance
+func GetWebhookQueue() *WebhookQueue {
+	webhookQueueOnce.Do(func() {
+		// Discord allows 5 requests per 2 seconds per webhook = 400ms between requests
+		// Use 500ms to be safe
+		globalWebhookQueue = NewWebhookQueue(1000, 500, 300)
+		globalWebhookQueue.Start()
+	})
+	return globalWebhookQueue
+}
 
 // ValidateDiscordToken validates a Discord bot token by making an API request
 func ValidateDiscordToken(token string) bool {
@@ -119,17 +137,20 @@ func ValidateTelegramToken(token string) bool {
 // ValidateDiscordWebhook validates a Discord webhook URL
 func ValidateDiscordWebhook(webhookURL string) bool {
 	if webhookURL == "" {
+		fmt.Printf("[WARN] Discord webhook URL is empty\n")
 		return false
 	}
 
 	// Discord webhook URL pattern: https://discord.com/api/webhooks/ID/TOKEN
 	if !strings.HasPrefix(webhookURL, "https://discord.com/api/webhooks/") {
+		fmt.Printf("[ERROR] Invalid Discord webhook URL format. Expected: https://discord.com/api/webhooks/ID/TOKEN\n")
 		return false
 	}
 
 	// Extract webhook ID and token
 	parts := strings.Split(strings.TrimPrefix(webhookURL, "https://discord.com/api/webhooks/"), "/")
 	if len(parts) < 2 {
+		fmt.Printf("[ERROR] Discord webhook URL missing ID or token\n")
 		return false
 	}
 
@@ -137,24 +158,66 @@ func ValidateDiscordWebhook(webhookURL string) bool {
 	webhookID := parts[0]
 	for _, char := range webhookID {
 		if char < '0' || char > '9' {
+			fmt.Printf("[ERROR] Discord webhook ID must be numeric\n")
 			return false
 		}
 	}
 
-	// Test the webhook by sending a simple ping
-	payload := map[string]string{"content": "shhgit webhook validation"}
-	jsonData, err := json.Marshal(payload)
+	// Test the webhook by sending a validation embed
+	testPayload := map[string]interface{}{
+		"embeds": []map[string]interface{}{
+			{
+				"title":       "shhgit - Webhook Validation",
+				"description": "Testing webhook connectivity and permissions",
+				"color":       65280, // Green
+			},
+		},
+	}
+	
+	jsonData, err := json.Marshal(testPayload)
 	if err != nil {
+		fmt.Printf("[ERROR] Failed to marshal validation payload: %v\n", err)
 		return false
 	}
 
 	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(string(jsonData)))
 	if err != nil {
+		fmt.Printf("[ERROR] Discord webhook POST failed: %v\n", err)
 		return false
 	}
 	defer resp.Body.Close()
 
-	return resp.StatusCode == 204 || resp.StatusCode == 200
+	if resp.StatusCode == 204 || resp.StatusCode == 200 {
+		fmt.Printf("[✓] Discord webhook is valid and has proper permissions\n")
+		return true
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Printf("[ERROR] Discord webhook validation failed:\n")
+	fmt.Printf("  HTTP Status: %d\n", resp.StatusCode)
+	fmt.Printf("  Response: %s\n", string(body))
+
+	switch resp.StatusCode {
+	case 401, 403:
+		fmt.Printf("  → Permission denied. Check webhook has 'Send Messages' permission in Discord channel.\n")
+		return false
+	case 404:
+		fmt.Printf("  → Webhook not found. Verify the webhook URL is correct and hasn't been deleted.\n")
+		return false
+	case 429:
+		// Rate limited - Discord is temporarily blocking us
+		// The webhook is valid, just can't test it right now
+		// The webhook queue will handle retries with backoff
+		fmt.Printf("  → Rate limited (429). Assuming webhook is valid.\n")
+		fmt.Printf("  → The webhook queue system will retry with exponential backoff.\n")
+		return true // Consider valid since it's a transient rate limit, not a permission error
+	case 400:
+		fmt.Printf("  → Bad request. The webhook payload may be invalid.\n")
+		return false
+	default:
+		fmt.Printf("  → Unexpected status code. Check Discord API status.\n")
+		return false
+	}
 }
 
 // ValidateTelegramWebhook validates a Telegram webhook setup
@@ -458,13 +521,41 @@ func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, m
 	if len(matchesStr) > 1000 {
 		matchesStr = matchesStr[:997] + "..."
 	}
-	message := fmt.Sprintf("**%s** | Priority: %d\n**File:** %s\n**Repository:** %s\n**Matches:** %s", signature, priority, file, url, matchesStr)
-	if fileContent != "" && strings.HasSuffix(file, ".env") {
-		// Truncate file content to keep the payload reasonable
-		if len(fileContent) > 1900 {
-			fileContent = fileContent[:1897] + "..."
+	
+	// For filename-based matches, show the filename if no content matches
+	if len(matchesStr) == 0 || matchesStr == "" {
+		matchesStr = fmt.Sprintf("Filename: %s", file)
+	}
+	
+	// Generate GitHub link - only add line anchor if we have a valid line number
+	var githubLink string
+	if len(matches) > 0 && fileContent != "" {
+		lineNum := findLineNumber(fileContent, matches[0])
+		if lineNum > 0 {
+			githubLink = generateGitHubBlobLink(url, file, lineNum)
+		} else {
+			// No valid line number, just link to file without anchor
+			githubLink = generateGitHubBlobLinkNoAnchor(url, file)
 		}
-		message += "\n**File Content:**\n" + fileContent
+	} else {
+		// No matches or content, link to file without anchor
+		githubLink = generateGitHubBlobLinkNoAnchor(url, file)
+	}
+	
+	// Enhanced message format with clear signature match display
+	message := fmt.Sprintf("**%s** | Priority: %d\n**File:** [%s](%s)\n**Repository:** %s\n\n**<match>**\n```\n%s\n```", 
+		signature, priority, file, githubLink, url, matchesStr)
+	
+	// For .env files, embed FULL file content (match all .env variants)
+	isEnvFile := fileContent != "" && (
+		strings.HasSuffix(strings.ToLower(file), ".env") ||
+		strings.Contains(strings.ToLower(file), ".env.") ||
+		strings.HasPrefix(strings.ToLower(filepath.Base(file)), "env.") ||
+		filepath.Base(strings.ToLower(file)) == ".env")
+	
+	if isEnvFile {
+		// Embed FULL file content for .env files (no truncation)
+		message += "\n**📄 .env File Content:**\n```env\n" + fileContent + "\n```"
 	}
 
 	if webhookPayload == "" {
@@ -474,50 +565,117 @@ func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, m
 
 	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(payload))
 	if err != nil {
+		fmt.Printf("[ERROR] Generic webhook POST failed: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Printf("[ERROR] Generic webhook returned %d: %s\n", resp.StatusCode, string(body))
+	}
 }
 
-// sendDiscordMatchWebhook sends a match alert as a rich Discord embed.
+// sendDiscordMatchWebhook sends a match alert as a rich Discord embed via the webhook queue.
 func sendDiscordMatchWebhook(webhookURL string, url string, signature string, file string, matches []string, color string, priority int, fileContent string) {
 	// Convert color hex to decimal for Discord embed
 	colorInt := parseColorHex(color)
 
 	// Truncate matches if too long
 	matchesStr := strings.Join(matches, ", ")
-	if len(matchesStr) > 1024 {
-		matchesStr = matchesStr[:1021] + "..."
+	if len(matchesStr) > 2048 {
+		matchesStr = matchesStr[:2045] + "..."
 	}
 
 	// Create Discord embed payload
-	fields := []map[string]interface{}{
-		{
-			"name":  "Matches",
-			"value": matchesStr,
-		},
-	}
-
-	// Add file content if it's a .env file
-	if fileContent != "" && strings.HasSuffix(file, ".env") {
-		// Truncate file content if too long (Discord limit is 1024 chars per field)
-		if len(fileContent) > 1024 {
-			fileContent = fileContent[:1021] + "..."
+	fields := []map[string]interface{}{}
+	
+	// Add signature match section with clear formatting
+	if len(matchesStr) == 0 || matchesStr == "" {
+		// For filename-based matches (like .env files), show the filename
+		fields = append(fields, map[string]interface{}{
+			"name":  "📄 Matched File",
+			"value": fmt.Sprintf("`%s`", file),
+		})
+	} else {
+		// Show the actual matched content in a highlighted <match> block
+		matchDisplay := fmt.Sprintf("```\n<match>\n%s\n</match>\n```", matchesStr)
+		if len(matchDisplay) > 1024 {
+			matchDisplay = fmt.Sprintf("```\n<match>\n%s\n</match>\n```", matchesStr[:900]+"...")
 		}
 		fields = append(fields, map[string]interface{}{
-			"name":  "File Content (.env)",
-			"value": "```\n" + fileContent + "\n```",
+			"name":   "🔍 Signature Match",
+			"value":  matchDisplay,
+			"inline": false,
 		})
 	}
 
+	// For .env files, embed the FULL content in code blocks (no truncation)
+	// Match any .env file: .env, .env.local, .env.production, env.staging, etc.
+	isEnvFile := fileContent != "" && (
+		strings.HasSuffix(strings.ToLower(file), ".env") ||
+		strings.Contains(strings.ToLower(file), ".env.") ||
+		strings.HasPrefix(strings.ToLower(filepath.Base(file)), "env.") ||
+		filepath.Base(strings.ToLower(file)) == ".env")
+	
+	if isEnvFile {
+		// Discord has a 6000 character limit per embed description
+		// and 1024 character limit per field value
+		// We'll split the content across multiple fields if needed
+		const maxFieldLength = 900 // Leave room for code block markers
+		
+		if len(fileContent) <= maxFieldLength {
+			// Single field if content is small enough
+			fields = append(fields, map[string]interface{}{
+				"name":   "📄 .env File Content",
+				"value":  "```env\n" + fileContent + "\n```",
+				"inline": false,
+			})
+		} else {
+			// Split into multiple fields for large .env files
+			envChunks := chunkString(fileContent, maxFieldLength)
+			for i, chunk := range envChunks {
+				fieldName := fmt.Sprintf("📄 .env File Content (Part %d/%d)", i+1, len(envChunks))
+				if i == 0 {
+					fieldName = fmt.Sprintf("📄 .env File Content (1/%d)", len(envChunks))
+				}
+				fields = append(fields, map[string]interface{}{
+					"name":   fieldName,
+					"value":  "```env\n" + chunk + "\n```",
+					"inline": false,
+				})
+			}
+		}
+	}
+
+	// Generate GitHub link - only add line anchor if we have a valid line number
+	var githubLink string
+	if fileContent != "" && len(matches) > 0 {
+		lineNum := findLineNumber(fileContent, matches[0])
+		if lineNum > 0 {
+			githubLink = generateGitHubBlobLink(url, file, lineNum)
+		} else {
+			githubLink = generateGitHubBlobLinkNoAnchor(url, file)
+		}
+	} else {
+		// No valid line number, just link to file without anchor
+		githubLink = generateGitHubBlobLinkNoAnchor(url, file)
+	}
+
+	// Create description with clickable link
+	description := fmt.Sprintf("**Priority:** %d\n**File:** [%s](%s)\n**Repository:** %s", 
+		priority, file, githubLink, url)
+
 	embed := map[string]interface{}{
-		"title":       signature,
-		"description": fmt.Sprintf("**Priority:** %d\n**File:** %s\n**Repository:** %s", priority, file, url),
+		"title":       "🔍 " + signature,
+		"description": description,
 		"color":       colorInt,
 		"fields":      fields,
 		"footer": map[string]string{
 			"text": "shhgit - Secret Detection",
 		},
+		"url":       githubLink,
+		"timestamp": time.Now().Format(time.RFC3339),
 	}
 
 	payload := map[string]interface{}{
@@ -526,14 +684,85 @@ func sendDiscordMatchWebhook(webhookURL string, url string, signature string, fi
 
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
+		fmt.Printf("[ERROR] Failed to marshal Discord webhook payload: %v\n", err)
 		return
 	}
 
-	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(string(jsonPayload)))
-	if err != nil {
-		return
+	// Use webhook queue for rate limiting and retry logic
+	queue := GetWebhookQueue()
+	queue.Enqueue(webhookURL, string(jsonPayload))
+}
+
+// chunkString splits a string into chunks of max size
+func chunkString(s string, maxSize int) []string {
+	if len(s) <= maxSize {
+		return []string{s}
 	}
-	defer resp.Body.Close()
+
+	var chunks []string
+	for len(s) > maxSize {
+		chunks = append(chunks, s[:maxSize])
+		s = s[maxSize:]
+	}
+	if len(s) > 0 {
+		chunks = append(chunks, s)
+	}
+	return chunks
+}
+
+// findLineNumber finds the line number of the first occurrence of text in content
+func findLineNumber(content string, searchText string) int {
+	if !strings.Contains(content, searchText) {
+		return 1
+	}
+
+	idx := strings.Index(content, searchText)
+	// Count newlines before this index
+	lineNum := 1 + strings.Count(content[:idx], "\n")
+	return lineNum
+}
+
+// generateGitHubBlobLink generates a GitHub blob URL (for viewing with line anchors) from repo URL, file path, and line number
+func generateGitHubBlobLink(repoURL string, filePath string, lineNum int) string {
+	// Convert GitHub URL to blob URL with line anchor
+	// https://github.com/user/repo.git -> https://github.com/user/repo/blob/main/file.path#L15
+	// https://github.com/user/repo -> https://github.com/user/repo/blob/main/file.path#L15
+
+	// Extract user/repo from URL
+	repoURL = strings.TrimSuffix(repoURL, ".git")
+	parts := strings.Split(repoURL, "/")
+	if len(parts) < 4 {
+		return repoURL // Fallback to original URL if parsing fails
+	}
+
+	user := parts[len(parts)-2]
+	repo := parts[len(parts)-1]
+
+	// Build GitHub blob URL with line anchor (assumes main/master branch)
+	blobURL := fmt.Sprintf("https://github.com/%s/%s/blob/main/%s#L%d", user, repo, filePath, lineNum)
+
+	return blobURL
+}
+
+// generateGitHubBlobLinkNoAnchor generates a GitHub blob URL without a line anchor
+func generateGitHubBlobLinkNoAnchor(repoURL string, filePath string) string {
+	// Convert GitHub URL to blob URL without line anchor
+	// https://github.com/user/repo.git -> https://github.com/user/repo/blob/main/file.path
+
+	// Extract user/repo from URL
+	repoURL = strings.TrimSuffix(repoURL, ".git")
+	parts := strings.Split(repoURL, "/")
+	if len(parts) < 4 {
+		return repoURL // Fallback to original URL if parsing fails
+	}
+
+	user := parts[len(parts)-2]
+	repo := parts[len(parts)-1]
+
+	// Build GitHub blob URL without line anchor (assumes main/master branch)
+	blobURL := fmt.Sprintf("https://github.com/%s/%s/blob/main/%s", user, repo, filePath)
+
+	return blobURL
 }
 
 // parseColorHex converts a hex color string to Discord embed color integer

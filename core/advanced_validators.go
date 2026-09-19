@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -232,7 +231,7 @@ func (v *AWSValidator) Validate(token string) *ValidationResult {
 	}
 
 	// AWS keys need secret key too, just validate format
-	if matched, _ := regexp.MatchString(`^AKIA[0-9A-Z]{16}$`, token); matched {
+	if FastMatch("aws_key", token) {
 		result.Valid = true
 		result.Confidence = 70 // Format valid but can't verify without secret key
 		result.Error = "Format valid - requires secret key for full validation"
