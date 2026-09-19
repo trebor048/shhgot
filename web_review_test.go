@@ -380,6 +380,64 @@ func TestReviewListOmitsCredentialAndAssessment(t *testing.T) {
 	}
 }
 
+// The file viewer and the AI review both key off the same identifier: the
+// scanner stores a captured file body under the match id, /api/file is fetched
+// with that id, and a review asks for the body with match_id. Nothing enforced
+// that they agree, so a change to the id scheme on either side would silently
+// starve every review of its file context. This pins them to one value.
+func TestMatchIDIsSharedByFileViewerAndReview(t *testing.T) {
+	withReviewEnv(t)
+
+	const matchID = "shared-match-id-1"
+	const body = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+	storeMatchFile(matchID, "https://github.com/acme/app", "deploy/.env", body, "wJalrXUtnFEMI", 1)
+
+	// Half one: the id the dashboard uses to fetch a file body.
+	rec := httptest.NewRecorder()
+	getMatchFile(rec, localRequest(http.MethodGet, "/api/file?id="+matchID, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/file status = %d, want the stored body", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), body) {
+		t.Fatalf("/api/file did not return the stored body: %s", rec.Body.String())
+	}
+
+	// Half two: the very same id used to start a review must reach that body.
+	req, err := json.Marshal(reviewRequest{
+		MatchID:   matchID,
+		Signature: "AWS Secret Access Key",
+		Secret:    "wJalrXUtnFEMI",
+		Context:   "scanner notes",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	reviewCollectionHandler(rec, localRequest(http.MethodPost, "/api/review", req))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	rev, ok := reviewStore.Get(created.ID)
+	if !ok {
+		t.Fatal("review not stored")
+	}
+	if !strings.Contains(rev.Context, body) {
+		t.Fatalf("the review did not receive the cached file body: %q", rev.Context)
+	}
+	// The browser's summary is kept, but clearly labelled as notes rather than
+	// mistaken for file content.
+	if !strings.Contains(rev.Context, "scanner notes") {
+		t.Errorf("the scanner notes were dropped: %q", rev.Context)
+	}
+}
+
 func TestReviewAPICreatesFromStoredMatchFile(t *testing.T) {
 	withReviewEnv(t)
 
