@@ -381,6 +381,18 @@ func TestReviewAPIValidationAndRouting(t *testing.T) {
 		t.Fatalf("unknown action status = %d, want 404", rec.Code)
 	}
 
+	// Deleting an unknown review must be a JSON 404, not a 500: the store
+	// reports "missing" and "invalid id" identically, and both mean not-found.
+	rec = httptest.NewRecorder()
+	reviewItemHandler(rec, localRequest(http.MethodDelete, "/api/review/does-not-exist", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("delete unknown status = %d, want 404", rec.Code)
+	}
+	var errBody map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &errBody); err != nil || errBody["error"] == "" {
+		t.Fatalf("delete unknown body = %q, want a JSON error object", rec.Body.String())
+	}
+
 	// Wrong method.
 	rec = httptest.NewRecorder()
 	reviewCollectionHandler(rec, localRequest(http.MethodPut, "/api/review", []byte(`{}`)))

@@ -395,7 +395,14 @@ func reviewItemHandler(w http.ResponseWriter, r *http.Request) {
 		case http.MethodDelete:
 			dropJob(id)
 			if err := reviewStore.Delete(id); err != nil {
-				writeJSONError(w, http.StatusNotFound, "no such review")
+				// The store reports a missing review and an invalid id with the
+				// same wrapped os.ErrNotExist, so errors.Is is the way to tell
+				// "no such review" apart from a real filesystem failure.
+				if errors.Is(err, os.ErrNotExist) {
+					writeJSONError(w, http.StatusNotFound, "no such review")
+					return
+				}
+				writeJSONError(w, http.StatusInternalServerError, "could not delete the review: "+err.Error())
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
