@@ -16,17 +16,67 @@ shhgit can constantly scan your code repositories to find and alert you of these
 
 ## Installation
 
-You have two options. I'd recommend the first as it will give you access to the shhgit live web interface. Use the second option if you just want the command line interface.
+### 🚀 Quick Start - Linux Installation
 
-### via Docker
+You have **two options**:
+
+#### Option 1: Native Linux (No Docker) ⭐ RECOMMENDED
+
+For direct Linux installation without Docker:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eth0izzle/shhgit/main/install-native.sh | bash
+```
+
+This will:
+- ✅ Install Go (if needed)
+- ✅ Clone shhgit
+- ✅ Build the binary (~15-20MB)
+- ✅ Optionally set up PostgreSQL
+- ✅ Optionally enable Cloudflare Tunnel
+- ✅ Print tunnel URL when starting
+
+#### Option 2: Docker Compose
+
+For containerized deployment with PostgreSQL, Redis, Prometheus, Grafana:
+
+```bash
+git clone https://github.com/eth0izzle/shhgit
+cd shhgit
+cp .env.example .env
+docker-compose up -d
+```
+
+---
+
+### With Cloudflare Tunnel (Remote Access - Both Options)
+
+Enable remote access without exposing a public IP:
+
+```bash
+# Native:
+# Edit config.yaml: tunnel.enabled = true
+./shhgit
+
+# Docker:
+ENABLE_TUNNEL=true docker-compose --profile tunnel up -d
+```
+
+Tunnel URL prints automatically in logs when services start! ✅
+
+---
+
+### Traditional Installation Methods (Deprecated)
+
+#### Docker Compose (Includes Web UI)
 
 1. Clone this repository: `git clone https://github.com/eth0izzle/shhgit.git`
-2. Build via Docker compose: `docker-compose build`
-3. Edit your `config.yaml` file (i.e. adding your GitHub tokens)
-4. Bring up the stack: `docker-compose up`
+2. Configure environment: `cp .env.example .env && nano .env`
+3. Build via Docker compose: `docker-compose build`
+4. Bring up the stack: `docker-compose up -d`
 5. Open up http://localhost:8080/
 
-### via Go get
+#### Go Get (CLI Only)
 
 _Note_: this method does not include the shhgit web interface
 
@@ -79,28 +129,29 @@ You can also forgo the signatures and use shhgit with your own custom search que
 
 ### Config
 
-The `config.yaml` file has 7 elements. A [default is provided](https://github.com/eth0izzle/shhgit/blob/master/config.yaml).
+shhgit reads `config.yaml` from `--config-path`, then the binary's directory, then the working directory. A documented [example is provided](config.yaml.example) — copy it and fill in your tokens:
 
+```bash
+cp config.yaml.example config.yaml
 ```
-github_access_tokens: # provide at least one token
-  - 'token one'
-  - 'token two'
-webhook: '' # URL to a POST webhook.
-webhook_payload: '' # Payload to POST to the webhook URL
-blacklisted_strings: [] # list of strings to ignore
-blacklisted_extensions: [] # list of extensions to ignore
-blacklisted_paths: [] # list of paths to ignore
-blacklisted_entropy_extensions: [] # additional extensions to ignore for entropy checks
-signatures: # list of signatures to check
-  - part: '' # either filename, extension, path or contents
-    match: '' # simple text comparison (if no regex element)
-    regex: '' # regex pattern (if no match element)
-    name: '' # name of the signature
-```
+
+| Section | Purpose |
+| --- | --- |
+| `github_access_tokens` | GitHub PATs (required unless `--local`); 401-revoked tokens are pruned automatically |
+| `ai_tokens` | AI-provider token prefixes the token validator tests against live APIs |
+| `webhook`, `webhook_ai_tokens`, `webhook_crypto` | Discord/Telegram delivery targets per match class |
+| `webhook_payload` | POST body template; `%s` is replaced with the match text |
+| `blacklisted_strings`, `blacklisted_extensions`, `blacklisted_paths`, `blacklisted_entropy_extensions` | Match suppression lists (`{sep}` expands to the OS path separator) |
+| `signatures` | Detection rules — `part` is one of `filename`, `extension`, `path`, `contents`; supply `match` (literal) or `regex`, plus optional `verifier`, `priority`, `color`, `exclude_in_modes` |
+| `performance` | Thread pools, API pagination, worker pool and queue sizing |
+| `cleanup` | Disk-usage ceiling and cleanup interval for the temp directory |
+| `match_log_dir`, `match_log_enabled` | Per-match log output location and toggle |
+| `ai_review` | Interactive AI-review chat backend (`deepseek` or `ollama`) |
+| `logFormat` | Console preset: `minimal`, `fancy`, `ultra fancy`, `even more fancy`, `neon` |
 
 #### Signatures
 
-shhgit comes with 150 signatures. You can remove or add more by editing the `config.yaml` file.
+shhgit ships with 309 signatures in `config.yaml.example`. Remove or add more by editing the `signatures` list in your `config.yaml`. Signatures are matched by name, and can be routed to a specific webhook or given a `priority` (used for per-priority log files and Discord colour).
 
 ```
 1Password password manager database file, Amazon MWS Auth Token, Apache htpasswd file, Apple Keychain database file, Artifactory, AWS Access Key ID, AWS Access Key ID Value, AWS Account ID, AWS CLI credentials file, AWS cred file info, AWS Secret Access Key, AWS Session Token, Azure service configuration schema file, Carrierwave configuration file, Chef Knife configuration file, Chef private key, CodeClimate, Configuration file for auto-login process, Contains a private key, Contains a private key, cPanel backup ProFTPd credentials file, Day One journal file, DBeaver SQL database manager configuration file, DigitalOcean doctl command-line client configuration file, Django configuration file, Docker configuration file, Docker registry authentication file, Environment configuration file, esmtp configuration, Facebook access token, Facebook Client ID, Facebook Secret Key, FileZilla FTP configuration file, FileZilla FTP recent servers file, Firefox saved passwords DB, git-credential-store helper credentials file, Git configuration file, GitHub Hub command-line client configuration file, Github Key, GNOME Keyring database file, GnuCash database file, Google (GCM) Service account, Google Cloud API Key, Google OAuth Access Token, Google OAuth Key, Heroku API key, Heroku config file, Hexchat/XChat IRC client server list configuration file, High entropy string, HockeyApp, Irssi IRC client configuration file, Java keystore file, Jenkins publish over SSH plugin file, Jetbrains IDE Config, KDE Wallet Manager database file, KeePass password manager database file, Linkedin Client ID, LinkedIn Secret Key, Little Snitch firewall configuration file, Log file, MailChimp API Key, MailGun API Key, Microsoft BitLocker recovery key file, Microsoft BitLocker Trusted Platform Module password file, Microsoft SQL database file, Microsoft SQL server compact database file, Mongoid config file, Mutt e-mail client configuration file, MySQL client command history file, MySQL dump w/ bcrypt hashes, netrc with SMTP credentials, Network traffic capture file, NPM configuration file, NuGet API Key, OmniAuth configuration file, OpenVPN client configuration file, Outlook team, Password Safe database file, PayPal/Braintree Access Token, PHP configuration file, Picatic API key, Pidgin chat client account configuration file, Pidgin OTR private key, PostgreSQL client command history file, PostgreSQL password file, Potential cryptographic private key, Potential Jenkins credentials file, Potential jrnl journal file, Potential Linux passwd file, Potential Linux shadow file, Potential MediaWiki configuration file, Potential private key (.asc), Potential private key (.p21), Potential private key (.pem), Potential private key (.pfx), Potential private key (.pkcs12), Potential PuTTYgen private key, Potential Ruby On Rails database configuration file, Private SSH key (.dsa), Private SSH key (.ecdsa), Private SSH key (.ed25519), Private SSH key (.rsa), Public ssh key, Python bytecode file, Recon-ng web reconnaissance framework API key database, remote-sync for Atom, Remote Desktop connection file, Robomongo MongoDB manager configuration file, Rubygems credentials file, Ruby IRB console history file, Ruby on Rails master key, Ruby on Rails secrets, Ruby On Rails secret token configuration file, S3cmd configuration file, Salesforce credentials, Sauce Token, Sequel Pro MySQL database manager bookmark file, sftp-deployment for Atom, sftp-deployment for Atom, SFTP connection configuration file, Shell command alias configuration file, Shell command history file, Shell configuration file (.bashrc, .zshrc, .cshrc), Shell configuration file (.exports), Shell configuration file (.extra), Shell configuration file (.functions), Shell profile configuration file, Slack Token, Slack Webhook, SonarQube Docs API Key, SQL Data dump file, SQL dump file, SQLite3 database file, SQLite database file, Square Access Token, Square OAuth Secret, SSH configuration file, SSH Password, Stripe API key, T command-line Twitter client configuration file, Terraform variable config file, Tugboat DigitalOcean management tool configuration, Tunnelblick VPN configuration file, Twilo API Key, Twitter Client ID, Twitter Secret Key, Username and password in URI, Ventrilo server configuration file, vscode-sftp for VSCode, Windows BitLocker full volume encrypted data file, WP-Config

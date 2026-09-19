@@ -1,4 +1,8 @@
-# Binaries
+# ===========================================================================
+# shhgit .gitignore
+# ===========================================================================
+
+# --- Binaries & build artifacts -------------------------------------------
 *.exe
 *.exe~
 *.dll
@@ -8,41 +12,72 @@
 *.out
 *.err
 
-# Build artifacts
+# Linux binaries (no extension on Linux)
+/shhgit
+/shhgit-server
+shhgit-linux-*
+shhgit_linux-*
+
 build/
 vendor/
+dist/
 
-# IDE / editor
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
+# --- Secrets & local config — NEVER COMMIT --------------------------------
+# .env is created by `cp .env.example .env`; it holds DB/Redis/JWT/Cloudflare
+# credentials. The template stays tracked.
+.env
+.env.*
+!.env.example
 
-# Config files with secrets — DO NOT COMMIT REAL CONFIG
+# Local config. The real config.yaml holds GitHub PATs and Discord webhooks.
 config.yaml
+config.yaml.bak
+config.yaml.*
+!config.yaml.example
+config.clean.yaml
 config_backup.yaml
 config_clean.yaml
 config_enhanced.yaml
 config.cleaned.sanitized.yaml
 
-# Logs
+# --- Scan output (may contain live credentials) ---------------------------
+remote_connection_strings.txt
+found_keys_*.txt
+
+# --- Logs -----------------------------------------------------------------
 logs/
 *.log
 
-# Runtime output
-found_keys_*.txt
+# --- Backups / scratch ----------------------------------------------------
+*.bak
+*.orig
+*.rej
+_*.txt
+_*.html
+*~
+*.swp
+*.swo
+.DS_Store
 
-# AI review workspace (job data, clones, archives) — never commit
-ai_review/
-yamlcheck/
-
-# Workspace
+# --- IDE / editor ---------------------------------------------------------
+.vscode/
+.idea/
 workspace.code-workspace
 
-# Node dependencies
+# --- Node ----------------------------------------------------------------
 node_modules/
 
-# SDD workspace (task reports may reference secrets) — never track
+# --- Local agent-harness state (never publish your own use) ---------------
+# Session replays, trajectories, evidence, plans and local workflow config.
+# These are personal tooling state, not shhgit content.
+.swarm/
+.opencode/
 .superpowers/
+
+# AI review workspace (job data, clones, archives, extracted secrets)
+ai_review/
+aireview/jobs/
+yamlcheck/
+
+# Accidental recursive copy of the repo (from a bad `cp`/`scp` invocation)
+.../

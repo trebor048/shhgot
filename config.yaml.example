@@ -1,4 +1,19 @@
-# Performance optimization settings
+# ============================================================================
+# shhgit example configuration
+# ============================================================================
+# Copy this file to config.yaml and fill in your own values:
+#
+#     cp config.yaml.example config.yaml
+#
+# config.yaml is gitignored — never commit real tokens.
+# Every key below is recognized by core/config.go. Values shown are safe
+# placeholders; the file is not usable until you replace them. Keys the binary
+# parses but does not yet act on are called out explicitly in comments.
+# ============================================================================
+
+# Performance optimization settings — every key is honored by the scanner
+# (core/config.go). Absent keys keep the compiled-in defaults. Values here
+# are conservative examples; crank them up for maximum throughput.
 performance:
   max_repository_threads: 3
   max_gist_threads: 3
@@ -8,8 +23,18 @@ performance:
   api_sleep_seconds: 15
   worker_pool_size: 3
   queue_buffer_size: 2
+  max_file_count: 10000            # files processed per repository before skipping
 
-logFormat: "fancy"
+logFormat: "fancy"                 # minimal | fancy | ultra fancy | even more fancy | neon
+
+# Interactive AI-review chat (launched from each match card).
+ai_review:
+  backend: deepseek               # deepseek | ollama
+  deepseek_api_key: ''            # or set the DEEPSEEK_API_KEY env var
+  deepseek_model: deepseek-chat
+  ollama_url: http://localhost:11434
+  ollama_model: hf.co/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive:Q5_K_M
+  # system_prompt: ''            # optional override; a sensible default is built in
 
 ai_tokens:
   # OpenAI and related
@@ -208,26 +233,53 @@ ai_tokens:
   - 'claude2_[your-claude2-token]'
 
 cleanup:
-  max_disk_usage_mb: 750
-  cleanup_threshold_mb: 500
-  cleanup_interval_secs: 60
-  enabled: true
+  max_disk_usage_mb: 750          # hard ceiling for the temp directory (default 5120)
+  cleanup_threshold_mb: 500       # start evicting once usage passes this
+  cleanup_interval_secs: 60       # how often the cleanup pass runs (default 30)
+
+# Per-match-type append logs. Written one file per signature name.
+match_log_dir: logs/matches       # default: logs/matches
+match_log_enabled: true           # default: true
 
 
+# Tokens GitHub reports as revoked (HTTP 401) are auto-removed from this file
+# at every startup AND while running (a config.yaml.bak backup is written
+# first). A 401 during a scan drops the token immediately so it is never
+# retried.
 github_access_tokens:
   - 'github_pat_YOUR_GITHUB_FINE_GRAINED_PAT_HERE'
   - 'ghp_YOUR_GITHUB_CLASSIC_TOKEN_HERE'
 
-webhook: 'https://discord.com/api/webhooks/YOUR_DISCORD_WEBHOOK_HERE'
+# ---------------------------------------------------------------------------
+# Webhook delivery
+# ---------------------------------------------------------------------------
+# Left commented out because a Discord placeholder fails startup validation:
+# the webhook ID must be numeric, so `YOUR_DISCORD_WEBHOOK_HERE` is rejected by
+# ValidateDiscordWebhook before the scanner starts. Uncomment a line and paste
+# a real URL, or point at an env var (values go through os.ExpandEnv):
+#
+#   webhook: '$SHHGIT_DISCORD_WEBHOOK'
+#
+# webhook: 'https://discord.com/api/webhooks/<numeric-id>/<token>'
+# webhook_ai_tokens: 'https://discord.com/api/webhooks/<id>/<token>'   # AI-token match class
+# webhook_crypto: 'https://discord.com/api/webhooks/<id>/<token>'      # crypto match class
 
-webhook_ai_tokens: 'https://discord.com/api/webhooks/YOUR_DISCORD_AI_TOKENS_WEBHOOK_HERE'
-
-webhook_crypto: 'https://discord.com/api/webhooks/YOUR_DISCORD_CRYPTO_WEBHOOK_HERE'
-
+# Body template POSTed to the webhook above. %s is replaced with the match text.
 webhook_payload: |
   {
     "text": "%s"
   }
+
+# NOTE: `webhook_queue` is parsed into core.WebhookQueueCfg but the live queue is
+# still constructed with hardcoded defaults (1000 slots, 500ms rate limit,
+# 300s dedupe window) in core/validators.go. Setting it has no effect today.
+# webhook_queue:
+#   enabled: true
+#   queue_size: 1000
+#   rate_limit_ms: 500
+#   dedupe_window_sec: 300
+#   file_output_enabled: false
+#   output_file_path: ''
 
 blacklisted_strings: ["AKIAIOSFODNN7EXAMPLE", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef1234", "username:password", "user:pass", "sshpass -p $SSH_PASS"]
 blacklisted_extensions: [".exe", ".jpg", ".jpeg", ".png", ".gif", ".zip", ".tar.gz"]
