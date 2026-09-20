@@ -31,9 +31,16 @@ services:
       # "${SHHGIT_PORT:-8080}:8080" if you really want LAN access.
       - "127.0.0.1:${SHHGIT_PORT:-8080}:8080"
     environment:
-      # This is the complete list of environment variables the binary reads.
-      # GitHub tokens, webhooks and signatures come from config.yaml.
+      # The environment variables this file passes through from .env. The binary
+      # also reads the SHHGIT_AI_* forms (see .env.example); they are listed here so
+      # a .env file works without editing this file, and an unset one is simply
+      # empty. GitHub tokens, webhooks and signatures come from config.yaml.
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - SHHGIT_AI_PROVIDER=${SHHGIT_AI_PROVIDER:-}
+      - SHHGIT_AI_API_KEY=${SHHGIT_AI_API_KEY:-}
+      - SHHGIT_AI_BASE_URL=${SHHGIT_AI_BASE_URL:-}
+      - SHHGIT_AI_MODEL=${SHHGIT_AI_MODEL:-}
     volumes:
       # Mounted read-write on purpose: shhgit prunes revoked (HTTP 401) GitHub
       # tokens from this file at startup and writes a config.yaml.bak backup.

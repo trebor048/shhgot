@@ -10,7 +10,6 @@ SHELL    := /bin/sh
 BINARY   := shhgit
 GOEXE    := $(shell go env GOEXE)
 DIST     := dist
-PKG      := github.com/trebor048/shhgot
 LDFLAGS  := -s -w
 GOFLAGS  := CGO_ENABLED=0
 

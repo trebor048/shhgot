@@ -63,8 +63,12 @@ _*.html
 .idea/
 workspace.code-workspace
 
-# --- Node ----------------------------------------------------------------
+# --- Leftovers from the removed web frontend ------------------------------
+# frontend/ is not tracked any more (the refactor deleted its sources), but an
+# npm install and a build can still be sitting on disk, and `git add -A` would
+# happily commit all 8,700-odd files of them. Keep both guarded.
 node_modules/
+/frontend/
 
 # --- Local agent-harness state (never publish your own use) ---------------
 # Session replays, trajectories, evidence, plans and local workflow config.

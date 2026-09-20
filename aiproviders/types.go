@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -203,6 +204,28 @@ func resolve(in Settings) (Settings, error) {
 	return out, nil
 }
 
+// validateBaseURL rejects an endpoint that is not an absolute http(s) URL.
+//
+// The stack this replaced validated the Ollama URL and the rewrite dropped it, so
+// "localhost:11434" - which url.Parse reads as the scheme "localhost" - was stored
+// happily and only surfaced on the first review as an opaque "unsupported protocol
+// scheme" from the HTTP client. It is deliberately not restricted to loopback:
+// Ollama on another machine is a normal setup (a GPU host, say), and the operator
+// types the endpoint themselves.
+func validateBaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%w: %q is not a valid URL: %v", ErrBadConfig, raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("%w: %q must be an absolute http:// or https:// URL", ErrBadConfig, raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%w: %q has no host", ErrBadConfig, raw)
+	}
+	return nil
+}
+
 // applyDefaults trims and canonicalises the settings and fills in the provider
 // defaults for BaseURL and Model. Unlike resolve it does not judge whether the
 // configuration is usable: Store.Get needs the effective endpoint and model
@@ -221,6 +244,12 @@ func applyDefaults(in Settings) (Settings, error) {
 		APIKey:   strings.TrimSpace(in.APIKey),
 		BaseURL:  strings.TrimSpace(in.BaseURL),
 		Model:    strings.TrimSpace(in.Model),
+	}
+
+	if out.BaseURL != "" {
+		if err := validateBaseURL(out.BaseURL); err != nil {
+			return Settings{}, err
+		}
 	}
 
 	if spec.custom {

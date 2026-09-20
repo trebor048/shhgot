@@ -567,6 +567,11 @@ All four go through one OpenAI-compatible client; `ollama` talks to the native
 `/api/chat` endpoint unless you point `base_url` at a `/v1` route. `custom` is for
 any other OpenAI-compatible gateway (vLLM, LiteLLM, OpenRouter, a company proxy).
 
+`base_url` must be an absolute `http://` or `https://` URL. A bare
+`localhost:11434` is rejected when you save it (rather than failing later with an
+opaque "unsupported protocol scheme" on the first review), and it is not restricted
+to loopback — an Ollama on another machine is fine.
+
 ### Environment variables
 
 Read as per-field fallbacks, used only for fields the saved settings leave blank.
