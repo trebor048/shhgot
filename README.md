@@ -231,7 +231,7 @@ Tests the Claude/OpenAI tokens in `config.yaml` and writes the valid ones to
 | `--scanner` | off | Run the scanner with no UI. |
 | `--web-port` | `8080` | Dashboard port. |
 | `--web-host` | `127.0.0.1` | Dashboard bind address. |
-| `-threads` | `0` (2× logical CPUs) | Concurrent worker count. |
+| `-threads` | `0` (one per logical CPU) | Concurrent worker count, capped by the `max_*_threads` keys below. |
 | `--local` | – | Scan this directory recursively instead of GitHub. |
 | `--live` | – | Your shhgit live endpoint. |
 | `--config-path` | – | Directory to look for `config.yaml` in. |
@@ -301,14 +301,14 @@ the priority colouring pick it up automatically.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `max_repository_threads` | `3` | Repositories cloned/processed concurrently. |
-| `max_gist_threads` | `3` | Gists processed concurrently. |
+| `max_repository_threads` | `20` | Repositories cloned/processed concurrently. |
+| `max_gist_threads` | `5` | Gists processed concurrently. |
 | `max_comment_threads` | `3` | Comment streams processed concurrently. |
-| `api_pages_per_cycle` | `5` | API pages fetched per polling cycle. |
+| `api_pages_per_cycle` | `3` | API pages fetched per polling cycle. |
 | `api_per_page` | `100` | Results per page (GitHub caps this at 100). |
-| `api_sleep_seconds` | `15` | Pause between polling cycles. |
-| `worker_pool_size` | `3` | Size of the file-scanning worker pool. |
-| `queue_buffer_size` | `2` | Queue buffer depth. |
+| `api_sleep_seconds` | `5` | Pause between polling cycles. |
+| `worker_pool_size` | `20` | Concurrent event processors. |
+| `queue_buffer_size` | `0` | Internal queue depth. Unset keeps the built-in `1000`/`100`/`1000` sizes. |
 | `max_file_count` | `10000` | Files processed per repository before skipping it. |
 
 Disk usage is capped by `max_disk_usage_mb` (default 5120) plus
@@ -323,10 +323,20 @@ environment variables act as per-field fallbacks below it (see
 
 | Variable | Effect |
 |---|---|
-| `DEEPSEEK_API_KEY` | DeepSeek API key. |
-| `OPENAI_API_KEY` | OpenAI API key. |
-| `AI_API_KEY`, `AI_BASE_URL`, `AI_MODEL` | Generic overrides for any provider. |
-| `OLLAMA_URL`, `OLLAMA_MODEL` | Local Ollama endpoint and model. |
+| `SHHGIT_AI_PROVIDER` | Provider id: `deepseek`, `openai`, `custom` or `ollama`. |
+| `SHHGIT_AI_API_KEY` | API key for whichever provider is selected. |
+| `SHHGIT_AI_BASE_URL` | Endpoint base URL, e.g. a self-hosted gateway. |
+| `SHHGIT_AI_MODEL` | Model name. |
+| `SHHGIT_AI_<PROVIDER>_API_KEY` | Per-provider key, e.g. `SHHGIT_AI_OLLAMA_API_KEY`. The same pattern works for `_BASE_URL` and `_MODEL`. |
+| `DEEPSEEK_API_KEY`, `OPENAI_API_KEY` | Convenience aliases for the keys above, so an existing setup keeps working. |
+
+Every variable is a **per-field fallback below the Settings tab**: a value saved
+in the dashboard wins, and the environment is consulted only for fields the saved
+settings leave blank. So an env-provided key is used until you save one in the
+UI, after which the UI's value takes precedence.
+
+The Ollama endpoint is set through `SHHGIT_AI_BASE_URL` (or the Settings tab);
+there is no separate `OLLAMA_URL` variable.
 
 Deployment-only variables, read by the tooling around the binary rather than by
 shhgit itself:
@@ -407,8 +417,9 @@ step, no separate frontend server, nothing extra to deploy.
 | `/api/settings` | `GET` the AI configuration (the key is never sent back), `PUT` to save it. |
 | `/api/settings/test` | `POST` to make one real call against the configured provider. |
 
-Unknown paths get a real `404` with a JSON body, so a mistyped endpoint is
-obvious instead of silently returning dashboard HTML.
+A mistyped `/api/…` path gets a real `404` with a JSON body, so a broken client
+request is obvious instead of silently returning dashboard HTML. Other unknown
+paths get a plain `404`.
 
 ### Web security notes
 
@@ -417,12 +428,17 @@ obvious instead of silently returning dashboard HTML.
 - **Same-origin only.** Cross-origin requests are rejected with `403`, so a page
   you happen to visit cannot read `/api/matches` or inject findings via
   `/api/push`. Requests with no `Origin` header (curl, the CLI) still work.
-- **`/api/settings` and `/api/review` are additionally local-only.** While the
-  dashboard is bound to a loopback address, those routes also require a loopback
-  `Host`, which defeats DNS rebinding — an attacker hostname resolving to
-  `127.0.0.1` would otherwise look same-origin. Binding a routable address
-  (`--web-host 0.0.0.0`) is treated as an explicit opt-in to exposure, and only
-  the same-origin check applies.
+- **Every route that can reveal captured material is additionally local-only**
+  (`/api/matches`, `/api/file`, `/api/logs`, `/api/tokens`, `/api/stats`,
+  `/api/signatures`, `/api/activity`, `/api/events`, `/api/push`, `/api/review`,
+  `/api/settings` and the review sub-routes). While the dashboard is bound to a
+  loopback address they also require a loopback `Host`, which defeats DNS
+  rebinding — an attacker hostname resolving to `127.0.0.1` would otherwise look
+  same-origin, and `Origin == Host` alone would have let it read your findings.
+  `/health` and the dashboard page itself stay reachable by any hostname.
+- **Binding a routable address** (`--web-host 0.0.0.0`) disables that Host check,
+  leaving only the same-origin comparison. Treat it as an explicit opt-in to
+  exposure, and only do it behind something that authenticates.
 - **The feed contains live secrets.** Treat the dashboard as a secrets console:
   do not screen-share it, do not put it on a public interface.
 
@@ -503,9 +519,10 @@ reviewed, the streamed assessment for the selected finding, and a chat box.
 ```
 
 Open the **Settings** tab, choose a provider, paste a key, and press **Test
-Connection**. Saving writes `ai_review/settings.json` (mode `0600`, gitignored)
-and takes effect immediately — no restart. The API key is never sent back to the
-browser; the UI only learns whether one is stored.
+Connection**. Saving writes `ai_review/settings.json` (gitignored, and mode
+`0600` on Unix; Windows applies its own ACLs) and takes effect immediately — no
+restart. The API key is never sent back to the browser; the UI only learns
+whether one is stored.
 
 ### Configure it in `config.yaml`
 
@@ -536,12 +553,22 @@ any other OpenAI-compatible gateway (vLLM, LiteLLM, OpenRouter, a company proxy)
 
 ### Environment variables
 
-Read as per-field fallbacks, below the UI settings and above `config.yaml`:
+Read as per-field fallbacks, used only for fields the saved settings leave blank.
+Note that `config.yaml` *seeds* those saved settings on first run, so a value set
+there also outranks the environment.
 
 ```bash
+SHHGIT_AI_PROVIDER=deepseek        # deepseek | openai | custom | ollama
+SHHGIT_AI_API_KEY=...
+SHHGIT_AI_BASE_URL=https://api.deepseek.com/v1
+SHHGIT_AI_MODEL=deepseek-chat
+
+# per provider, same three fields
+SHHGIT_AI_OPENAI_API_KEY=...
+SHHGIT_AI_OLLAMA_BASE_URL=http://localhost:11434
+
+# vendor aliases, lowest precedence of the key names
 DEEPSEEK_API_KEY=...      OPENAI_API_KEY=...
-AI_API_KEY=...            AI_BASE_URL=...           AI_MODEL=...
-OLLAMA_URL=...            OLLAMA_MODEL=...
 ```
 
 Prefer these for keys so no secret sits in a file.

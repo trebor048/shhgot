@@ -430,6 +430,18 @@ if(t==='review')loadReviews();
 else if(t==='settings')loadSettings();
 }
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+/* Only http(s) links are rendered as links. esc() stops an attribute breakout but
+   says nothing about the scheme, and a link the operator clicks runs in this
+   page's origin - which can read /api/matches and therefore every captured
+   secret. Log text and match URLs both carry attacker-influenced strings (repo
+   and file names, OSC 8 hyperlink payloads), so javascript: and data: must never
+   reach an href. */
+function safeUrl(u){u=String(u==null?'':u).trim();return /^https?:\/\//i.test(u)?u:''}
+function urlLink(url,text,cls,title){
+ var h=safeUrl(url);
+ if(!h){return esc(text||url||'')}
+ return '<a'+(cls?' class="'+esc(cls)+'"':'')+(title?' title="'+esc(title)+'"':'')+' href="'+esc(h)+'" target="_blank" rel="noopener">'+esc(text||h)+'</a>';
+}
 function prioLabel(p){return p===3?'crit':p===2?'high':p===1?'med':'low'}
 function prioFilter(m){if(m.priority===3&&!state.p3)return false;if(m.priority===2&&!state.p2)return false;if(m.priority===1&&!state.p1)return false;if(m.priority===0&&!state.p0)return false;return true}
 function matchFilter(m){if(!prioFilter(m))return false;if(state.source&&m.source!==state.source)return false;if(state.sig&&m.signature!==state.sig)return false;if(state.q){var hay=(m.url+' '+(m.file||'')+' '+(m.signature||'')+' '+(m.matches||[]).join(' ')).toLowerCase();if(hay.indexOf(state.q.toLowerCase())<0)return false;}return true}
@@ -474,7 +486,7 @@ var body=document.createElement('div');body.className='mrow-body';
 var strip=document.createElement('div');strip.className='secstrip';
 strip.innerHTML='<span class="sec-lab">&#128273; secret</span><code class="secval" data-full="'+esc(secret)+'" title="'+esc(secret)+'">'+esc(short(secret,160))+'</code><button class="copy" title="copy secret">copy</button><button class="hidebtn" title="hide / reveal secret">hide</button>';
 var meta=document.createElement('div');meta.className='metarow';
-meta.innerHTML='<span>source: '+esc(m.source)+'</span>'+(m.has_file?'<span>line <b>'+(m.line||'?')+'</b></span>':'')+'<a href="'+esc(m.url)+'" target="_blank">'+esc(m.url)+'</a>'+(m.has_file?'<a class="filelink" title="View full file - syntax highlighted, secret marked">&#128196; view full file</a>':'')+'<button class="aibtn" title="AI review: sends this secret, the file and the repo to the configured provider">'+aiIcon()+' review</button>';
+meta.innerHTML='<span>source: '+esc(m.source)+'</span>'+(m.has_file?'<span>line <b>'+(m.line||'?')+'</b></span>':'')+urlLink(m.url)+(m.has_file?'<a class="filelink" title="View full file - syntax highlighted, secret marked">&#128196; view full file</a>':'')+'<button class="aibtn" title="AI review: sends this secret, the file and the repo to the configured provider">'+aiIcon()+' review</button>';
 body.appendChild(strip);body.appendChild(meta);
 var toks=(m.matches||[]).map(function(t){return '<div class="tok"><span class="v">'+esc(t)+'</span><button class="copy">copy</button></div>'}).join('');
 if(toks)body.insertAdjacentHTML('beforeend','<div class="toks">'+toks+'</div>');
@@ -562,7 +574,8 @@ var url=(parts[0]==='8'&&parts[1])?parts.slice(1).join(';;'):'';
 var close=line.indexOf('\x1b]8;;\x1b\\',end+2);
 var textEnd=(close>0)?close:line.length;
 var inner=ansiHtml(line.slice(end+2,textEnd));
-if(url){out+='<a href="'+esc(url)+'" target="_blank" rel="noopener">'+inner+'</a>';}
+var link=safeUrl(url);
+if(link){out+='<a href="'+esc(link)+'" target="_blank" rel="noopener">'+inner+'</a>';}
 else{out+=inner;}
 i=(close>0)?close+7:line.length;
 continue;
@@ -741,7 +754,7 @@ var lang=detectLang(d.file);
 modalState={detail:d,raw:lang==='env'};
 var ovl=document.createElement('div');ovl.className='ovl';ovl.id='file-modal';
 ovl.innerHTML='<div class="modal">'
-+'<div class="modal-head"><a class="m-repo" href="'+esc(d.url)+'" target="_blank">'+esc(shortRepo(d.url))+'</a><span class="m-file" title="'+esc(d.file)+'">'+esc(d.file)+'</span>'+(d.secret?'<span class="m-sec" title="'+esc(d.secret)+'">'+esc(short(d.secret,120))+'</span>':'')+'<span class="spacer"></span><button class="close" title="Close (Esc)">&#10005;</button></div>'
++'<div class="modal-head">'+urlLink(d.url,shortRepo(d.url),'m-repo')+'<span class="m-file" title="'+esc(d.file)+'">'+esc(d.file)+'</span>'+(d.secret?'<span class="m-sec" title="'+esc(d.secret)+'">'+esc(short(d.secret,120))+'</span>':'')+'<span class="spacer"></span><button class="close" title="Close (Esc)">&#10005;</button></div>'
 +'<div class="modal-tools"><span class="m-lang">'+esc(lang)+'</span><button class="mbtn active" id="mb-hl">highlighted</button><button class="mbtn" id="mb-raw">raw</button><span class="spacer"></span><button class="copy" id="mb-copy">copy raw</button>'+(d.truncated?'<span class="trunc-note">file truncated at 128 KB</span>':'')+'</div>'
 +'<div class="modal-body" id="mb-body"></div>'+'</div>';
 document.body.appendChild(ovl);
@@ -906,6 +919,17 @@ list.sort(function(a,b){return (Date.parse(b.created_at||'')||0)-(Date.parse(a.c
 rv.list=list;
 var c=document.getElementById('cnt-review');if(c)c.textContent=list.length;
 if(selectId!=null)rv.selected=String(selectId);
+/* This poll refreshes the list, while the open review's pane is driven by its own
+   stream. If that stream dies - a server restart, a dropped connection - the pane
+   would sit on "running" while the list already says "done", so refetch the
+   detail whenever the two disagree. Only when no stream is attached, and only for
+   a plain poll: a caller that passed selectId is switching reviews itself, and
+   selectReview ignores a response for a review that is no longer selected. */
+if(selectId==null){
+var sel=null;
+for(var i=0;i<list.length;i++){if(String(list[i].id)===String(rv.selected)){sel=list[i];break;}}
+if(sel&&rv.selected!=null&&!rv.stream&&String(sel.status)!==String(rv.status))selectReview(rv.selected);
+}
 if(rv.selected!=null&&!findReview(rv.selected)){
 rv.selected=null;rv.detail=null;rv.status='';rv.error='';rv.assessment='';rv.messages=[];rv.draft='';
 renderReviewDetail();
@@ -955,7 +979,7 @@ var html='<div class="rv-dhead"><div class="rv-dtop">'
 +'<span class="rv-dprov">'+esc((d.provider||'?')+(d.model?':'+d.model:''))+'</span>'
 +'</div><div class="rv-dsub">'
 +(d.file?'<span class="dfile" title="'+esc(d.file)+'">'+esc(d.file)+'</span>':'')
-+(d.url?'<a href="'+esc(d.url)+'" target="_blank" rel="noopener">'+esc(shortRepo(d.url)||d.url)+'</a>':'')
++(d.url?urlLink(d.url,shortRepo(d.url)||d.url):'')
 +'<span>created '+esc(relTime(d.created_at)||'-')+'</span>'
 +(d.updated_at&&d.updated_at!==d.created_at?'<span>updated '+esc(relTime(d.updated_at))+'</span>':'')
 +'</div>'
@@ -1043,7 +1067,10 @@ if(es.__closed)return;
 var msg=null;try{msg=JSON.parse(e.data);}catch(err){return;}
 if(!msg||!msg.type)return;
 if(msg.type==='delta'){
-rv.assessment+=(typeof msg.text==='string'?msg.text:'');
+var t=(typeof msg.text==='string'?msg.text:'');
+/* the first frame of a stream carries the whole assessment so far and is flagged
+   reset; a reconnected stream must replace, not append, or the text doubles */
+if(msg.reset)rv.assessment=t;else rv.assessment+=t;
 if(rv.status==='queued')rv.status='running';
 scheduleAssessment();
 }else if(msg.type==='done'){

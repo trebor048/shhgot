@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -57,6 +58,41 @@ var (
 	reviewJobs   = map[string]*reviewJob{}
 )
 
+// reconcileInterruptedReviews marks reviews that a previous process left
+// queued or running as failed, and returns how many it changed.
+//
+// A review is flipped to "running" before its goroutine starts, and only the
+// process that started it can finish it: the in-flight job lives in an
+// in-memory map that does not survive a restart. So at startup any review still
+// marked queued or running is orphaned and can never make progress. Left alone
+// it would show a spinner in the dashboard for good, and because it is not in a
+// terminal state it cannot be retried either - the operator could only delete
+// it. Marking it failed says what actually happened and returns it to a state
+// the UI understands.
+func reconcileInterruptedReviews(store *reviewstore.Store) int {
+	if store == nil {
+		return 0
+	}
+
+	reconciled := 0
+	for _, rev := range store.List() {
+		if rev.Status != reviewstore.StatusQueued && rev.Status != reviewstore.StatusRunning {
+			continue
+		}
+		rev.Status = reviewstore.StatusFailed
+		rev.Error = "interrupted: shhgit stopped while this review was in progress, so it never finished"
+		if err := store.Update(rev); err != nil {
+			// A review that cannot be rewritten is reported by the caller's
+			// normal error handling on the next access; keep going so one bad
+			// file does not block the rest.
+			log.Printf("[ai-review] could not mark interrupted review %s as failed: %v", rev.ID, err)
+			continue
+		}
+		reconciled++
+	}
+	return reconciled
+}
+
 // initAIReview prepares the review store and the AI settings store. It is
 // called once at startup; a failure is reported but must not stop the scanner,
 // because AI review is an optional feature.
@@ -80,6 +116,9 @@ func initAIReview(cfg *core.Config) error {
 		return fmt.Errorf("open review store: %w", err)
 	}
 	reviewStore = st
+	if n := reconcileInterruptedReviews(st); n > 0 {
+		log.Printf("[ai-review] marked %d interrupted review(s) as failed", n)
+	}
 
 	if p := strings.TrimSpace(ai.SystemPrompt); p != "" {
 		reviewPrompt = p
@@ -114,7 +153,13 @@ func initAIReview(cfg *core.Config) error {
 		}
 
 		if seed.Provider != "" || seed.APIKey != "" || seed.BaseURL != "" || seed.Model != "" {
-			if err := store.Set(seed); err != nil {
+			// Seeding is best effort. An unusable seed - an unknown provider in
+			// config.yaml, say - must not disable AI review altogether: without a
+			// settings file the store falls back to the environment and then to
+			// the built-in defaults, which is a working configuration.
+			if _, err := aiproviders.New(seed); err != nil {
+				log.Printf("[ai-review] ignoring unusable AI settings from config.yaml: %v", err)
+			} else if err := store.Set(seed); err != nil {
 				return fmt.Errorf("seed AI settings: %w", err)
 			}
 		}
@@ -156,6 +201,13 @@ func legacyChatSettings(dir string) (aiproviders.Settings, string, bool) {
 	default:
 		s.APIKey = strings.TrimSpace(legacy.DeepseekKey)
 		s.Model = strings.TrimSpace(legacy.DeepseekModel)
+		// The old chat defaulted to DeepSeek, and an empty or unrecognised
+		// backend lands in this branch anyway. Naming it explicitly matters:
+		// a provider-less seed is rejected by the settings store, which used to
+		// fail the whole AI setup on an upgrade.
+		if s.Provider == "" {
+			s.Provider = "deepseek"
+		}
 	}
 	if s.Provider == "" && s.APIKey == "" && s.Model == "" {
 		return aiproviders.Settings{}, "", false
@@ -274,9 +326,9 @@ func viewOf(r *reviewstore.Review, full bool) reviewView {
 
 // --- routing -----------------------------------------------------------------
 
-func registerReviewRoutes() {
-	http.HandleFunc("/api/review", corsMiddleware(localGuard(reviewCollectionHandler)))
-	http.HandleFunc("/api/review/", corsMiddleware(localGuard(reviewItemHandler)))
+func registerReviewRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/api/review", corsMiddleware(localGuard(reviewCollectionHandler)))
+	mux.HandleFunc("/api/review/", corsMiddleware(localGuard(reviewItemHandler)))
 }
 
 // reviewCollectionHandler serves GET (list) and POST (create + start).
@@ -327,8 +379,13 @@ func reviewCollectionHandler(w http.ResponseWriter, r *http.Request) {
 					if notes != "" {
 						// The browser only sends a short scanner summary; keep it,
 						// clearly labelled, rather than mistaking it for the file.
-						in.Context += "\n\n--- scanner notes, not part of the file ---\n" + notes
+						in.Context += "\n\n" + scannerNotesMarker + "\n" + notes
 					}
+				} else if notes := strings.TrimSpace(in.Context); notes != "" {
+					// The cache had no body for this match: keep the summary but
+					// record that it is not file content, so the prompt builder
+					// does not present it as such.
+					in.Context = noFileBodyMarker + "\n" + notes
 				}
 			}
 		}
@@ -468,7 +525,11 @@ func startReview(rev *reviewstore.Review, client aiproviders.Client) {
 
 	local.Status = reviewstore.StatusRunning
 	local.Error = ""
-	_ = store.Update(&local)
+	// SetResult rather than Update: a chat turn can be appended while the review
+	// runs, and writing this whole struct back would discard it.
+	if err := store.SetResult(local.ID, reviewstore.StatusRunning, local.Assessment, ""); err != nil {
+		log.Printf("[ai-review] could not mark review %s as running: %v", local.ID, err)
+	}
 	broadcastReview(&local)
 
 	go func() {
@@ -480,19 +541,27 @@ func startReview(rev *reviewstore.Review, client aiproviders.Client) {
 			return nil
 		})
 
+		status := reviewstore.StatusDone
+		assessment := job.full()
+		errMsg := ""
 		if err != nil {
-			job.finish(reviewstore.StatusFailed, err.Error())
-			local.Status = reviewstore.StatusFailed
-			local.Error = err.Error()
-		} else {
-			job.finish(reviewstore.StatusDone, "")
-			local.Status = reviewstore.StatusDone
-			local.Assessment = job.full()
-			local.Error = ""
+			status = reviewstore.StatusFailed
+			assessment = ""
+			errMsg = err.Error()
+		}
+		job.finish(status, errMsg)
+
+		// Record the outcome without rewriting the record: chat turns appended
+		// while the review ran must survive it finishing.
+		if uerr := store.SetResult(local.ID, status, assessment, errMsg); uerr != nil {
+			log.Printf("[ai-review] could not save the result of review %s: %v", local.ID, uerr)
 		}
 
-		_ = store.Update(&local)
-		broadcastReview(&local)
+		// Broadcast the stored record so subscribers see the transcript as it
+		// actually is, not the pre-run snapshot.
+		if fresh, ok := store.Get(local.ID); ok {
+			broadcastReview(fresh)
+		}
 		dropJob(local.ID)
 	}()
 }
@@ -506,12 +575,12 @@ func buildReviewMessages(rev *reviewstore.Review, system string) []aiproviders.M
 	fmt.Fprintf(&b, "Detected signature: %s\n", orUnknown(rev.Signature))
 	fmt.Fprintf(&b, "Detected value: %s\n", orUnknown(rev.Secret))
 	if rev.Context != "" {
-		b.WriteString("\n--- file content, for context (may be truncated) ---\n")
+		b.WriteString(contextHeading(rev.Context))
 		b.WriteString(rev.Context)
 		if !strings.HasSuffix(rev.Context, "\n") {
 			b.WriteString("\n")
 		}
-		b.WriteString("--- end of file content ---")
+		b.WriteString("--- end of supplied context ---")
 	} else {
 		b.WriteString("\nNo file content was captured for this finding; base your answer on the metadata above and say what you could not determine.\n")
 	}
@@ -519,6 +588,36 @@ func buildReviewMessages(rev *reviewstore.Review, system string) []aiproviders.M
 	return []aiproviders.Message{
 		{Role: aiproviders.RoleSystem, Content: system},
 		{Role: aiproviders.RoleUser, Content: b.String()},
+	}
+}
+
+// Markers carried inside a stored review's Context, so the prompt can state what
+// the model is actually being shown. A review holds the captured file body, or
+// only the browser's one-line scanner summary when the file cache had already
+// evicted the entry (it keeps the most recent 300) or when the review predates a
+// restart, since that cache lives in memory.
+const (
+	// scannerNotesMarker is appended when the scanner's summary is kept
+	// alongside a captured body, so its presence means the body is there.
+	scannerNotesMarker = "--- scanner notes, not part of the file ---"
+	// noFileBodyMarker is written when only the summary exists.
+	noFileBodyMarker = "--- no file content was captured for this finding ---"
+)
+
+// contextHeading introduces a review's stored context in the prompt.
+//
+// Describing a one-line summary as "file content" invited the model to reason as
+// though it had read the file, which is worse than saying nothing. Records
+// written before these markers existed cannot be told apart, so they get a
+// heading that is true either way rather than a guess.
+func contextHeading(context string) string {
+	switch {
+	case strings.Contains(context, scannerNotesMarker):
+		return "\n--- file content, for context (may be truncated) ---\n"
+	case strings.Contains(context, noFileBodyMarker):
+		return "\n--- no file content was captured for this finding; the scanner's summary follows ---\n"
+	default:
+		return "\n--- context supplied with this finding (the captured file content if it was available, otherwise the scanner's summary) ---\n"
 	}
 }
 
@@ -565,8 +664,15 @@ func reviewStreamHandler(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	history, ch, _ := job.subscribe()
+	// Every return below leaves the fan-out set, so a client that goes away
+	// mid-review cannot slow down the deltas sent to the ones that stayed.
+	defer job.unsubscribe(ch)
 	if history != "" {
-		if err := sseSend(w, flusher, map[string]any{"type": "delta", "text": history}); err != nil {
+		// reset tells the client this frame is the whole assessment so far, not
+		// another delta. Without it a client that reconnects (EventSource does
+		// that on its own after a dropped connection) would append the history a
+		// second time and show the assessment twice.
+		if err := sseSend(w, flusher, map[string]any{"type": "delta", "text": history, "reset": true}); err != nil {
 			return
 		}
 	}
@@ -732,6 +838,26 @@ func (j *reviewJob) subscribe() (history string, ch chan string, finished bool) 
 	}
 	j.subs[ch] = struct{}{}
 	return history, ch, false
+}
+
+// unsubscribe removes a subscriber that has gone away.
+//
+// Without it a browser that disconnects or reconnects mid-review would leave its
+// channel in the fan-out set until the review finished, and publish - which walks
+// every subscriber under the job mutex on each delta - would keep paying for
+// stale entries. Entry and removal both happen under j.mu, the same mutex publish
+// sends under, so a close can never race a send. Calling it on a channel that was
+// never registered (the already-finished case) is a no-op.
+func (j *reviewJob) unsubscribe(ch chan string) {
+	if ch == nil {
+		return
+	}
+	j.mu.Lock()
+	if _, ok := j.subs[ch]; ok {
+		delete(j.subs, ch)
+		close(ch)
+	}
+	j.mu.Unlock()
 }
 
 func lookupJob(id string) *reviewJob {

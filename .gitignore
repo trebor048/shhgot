@@ -14,7 +14,6 @@
 
 # Linux binaries (no extension on Linux)
 /shhgit
-/shhgit-server
 shhgit-linux-*
 shhgit_linux-*
 
@@ -23,8 +22,8 @@ vendor/
 dist/
 
 # --- Secrets & local config — NEVER COMMIT --------------------------------
-# .env is created by `cp .env.example .env`; it holds DB/Redis/JWT/Cloudflare
-# credentials. The template stays tracked.
+# .env is created by `cp .env.example .env`; it can hold an AI provider key and
+# a Cloudflare tunnel token. The template stays tracked.
 .env
 .env.*
 !.env.example
@@ -76,7 +75,6 @@ node_modules/
 
 # AI review workspace (job data, clones, archives, extracted secrets)
 ai_review/
-aireview/jobs/
 yamlcheck/
 
 # Accidental recursive copy of the repo (from a bad `cp`/`scp` invocation)

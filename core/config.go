@@ -59,14 +59,17 @@ func (p PerformanceConfig) Int(v *int, def int) int {
 
 // AIReviewConfig supplies the startup defaults for the AI security review.
 //
+// The values below are only a seed: they are written into ai_review/settings.json
+// the first time shhgit runs, after which the dashboard's Settings tab owns them.
+//
 // Precedence, highest first:
 //  1. what the operator saves in the dashboard's Settings tab (persisted to
-//     ai_review/settings.json),
-//  2. the environment variables read by aiproviders (DEEPSEEK_API_KEY,
-//     OPENAI_API_KEY, AI_BASE_URL, AI_API_KEY, AI_MODEL, OLLAMA_URL,
-//     OLLAMA_MODEL),
-//  3. the values below,
-//  4. the built-in per-provider defaults.
+//     ai_review/settings.json) - which on a first run is the seeded value below,
+//  2. the environment variables read by aiproviders (SHHGIT_AI_PROVIDER,
+//     SHHGIT_AI_API_KEY, SHHGIT_AI_BASE_URL, SHHGIT_AI_MODEL, the per-provider
+//     SHHGIT_AI_<PROVIDER>_* forms, and the DEEPSEEK_API_KEY / OPENAI_API_KEY
+//     aliases), used per field for anything the saved settings leave blank,
+//  3. the built-in per-provider defaults.
 //
 // Provider is one of deepseek, openai, custom or ollama.
 type AIReviewConfig struct {

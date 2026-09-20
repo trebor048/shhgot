@@ -68,7 +68,7 @@ tidy: ## Tidy go.mod / go.sum
 	go mod tidy
 
 clean: ## Remove build output and test caches
-	rm -rf $(DIST) $(BINARY) $(BINARY).exe shhgit-server run.log
+	rm -rf $(DIST) $(BINARY) $(BINARY).exe run.log
 	go clean -testcache
 
 # --- Run -------------------------------------------------------------------

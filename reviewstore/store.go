@@ -401,6 +401,59 @@ func (s *Store) AppendMessage(id string, m Message) error {
 	return nil
 }
 
+// SetResult records a review's outcome - its status, the generated assessment
+// and any error - and leaves every other field, the chat history in particular,
+// exactly as it stands.
+//
+// The runner must not write a whole Review struct back when it finishes. The
+// snapshot it captured before starting predates any chat turn appended while the
+// review was running (AppendMessage is documented as safe in that state), so
+// restoring that snapshot would silently discard those turns and could leave a
+// transcript that starts with an assistant reply to a question that is gone.
+// Doing the read-modify-write here, under the same mutex AppendMessage takes,
+// makes the two operations safe against each other.
+//
+// It returns os.ErrNotExist-compatible errors for an unknown or invalid id.
+func (s *Store) SetResult(id string, status Status, assessment, errMsg string) error {
+	if err := validateID(id); err != nil {
+		return lookupErr(id)
+	}
+	path, err := s.path(id)
+	if err != nil {
+		return lookupErr(id)
+	}
+
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+
+	s.mu.RLock()
+	cur, ok := s.index[id]
+	var next Review
+	if ok {
+		next = *cur
+		next.Messages = cloneMessages(cur.Messages)
+	}
+	s.mu.RUnlock()
+	if !ok {
+		return lookupErr(id)
+	}
+
+	now := time.Now().UTC()
+	next.Status = status
+	next.Assessment = assessment
+	next.Error = errMsg
+	next.UpdatedAt = now
+
+	if err := writeAtomic(path, &next); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.index[id] = &next
+	s.mu.Unlock()
+	return nil
+}
+
 // Delete removes the review with the given id from the index and deletes its
 // file. A review whose file is already gone is still removed from the index
 // successfully.

@@ -515,7 +515,10 @@ func eventsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// No Access-Control-Allow-Origin here. This stream carries live findings, so
+	// a wildcard let any page the operator visited subscribe to it, and setting it
+	// after corsMiddleware also overwrote that middleware's per-origin value. The
+	// dashboard subscribes same-origin, which needs no header at all.
 
 	ch := make(chan []byte, 128)
 	feedMu.Lock()
@@ -630,6 +633,19 @@ func localGuard(next http.HandlerFunc) http.HandlerFunc {
 // decides how strict localGuard is. Set by StartWebServer.
 var webBindIsLoopback = true
 
+// normalizeWebHost substitutes the documented default for an empty bind address.
+//
+// An empty host turns into ":8080", which listens on every interface, while
+// isLoopbackHost("") is false - so passing it would expose the dashboard and
+// disable the loopback guard in a single step. Callers should be able to assume
+// that an empty value is safe.
+func normalizeWebHost(host string) string {
+	if strings.TrimSpace(host) == "" {
+		return "127.0.0.1"
+	}
+	return host
+}
+
 // isLoopbackHost reports whether a Host header (optionally with a port) names
 // the local machine.
 func isLoopbackHost(host string) bool {
@@ -657,31 +673,64 @@ func isLoopbackHost(host string) bool {
 func StartWebServer(host, port string) error {
 	ensureWebHub()
 
-	// API endpoints
-	http.HandleFunc("/api/push", corsMiddleware(receiveMatch))
-	http.HandleFunc("/api/stats", corsMiddleware(getStats))
-	http.HandleFunc("/api/matches", corsMiddleware(getMatches))
-	http.HandleFunc("/api/ws", corsMiddleware(wsHandler))
-	http.HandleFunc("/api/logs", corsMiddleware(getLogs))
-	http.HandleFunc("/api/tokens", corsMiddleware(getTokens))
-	http.HandleFunc("/api/signatures", corsMiddleware(getSignatures))
-	http.HandleFunc("/api/activity", corsMiddleware(getActivity))
-	http.HandleFunc("/api/file", corsMiddleware(getMatchFile))
-	http.HandleFunc("/api/events", corsMiddleware(eventsHandler))
-	registerReviewRoutes()
-	registerSettingsRoutes()
-	http.HandleFunc("/health", corsMiddleware(health))
+	// An empty host would become ":8080", which listens on every interface, and
+	// it is not a loopback address - so the guard below would be switched off at
+	// the same moment the dashboard became reachable from the network. Fail
+	// closed to the documented default instead.
+	rooted := normalizeWebHost(host)
+	if rooted != host {
+		log.Printf("[web] empty --web-host: binding %s instead of every interface", rooted)
+	}
+	host = rooted
 
 	// localGuard's Host check only makes sense while the dashboard is bound to
 	// loopback; binding a routable address is an explicit opt-in to exposure.
+	// Set before registering so no request can be served with a stale value.
 	webBindIsLoopback = isLoopbackHost(host)
 
-	// Serve embedded frontend
-	http.HandleFunc("/", serveEmbeddedWeb)
+	mux := http.NewServeMux()
+	registerRoutes(mux)
 
 	addr := host + ":" + port
 	log.Printf("[web] Dashboard ready at http://%s", addr)
-	return http.ListenAndServe(addr, nil)
+	return http.ListenAndServe(addr, mux)
+}
+
+// registerRoutes installs every handler on mux.
+//
+// It is separate from StartWebServer so tests can assert the route table - in
+// particular that each route capable of revealing captured material carries the
+// loopback guard - without opening a socket.
+func registerRoutes(mux *http.ServeMux) {
+	// Every route that can reveal captured material runs behind localGuard, not
+	// just the cross-origin check in corsMiddleware. corsMiddleware compares
+	// Origin to Host, which DNS rebinding defeats by construction: the attacker's
+	// page is served from attacker.example, that name is rebound to 127.0.0.1, and
+	// the request then arrives with Origin == Host == attacker.example, looking
+	// perfectly same-origin. localGuard adds the loopback Host check that closes
+	// it, and a mismatch stops being a mere CORS refusal - it is a 403.
+	//
+	// /api/push is guarded too: without it a rebound page could inject fabricated
+	// findings into the operator's match list.
+	mux.HandleFunc("/api/push", corsMiddleware(localGuard(receiveMatch)))
+	mux.HandleFunc("/api/stats", corsMiddleware(localGuard(getStats)))
+	mux.HandleFunc("/api/matches", corsMiddleware(localGuard(getMatches)))
+	mux.HandleFunc("/api/ws", corsMiddleware(localGuard(wsHandler)))
+	mux.HandleFunc("/api/logs", corsMiddleware(localGuard(getLogs)))
+	mux.HandleFunc("/api/tokens", corsMiddleware(localGuard(getTokens)))
+	mux.HandleFunc("/api/signatures", corsMiddleware(localGuard(getSignatures)))
+	mux.HandleFunc("/api/activity", corsMiddleware(localGuard(getActivity)))
+	mux.HandleFunc("/api/file", corsMiddleware(localGuard(getMatchFile)))
+	mux.HandleFunc("/api/events", corsMiddleware(localGuard(eventsHandler)))
+	registerReviewRoutes(mux)
+	registerSettingsRoutes(mux)
+
+	// /health stays open: it reveals nothing and container and uptime probes
+	// depend on it. The dashboard itself carries no secrets and stays reachable
+	// by whatever hostname the operator uses, so that a hosts-file alias or a
+	// tunnel does not lock them out of their own UI.
+	mux.HandleFunc("/health", corsMiddleware(health))
+	mux.HandleFunc("/", serveEmbeddedWeb)
 }
 
 // serveEmbeddedWeb serves the embedded web interface.
@@ -693,7 +742,7 @@ func serveEmbeddedWeb(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/favicon.ico":
 			w.WriteHeader(http.StatusNoContent)
-		case strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/metrics":
+		case strings.HasPrefix(r.URL.Path, "/api/"):
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			fmt.Fprintf(w, `{"error":"no such endpoint","path":%q}`, r.URL.Path)

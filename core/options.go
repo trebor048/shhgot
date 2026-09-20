@@ -29,7 +29,7 @@ type Options struct {
 
 func ParseOptions() (*Options, error) {
 	options := &Options{
-		Threads:                flag.Int("threads", 0, "Number of concurrent threads (default number of logical CPUs * 2)"),
+		Threads:                flag.Int("threads", 0, "Number of concurrent threads (default: one per logical CPU)"),
 		Silent:                 flag.Bool("silent", false, "Suppress all output except for errors"),
 		Debug:                  flag.Bool("debug", false, "Print debugging information"),
 		MaximumRepositorySize:  flag.Uint("maximum-repository-size", 5120, "Maximum repository size to process in KB"),

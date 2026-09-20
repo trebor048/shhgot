@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -635,6 +637,478 @@ func TestReviewGuardBlocksCrossOriginAndRemoteHosts(t *testing.T) {
 	}
 }
 
+// A review is flipped to "running" before its goroutine starts and only the
+// process that started it can finish it, so a restart orphans anything still
+// queued or running. Without reconciliation such a review spins in the
+// dashboard forever and, being non-terminal, cannot be retried - only deleted.
+// A route that serves captured material and forgets localGuard is readable by any
+// page the operator visits: corsMiddleware's Origin==Host test is satisfied by DNS
+// rebinding (the attacker's hostname resolves to 127.0.0.1, so both headers carry
+// the attacker's name). This walks the registered mux and asserts that every
+// secret-bearing route refuses a rebound Host, so a new endpoint cannot silently
+// ship without the guard. /health and the static dashboard are deliberately open.
+func TestEverySecretRouteRejectsAReboundHost(t *testing.T) {
+	withReviewEnv(t)
+
+	// The guard is only active while the dashboard is bound to loopback.
+	prev := webBindIsLoopback
+	webBindIsLoopback = true
+	defer func() { webBindIsLoopback = prev }()
+
+	mux := http.NewServeMux()
+	registerRoutes(mux)
+
+	guarded := []string{
+		"/api/matches", "/api/file", "/api/logs", "/api/tokens",
+		"/api/stats", "/api/activity", "/api/signatures", "/api/push",
+		"/api/review", "/api/settings", "/api/settings/test",
+	}
+	for _, path := range guarded {
+		rec := httptest.NewRecorder()
+		// A rebound request: the attacker's name in both Host and Origin.
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = "attacker.example"
+		req.Header.Set("Origin", "http://attacker.example")
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("%s answered %d for a rebound Host, want 403: it is readable by any visited web page", path, rec.Code)
+		}
+	}
+
+	// The liveness probe must stay reachable so container health checks work.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req.Host = "attacker.example"
+	mux.ServeHTTP(rec, req)
+	if rec.Code == http.StatusForbidden {
+		t.Error("/health must stay reachable for health probes")
+	}
+
+	// The dashboard page itself must stay reachable by any hostname, or a
+	// hosts-file alias or tunnel would lock the operator out of their own UI.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "shhgit.internal"
+	mux.ServeHTTP(rec, req)
+	if rec.Code == http.StatusForbidden {
+		t.Error("the dashboard page must not be blocked by the loopback guard")
+	}
+}
+
+// The live finding feed must not hand out a wildcard CORS grant: that would let
+// any page the operator visits subscribe to it directly, with no rebinding needed.
+func TestEventsStreamDoesNotGrantWildcardCORS(t *testing.T) {
+	withReviewEnv(t)
+	ensureWebHub()
+
+	srv := httptest.NewServer(corsMiddleware(localGuard(eventsHandler)))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/events")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	// Headers arrive before the body: the handler flushes them on connect.
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("status = %d, want 200 for a loopback same-origin subscriber", resp.StatusCode)
+	}
+	acao := resp.Header.Get("Access-Control-Allow-Origin")
+	resp.Body.Close() // disconnects the stream
+
+	if acao == "*" {
+		t.Error(`/api/events granted Access-Control-Allow-Origin: *: any web page the operator visits could read the live secret feed`)
+	}
+}
+
+// A review can receive chat turns while it is still running (AppendMessage is
+// documented as safe in that state, and the chat endpoint allows it). The runner
+// used to write its whole pre-run snapshot back when it finished, which silently
+// destroyed those turns and could leave a transcript beginning with an assistant
+// reply to a question that no longer existed.
+func TestChatTurnsSurviveTheReviewCompleting(t *testing.T) {
+	withReviewEnv(t)
+
+	rev := &reviewstore.Review{Signature: "S", Secret: "x", Status: reviewstore.StatusRunning}
+	if err := reviewStore.Create(rev); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// A turn arrives while the review is in flight.
+	if err := reviewStore.AppendMessage(rev.ID, reviewstore.Message{Role: "user", Content: "asked while running"}); err != nil {
+		t.Fatalf("append user: %v", err)
+	}
+	if err := reviewStore.AppendMessage(rev.ID, reviewstore.Message{Role: "assistant", Content: "answered while running"}); err != nil {
+		t.Fatalf("append assistant: %v", err)
+	}
+
+	// The runner finishes and records its result.
+	if err := reviewStore.SetResult(rev.ID, reviewstore.StatusDone, "## What it is\nassessment", ""); err != nil {
+		t.Fatalf("set result: %v", err)
+	}
+
+	got, ok := reviewStore.Get(rev.ID)
+	if !ok {
+		t.Fatal("review vanished")
+	}
+	if got.Status != reviewstore.StatusDone || got.Assessment == "" {
+		t.Errorf("result not recorded: status=%q assessment=%q", got.Status, got.Assessment)
+	}
+	if len(got.Messages) != 2 {
+		t.Fatalf("chat turns = %d, want 2: the review completing destroyed them", len(got.Messages))
+	}
+	if got.Messages[0].Role != "user" || got.Messages[1].Role != "assistant" {
+		t.Errorf("transcript order = %q,%q, want user,assistant", got.Messages[0].Role, got.Messages[1].Role)
+	}
+
+	// The running transition must preserve turns too.
+	if err := reviewStore.SetResult(rev.ID, reviewstore.StatusRunning, "", ""); err != nil {
+		t.Fatalf("set running: %v", err)
+	}
+	got, _ = reviewStore.Get(rev.ID)
+	if len(got.Messages) != 2 {
+		t.Errorf("marking the review running dropped turns: %d messages", len(got.Messages))
+	}
+}
+
+// SetResult must not clobber unrelated fields, and must report a missing review
+// the same way the rest of the store does.
+func TestSetResultKeepsOtherFieldsAndReportsMissing(t *testing.T) {
+	withReviewEnv(t)
+
+	rev := &reviewstore.Review{
+		Signature: "S", Secret: "keepme", File: "a.go", Repo: "acme/app",
+		Context: "ctx", Provider: "ollama", Model: "m", Status: reviewstore.StatusQueued,
+	}
+	if err := reviewStore.Create(rev); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	created := rev.CreatedAt
+
+	if err := reviewStore.SetResult(rev.ID, reviewstore.StatusFailed, "", "boom"); err != nil {
+		t.Fatalf("set result: %v", err)
+	}
+	got, ok := reviewStore.Get(rev.ID)
+	if !ok {
+		t.Fatal("review vanished")
+	}
+	if got.Signature != "S" || got.Secret != "keepme" || got.File != "a.go" ||
+		got.Repo != "acme/app" || got.Context != "ctx" || got.Provider != "ollama" || got.Model != "m" {
+		t.Errorf("SetResult clobbered unrelated fields: %+v", got)
+	}
+	if got.Error != "boom" || got.Status != reviewstore.StatusFailed {
+		t.Errorf("result = %q/%q", got.Status, got.Error)
+	}
+	if !got.CreatedAt.Equal(created) {
+		t.Error("SetResult changed CreatedAt, which must be immutable")
+	}
+	if !got.UpdatedAt.After(created) && got.UpdatedAt.Before(created) {
+		t.Error("SetResult did not stamp UpdatedAt")
+	}
+
+	err := reviewStore.SetResult("does-not-exist", reviewstore.StatusDone, "x", "")
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("unknown id error = %v, want os.ErrNotExist-compatible", err)
+	}
+}
+
+// Subscribers that go away must leave the fan-out set, or a browser that
+// reconnects repeatedly would slow every later delta down.
+func TestUnsubscribeRemovesTheSubscriber(t *testing.T) {
+	job := newReviewJob()
+
+	_, ch1, _ := job.subscribe()
+	_, ch2, _ := job.subscribe()
+	if got := liveSubs(job); got != 2 {
+		t.Fatalf("subscribers = %d, want 2", got)
+	}
+
+	job.unsubscribe(ch1)
+	if got := liveSubs(job); got != 1 {
+		t.Errorf("subscribers after unsubscribe = %d, want 1", got)
+	}
+	// The removed channel is closed, so a reader unblocks instead of waiting.
+	if _, open := <-ch1; open {
+		t.Error("unsubscribe left the channel open")
+	}
+
+	// Idempotent, and safe on a channel that was never registered.
+	job.unsubscribe(ch1)
+	job.unsubscribe(nil)
+	neverSubscribed := make(chan string, 1)
+	job.unsubscribe(neverSubscribed)
+	if got := liveSubs(job); got != 1 {
+		t.Errorf("subscribers = %d, want 1 after repeated unsubscribes", got)
+	}
+
+	// finish still closes the remaining subscriber exactly once. The delta
+	// published above is buffered first, so drain it before expecting the close.
+	job.publish("delta")
+	job.finish(reviewstore.StatusDone, "")
+	if got := liveSubs(job); got != 0 {
+		t.Errorf("subscribers after finish = %d, want 0", got)
+	}
+	text, status, _ := job.result()
+	if text != "delta" || status != reviewstore.StatusDone {
+		t.Errorf("result = %q/%q", text, status)
+	}
+	if got, open := <-ch2; !open || got != "delta" {
+		t.Errorf("buffered delta = %q open=%v, want the published delta", got, open)
+	}
+	if _, open := <-ch2; open {
+		t.Error("finish did not close the remaining subscriber")
+	}
+}
+
+// liveSubs reports the job's current fan-out set size, so a leaked subscriber is
+// visible to a test.
+func liveSubs(j *reviewJob) int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return len(j.subs)
+}
+
+// The model must not be told that a one-line scanner summary is the file's
+// contents: that invites an assessment of code it never saw.
+func TestPromptSaysWhetherItHasFileContent(t *testing.T) {
+	cases := []struct {
+		name    string
+		context string
+		want    string
+		absent  string
+	}{
+		{
+			name:    "captured body with scanner notes",
+			context: "package main\n" + scannerNotesMarker + "\nline 4: AKIA...",
+			want:    "file content, for context",
+			absent:  "no file content was captured",
+		},
+		{
+			name:    "summary only",
+			context: noFileBodyMarker + "\nline 4: AKIA...",
+			want:    "no file content was captured for this finding; the scanner's summary follows",
+			absent:  "file content, for context",
+		},
+		{
+			name:    "record written before the markers existed",
+			context: "package main\nfunc main() {}",
+			want:    "context supplied with this finding",
+			absent:  "file content, for context",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msgs := buildReviewMessages(&reviewstore.Review{
+				Signature: "AWS key", Secret: "AKIA...", File: "a.go", Repo: "acme/app",
+				Context: tc.context,
+			}, "system")
+			if len(msgs) != 2 {
+				t.Fatalf("messages = %d, want 2", len(msgs))
+			}
+			body := msgs[1].Content
+			if !strings.Contains(body, tc.want) {
+				t.Errorf("prompt is missing %q:\n%s", tc.want, body)
+			}
+			if strings.Contains(body, tc.absent) {
+				t.Errorf("prompt wrongly claims %q:\n%s", tc.absent, body)
+			}
+			if !strings.Contains(body, tc.context) {
+				t.Error("prompt dropped the stored context")
+			}
+		})
+	}
+
+	// An empty context must still say so instead of leaving the model guessing.
+	msgs := buildReviewMessages(&reviewstore.Review{Signature: "S", Context: ""}, "system")
+	if !strings.Contains(msgs[1].Content, "No file content was captured") {
+		t.Errorf("empty context not reported:\n%s", msgs[1].Content)
+	}
+}
+
+// An empty bind address must never produce a listening socket on every interface
+// with the loopback guard switched off. Whatever host is used, "the guard is on"
+// has to agree with "bound to loopback".
+func TestEmptyWebHostFailsClosed(t *testing.T) {
+	if got := normalizeWebHost(""); got != "127.0.0.1" {
+		t.Errorf("normalizeWebHost(\"\") = %q, want 127.0.0.1", got)
+	}
+	if got := normalizeWebHost("   "); got != "127.0.0.1" {
+		t.Errorf("normalizeWebHost(whitespace) = %q, want 127.0.0.1", got)
+	}
+	if !isLoopbackHost(normalizeWebHost("")) {
+		t.Error("an empty --web-host still yields a guard-off binding")
+	}
+	// A routable address must keep working as an explicit opt-in.
+	if got := normalizeWebHost("0.0.0.0"); got != "0.0.0.0" {
+		t.Errorf("normalizeWebHost(0.0.0.0) = %q, want it left alone", got)
+	}
+	if isLoopbackHost("0.0.0.0") {
+		t.Error("0.0.0.0 must not be treated as loopback")
+	}
+}
+
+// A request with no Host at all must be refused rather than served.
+func TestGuardRefusesARequestWithNoHost(t *testing.T) {
+	prev := webBindIsLoopback
+	webBindIsLoopback = true
+	defer func() { webBindIsLoopback = prev }()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/matches", nil)
+	req.Host = ""
+	localGuard(getMatches).ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d for a missing Host, want 403", rec.Code)
+	}
+}
+
+// The stream's first frame carries the whole assessment so far. It must be
+// flagged, because EventSource reconnects on its own after a dropped connection:
+// a client that cannot tell a history frame from a delta appends the assessment
+// twice and the operator reads the same text twice.
+func TestReviewStreamFlagsTheHistoryFrame(t *testing.T) {
+	withReviewEnv(t)
+
+	rev := &reviewstore.Review{Signature: "S", Secret: "x", Status: reviewstore.StatusRunning}
+	if err := reviewStore.Create(rev); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	job := newReviewJob()
+	job.publish("half an assessment")
+	reviewJobsMu.Lock()
+	reviewJobs[rev.ID] = job
+	reviewJobsMu.Unlock()
+	defer dropJob(rev.ID)
+
+	mux := http.NewServeMux()
+	registerReviewRoutes(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/review/" + rev.ID + "/stream")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("content-type = %q, want an SSE stream", ct)
+	}
+
+	var frame map[string]any
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if err := json.Unmarshal([]byte(payload), &frame); err != nil {
+			t.Fatalf("decode frame %q: %v", payload, err)
+		}
+		break
+	}
+	if frame == nil {
+		t.Fatal("no SSE frame arrived")
+	}
+	if frame["type"] != "delta" {
+		t.Errorf("first frame type = %v, want delta", frame["type"])
+	}
+	if frame["reset"] != true {
+		t.Error("the history frame is not flagged reset: a reconnecting client would append it twice")
+	}
+	if frame["text"] != "half an assessment" {
+		t.Errorf("history text = %v, want the text streamed so far", frame["text"])
+	}
+}
+
+func mustURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse %s: %v", raw, err)
+	}
+	return u
+}
+
+func TestReconcileInterruptedReviews(t *testing.T) {
+	withReviewEnv(t)
+
+	queued := &reviewstore.Review{Signature: "Queued", Secret: "a", Status: reviewstore.StatusQueued}
+	running := &reviewstore.Review{Signature: "Running", Secret: "b", Status: reviewstore.StatusRunning}
+	done := &reviewstore.Review{Signature: "Done", Secret: "c", Status: reviewstore.StatusDone, Assessment: "kept"}
+	failed := &reviewstore.Review{Signature: "Failed", Secret: "d", Status: reviewstore.StatusFailed, Error: "original failure"}
+	for _, r := range []*reviewstore.Review{queued, running, done, failed} {
+		if err := reviewStore.Create(r); err != nil {
+			t.Fatalf("create %s: %v", r.Signature, err)
+		}
+	}
+	// AppendMessage on a running review proves a chat turn is not lost either.
+	if err := reviewStore.AppendMessage(running.ID, reviewstore.Message{Role: "user", Content: "was mid-conversation"}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	if n := reconcileInterruptedReviews(reviewStore); n != 2 {
+		t.Errorf("reconciled = %d, want 2 (the queued and the running review)", n)
+	}
+
+	got, ok := reviewStore.Get(queued.ID)
+	if !ok {
+		t.Fatal("queued review vanished")
+	}
+	if got.Status != reviewstore.StatusFailed {
+		t.Errorf("queued review status = %q, want failed", got.Status)
+	}
+	if got.Error == "" {
+		t.Error("queued review has no explanation for the operator")
+	}
+
+	got, ok = reviewStore.Get(running.ID)
+	if !ok {
+		t.Fatal("running review vanished")
+	}
+	if got.Status != reviewstore.StatusFailed {
+		t.Errorf("running review status = %q, want failed", got.Status)
+	}
+	if got.Error == "" {
+		t.Error("running review has no explanation for the operator")
+	}
+	if len(got.Messages) != 1 {
+		t.Errorf("running review lost its chat history: %d messages, want 1", len(got.Messages))
+	}
+
+	// Terminal reviews must be untouched, error text included.
+	got, _ = reviewStore.Get(done.ID)
+	if got.Status != reviewstore.StatusDone || got.Assessment != "kept" {
+		t.Errorf("a finished review was modified: status=%q assessment=%q", got.Status, got.Assessment)
+	}
+	got, _ = reviewStore.Get(failed.ID)
+	if got.Status != reviewstore.StatusFailed || got.Error != "original failure" {
+		t.Errorf("a failed review's own error was overwritten: %q", got.Error)
+	}
+
+	// Idempotent: a second pass finds nothing to do.
+	if n := reconcileInterruptedReviews(reviewStore); n != 0 {
+		t.Errorf("second pass reconciled %d, want 0", n)
+	}
+
+	// The store must still be usable afterwards.
+	list := reviewStore.List()
+	if len(list) != 4 {
+		t.Errorf("list = %d reviews, want 4", len(list))
+	}
+}
+
+// A nil store must not panic: initAIReview calls this before the store exists
+// in some failure paths.
+func TestReconcileHandlesNilStore(t *testing.T) {
+	if n := reconcileInterruptedReviews(nil); n != 0 {
+		t.Errorf("nil store reconciled %d, want 0", n)
+	}
+}
+
 func TestReviewChatRequiresMessageAndReview(t *testing.T) {
 	withReviewEnv(t)
 
@@ -756,5 +1230,85 @@ func TestInitAIReviewMigratesLegacyChatConfig(t *testing.T) {
 	}
 	if reviewPrompt != "LEGACY PROMPT" {
 		t.Fatalf("reviewPrompt = %q, want the legacy prompt", reviewPrompt)
+	}
+}
+
+// The old config did not always record a backend. A key with no backend used to
+// produce a provider-less seed, which the settings store rejects - and because
+// the failure was returned rather than logged, it disabled AI review entirely on
+// an upgrade.
+func TestInitAIReviewMigratesLegacyConfigWithNoBackend(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(func() {
+		reviewStore = nil
+		aiSettingsStore = nil
+		reviewPrompt = defaultReviewSystemPrompt
+	})
+
+	legacy := `{"backend":"","deepseek_api_key":"sk-legacy-nobackend","deepseek_model":"deepseek-chat"}`
+	if err := os.WriteFile(filepath.Join(dir, "chat_config.json"), []byte(legacy), 0o600); err != nil {
+		t.Fatalf("write legacy config: %v", err)
+	}
+
+	cfg := &core.Config{}
+	cfg.AIReview = core.AIReviewConfig{ReviewDir: dir}
+	if err := initAIReview(cfg); err != nil {
+		t.Fatalf("a backend-less legacy config must not fail startup: %v", err)
+	}
+	if aiSettingsStore == nil {
+		t.Fatal("settings store was not initialised")
+	}
+
+	got, err := aiSettingsStore.Get()
+	if err != nil {
+		t.Fatalf("settings get: %v", err)
+	}
+	if got.APIKey != "sk-legacy-nobackend" {
+		t.Error("the legacy API key was lost")
+	}
+	if got.Provider == "" {
+		t.Error("provider = \"\", want it defaulted, or the store rejects the seed")
+	}
+	if got.Provider != "deepseek" {
+		t.Errorf("provider = %q, want deepseek: the old chat defaulted to it", got.Provider)
+	}
+}
+
+// An unusable AI section in config.yaml must degrade to the environment and the
+// built-in defaults, not take the whole feature down.
+func TestInitAIReviewSurvivesAnUnusableSeed(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(func() {
+		reviewStore = nil
+		aiSettingsStore = nil
+		reviewPrompt = defaultReviewSystemPrompt
+	})
+
+	cfg := &core.Config{}
+	cfg.AIReview = core.AIReviewConfig{
+		Provider:  "not-a-real-provider",
+		ReviewDir: filepath.Join(dir, "ai_review"),
+	}
+	if err := initAIReview(cfg); err != nil {
+		t.Fatalf("an unknown provider in config.yaml must not fail startup: %v", err)
+	}
+	if reviewStore == nil || aiSettingsStore == nil {
+		t.Fatal("stores were not initialised despite the unusable seed")
+	}
+	if _, err := os.Stat(aiSettingsStore.Path()); !errors.Is(err, os.ErrNotExist) {
+		t.Error("an unusable seed must not be written to the settings file")
+	}
+	// The bogus provider must not be in effect: the store falls back to the
+	// built-in default. Asserting on the resolved provider keeps this
+	// independent of whether a key happens to be in the environment.
+	got, err := aiSettingsStore.Get()
+	if err != nil {
+		t.Fatalf("settings get: %v", err)
+	}
+	if got.Provider == "not-a-real-provider" {
+		t.Error("the unusable seed is still in effect")
+	}
+	if got.Provider != "deepseek" {
+		t.Errorf("provider = %q, want the built-in default", got.Provider)
 	}
 }

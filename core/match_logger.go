@@ -84,12 +84,17 @@ func (ml *MatchLogger) LogMatch(signatureName string, url string, fileName strin
 
 	// Sanitize values
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	cleanURL := sanitizeValue(url)
-	cleanFile := sanitizeValue(fileName)
+	cleanURL := csvCell(sanitizeValue(url))
+	cleanFile := csvCell(sanitizeValue(fileName))
 
 	cleanMatches := make([]string, 0, len(matches))
 	for _, m := range matches {
 		cleanMatches = append(cleanMatches, sanitizeValue(m))
+	}
+	// The joined cell starts with the first match, so that is the only one whose
+	// first character can begin a formula.
+	if len(cleanMatches) > 0 {
+		cleanMatches[0] = csvCell(cleanMatches[0])
 	}
 
 	// Build CSV row
@@ -155,6 +160,28 @@ func sanitizeFileName(name string) string {
 		return "misc.csv"
 	}
 	return name + ".csv"
+}
+
+// csvCell guards a value against spreadsheet formula injection (CWE-1236).
+//
+// The matched value comes from a scanned repository, which may be hostile, and a
+// file whose contents begin with one of these characters is evaluated as a
+// formula by Excel, LibreOffice and Google Sheets when the operator opens the
+// export. A crafted secret could then run a command or exfiltrate the
+// neighbouring cells - on the machine of the person investigating it.
+//
+// A leading apostrophe is the spreadsheet's own "this is text" marker: Excel
+// hides it in the cell and copies the value out unchanged, so the export stays
+// usable while the raw file remains greppable.
+func csvCell(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
 }
 
 // sanitizeValue strips control characters from a value so each log entry stays

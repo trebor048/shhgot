@@ -38,9 +38,11 @@ logFormat: "fancy"                 # minimal | fancy | ultra fancy | even more f
 #
 # These settings only SEED the AI configuration the first time shhgit runs.
 # After that the dashboard's Settings tab owns them, persisted to
-# ai_review/settings.json. Environment variables act as per-field fallbacks:
-# DEEPSEEK_API_KEY, OPENAI_API_KEY, AI_BASE_URL, AI_API_KEY, AI_MODEL,
-# OLLAMA_URL, OLLAMA_MODEL (and SHHGIT_AI_* equivalents).
+# ai_review/settings.json. Environment variables act as per-field fallbacks for
+# fields left blank, so a value saved in the UI always wins:
+#   SHHGIT_AI_PROVIDER, SHHGIT_AI_API_KEY, SHHGIT_AI_BASE_URL, SHHGIT_AI_MODEL
+#   SHHGIT_AI_<PROVIDER>_{API_KEY,BASE_URL,MODEL}
+#   DEEPSEEK_API_KEY, OPENAI_API_KEY (vendor aliases)
 #
 # Prefer the environment variables for the key so no secret lives in this file.
 #
@@ -48,7 +50,7 @@ logFormat: "fancy"                 # minimal | fancy | ultra fancy | even more f
 # file content in plain text. Use provider: ollama to keep everything local.
 ai_review:
   provider: deepseek              # deepseek | openai | custom | ollama
-  api_key: ''                     # or DEEPSEEK_API_KEY / OPENAI_API_KEY / AI_API_KEY
+  api_key: ''                     # or DEEPSEEK_API_KEY / OPENAI_API_KEY / SHHGIT_AI_API_KEY
   base_url: ''                    # blank = the provider's default endpoint
   model: ''                       # blank = the provider's default model
   review_dir: ai_review           # where reviews and AI settings are stored (gitignored)

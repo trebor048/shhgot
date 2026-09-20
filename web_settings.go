@@ -83,9 +83,9 @@ func mergeSettings(cur aiproviders.Settings, in settingsUpdate) aiproviders.Sett
 	return next
 }
 
-func registerSettingsRoutes() {
-	http.HandleFunc("/api/settings", corsMiddleware(localGuard(settingsHandler)))
-	http.HandleFunc("/api/settings/test", corsMiddleware(localGuard(settingsTestHandler)))
+func registerSettingsRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/api/settings", corsMiddleware(localGuard(settingsHandler)))
+	mux.HandleFunc("/api/settings/test", corsMiddleware(localGuard(settingsTestHandler)))
 }
 
 // settingsHandler serves GET (read, key masked) and PUT/POST (save).
