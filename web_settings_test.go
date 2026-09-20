@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -236,5 +238,113 @@ func TestMergeSettingsKeepsProviderOnRename(t *testing.T) {
 	got := mergeSettings(cur, settingsUpdate{BaseURL: cur.BaseURL, Model: "deepseek-reasoner"})
 	if got.Provider != "deepseek" || got.Model != "deepseek-reasoner" || got.APIKey != "k" {
 		t.Fatalf("merge = %+v", got)
+	}
+}
+
+// An operator who supplies a key through the environment must not find it copied
+// into ai_review/settings.json by an unrelated save. Besides putting a secret on
+// disk that they deliberately kept out of it, that copy would then outrank the
+// environment it came from, so changing the variable would appear to do nothing.
+func TestSavingSettingsDoesNotPersistAnEnvironmentKey(t *testing.T) {
+	t.Setenv("SHHGIT_AI_API_KEY", "env-only-key")
+
+	st := aiproviders.NewStore(filepath.Join(t.TempDir(), "settings.json"))
+	aiSettingsStore = st
+	webBindIsLoopback = true
+	t.Cleanup(func() { aiSettingsStore = nil })
+
+	// Nothing saved yet, so the environment supplies the key.
+	eff, err := st.Get()
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if eff.APIKey != "env-only-key" {
+		t.Fatalf("environment key not in effect: %q", eff.APIKey)
+	}
+
+	// An unrelated save: only the model changes.
+	rec := httptest.NewRecorder()
+	settingsHandler(rec, localRequest(http.MethodPut, "/api/settings", []byte(`{"provider":"deepseek","model":"deepseek-chat"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	raw, err := os.ReadFile(st.Path())
+	if err != nil {
+		t.Fatalf("read the saved file: %v", err)
+	}
+	if strings.Contains(string(raw), "env-only-key") {
+		t.Errorf("the environment-provided key was written to %s: %s", st.Path(), raw)
+	}
+
+	// The response must still report that a key is in effect, or the dashboard
+	// would tell the operator their environment key had been lost.
+	var view map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode the save response: %v", err)
+	}
+	saved, _ := view["settings"].(map[string]any)
+	if saved == nil || saved["api_key_set"] != true {
+		t.Errorf("save response = %s, want api_key_set true from the environment", rec.Body.String())
+	}
+
+	after, err := st.Get()
+	if err != nil {
+		t.Fatalf("get after the save: %v", err)
+	}
+	if after.APIKey != "env-only-key" {
+		t.Errorf("key = %q, want the environment value to still apply", after.APIKey)
+	}
+	if after.Model != "deepseek-chat" {
+		t.Errorf("model = %q, want the saved value", after.Model)
+	}
+}
+
+// A key the operator did save must survive a later save that omits it.
+func TestSavingSettingsKeepsAStoredKey(t *testing.T) {
+	st := settingsEnv(t)
+
+	rec := httptest.NewRecorder()
+	settingsHandler(rec, localRequest(http.MethodPut, "/api/settings", []byte(`{"provider":"deepseek","model":"deepseek-reasoner"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	after, err := st.Get()
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if after.APIKey != "sk-super-secret" {
+		t.Errorf("key = %q, want the stored key kept", after.APIKey)
+	}
+	if after.Model != "deepseek-reasoner" {
+		t.Errorf("model = %q, want the new value", after.Model)
+	}
+}
+
+// GetStored backs every save, so it must report a corrupted file rather than
+// treating it as empty and silently discarding what the operator had saved.
+func TestGetStoredReportsACorruptedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := aiproviders.NewStore(path).GetStored(); err == nil {
+		t.Error("a corrupted settings file must be reported, not ignored")
+	}
+
+	// A missing file means "nothing stored yet", not an error.
+	if got, err := aiproviders.NewStore(filepath.Join(dir, "absent.json")).GetStored(); err != nil {
+		t.Errorf("a missing file is not an error: %v", err)
+	} else if got.APIKey != "" || got.Model != "" {
+		t.Errorf("a missing file returned %+v, want empty settings", got)
+	}
+
+	// And it must not invent defaults the way Get does.
+	if got, err := aiproviders.NewStore(filepath.Join(dir, "absent.json")).Get(); err != nil {
+		t.Fatalf("get: %v", err)
+	} else if got.Provider == "" {
+		t.Error("Get should still apply the default provider")
 	}
 }

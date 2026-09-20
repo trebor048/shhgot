@@ -111,16 +111,23 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		cur, err := aiSettingsStore.Get()
+		// Merge from what the file holds, not from Get: Get falls back to the
+		// environment, and saving that back would persist an environment-provided
+		// API key into the file, where it would then outrank the environment.
+		cur, err := aiSettingsStore.GetStored()
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		next := mergeSettings(cur, in)
 
-		// Validate by building the client, so an unusable combination is
-		// rejected at save time instead of failing on the next review.
-		if _, err := aiproviders.New(next); err != nil {
+		// Judge the configuration the operator will actually get: the values being
+		// saved plus their per-field environment fallbacks. Validating `next` by
+		// itself would reject a working setup whose key comes from the
+		// environment. `next` is still what gets written, so no environment
+		// secret is persisted.
+		effective := aiproviders.WithEnvFallback(next)
+		if _, err := aiproviders.New(effective); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -128,9 +135,11 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		// Report the effective settings, so the dashboard shows that a key is in
+		// effect rather than claiming none is set.
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":       true,
-			"settings": newSettingsView(next),
+			"settings": newSettingsView(effective),
 		})
 
 	default:

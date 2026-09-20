@@ -49,6 +49,72 @@ func NewStore(path string) *Store { return &Store{path: path} }
 // Path returns the file the store reads and writes.
 func (s *Store) Path() string { return s.path }
 
+// WithEnvFallback returns a copy of s with blank fields filled from the same
+// environment variables Get consults, and the provider resolved the same way.
+//
+// It exists so a configuration can be judged before it is saved. The values
+// actually in effect include the environment; the file deliberately does not. A
+// setup whose API key comes from the environment is perfectly workable, so
+// validating the unsaved form alone would reject it - while the caller still
+// saves the form, and no environment secret reaches the disk.
+func WithEnvFallback(s Settings) Settings {
+	provider := normalizeProvider(s.Provider)
+	if provider == "" {
+		provider = normalizeProvider(os.Getenv(envProvider))
+	}
+	if provider == "" {
+		provider = defaultProvider
+	}
+
+	return Settings{
+		Provider: provider,
+		APIKey: firstNonEmpty(
+			strings.TrimSpace(s.APIKey),
+			envFallback(append([]string{envAPIKey, providerEnvSuffix(envAPIKeyFmt, provider)}, wellKnownAPIKeys[provider]...)...),
+		),
+		BaseURL: firstNonEmpty(
+			strings.TrimSpace(s.BaseURL),
+			envFallback(envBaseURL, providerEnvSuffix(envBaseURLFmt, provider)),
+		),
+		Model: firstNonEmpty(
+			strings.TrimSpace(s.Model),
+			envFallback(envModel, providerEnvSuffix(envModelFmt, provider)),
+		),
+	}
+}
+
+// GetStored returns exactly what the settings file holds: no environment
+// fallback and no built-in defaults.
+//
+// Code that writes settings back must merge from this rather than from Get. Get
+// merges the environment in, so a save built on its result copies an
+// environment-provided API key into the file - putting a secret on disk that the
+// operator deliberately kept out of it, and leaving a stale copy that then
+// outranks the environment it came from.
+//
+// A missing file is not an error: it means nothing has been stored yet. A file
+// that exists but cannot be read or parsed is reported, as in Get.
+func (s *Store) GetStored() (Settings, error) {
+	var saved Settings
+	raw, err := os.ReadFile(s.path)
+	switch {
+	case err == nil:
+		if uerr := json.Unmarshal(raw, &saved); uerr != nil {
+			return Settings{}, fmt.Errorf("parse %s: %w", s.path, uerr)
+		}
+	case errors.Is(err, fs.ErrNotExist):
+		return Settings{}, nil
+	default:
+		return Settings{}, fmt.Errorf("read %s: %w", s.path, err)
+	}
+
+	saved.Provider = normalizeProvider(saved.Provider)
+	saved.APIKey = strings.TrimSpace(saved.APIKey)
+	saved.BaseURL = strings.TrimSpace(saved.BaseURL)
+	saved.Model = strings.TrimSpace(saved.Model)
+	return saved, nil
+}
+
 // Get returns the saved settings, falling back per field to environment
 // variables and then to the built-in provider defaults.
 //
@@ -111,12 +177,28 @@ func (s *Store) Get() (Settings, error) {
 //
 // Provider defaults are applied before writing, so the stored file always names
 // the endpoint and model actually in use.
+//
+// Validation judges the configuration as it will be evaluated, environment
+// fallbacks included: a key supplied through the environment is a working setup,
+// and refusing to store the rest of the form because of it would be wrong. What
+// is written is the caller's own values, so no environment secret is copied into
+// the file.
 func (s *Store) Set(v Settings) error {
 	if strings.TrimSpace(s.path) == "" {
 		return fmt.Errorf("%w: settings store has no path", ErrBadConfig)
 	}
 
-	eff, err := resolve(v)
+	if _, err := resolve(WithEnvFallback(v)); err != nil {
+		return err
+	}
+
+	// A blank provider means "whichever one is in effect", so record that rather
+	// than an empty string the next read would have to guess at.
+	if normalizeProvider(v.Provider) == "" {
+		v.Provider = WithEnvFallback(v).Provider
+	}
+
+	eff, err := applyDefaults(v)
 	if err != nil {
 		return err
 	}
