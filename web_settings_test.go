@@ -84,8 +84,8 @@ func TestSettingsPutBlankKeyKeepsTheStoredOne(t *testing.T) {
 	body, _ := json.Marshal(settingsUpdate{
 		Provider: "deepseek",
 		APIKey:   "", // the dashboard cannot echo the key back, so blank means "keep"
-		BaseURL:  "https://api.deepseek.com/v1",
-		Model:    "deepseek-reasoner",
+		BaseURL:  strptr("https://api.deepseek.com/v1"),
+		Model:    strptr("deepseek-reasoner"),
 	})
 	rec := httptest.NewRecorder()
 	settingsHandler(rec, localRequest(http.MethodPut, "/api/settings", body))
@@ -197,8 +197,8 @@ func TestSettingsTestConnectionReportsFailureAsJSON(t *testing.T) {
 	// without depending on the network or a real provider.
 	body, _ := json.Marshal(settingsUpdate{
 		Provider: "custom",
-		BaseURL:  "http://127.0.0.1:9/v1",
-		Model:    "whatever",
+		BaseURL:  strptr("http://127.0.0.1:9/v1"),
+		Model:    strptr("whatever"),
 	})
 	rec := httptest.NewRecorder()
 	settingsTestHandler(rec, localRequest(http.MethodPost, "/api/settings/test", body))
@@ -235,11 +235,73 @@ func TestMergeSettingsKeepsProviderOnRename(t *testing.T) {
 	cur := aiproviders.Settings{Provider: "deepseek", APIKey: "k", BaseURL: "https://api.deepseek.com/v1", Model: "deepseek-chat"}
 
 	// An empty provider in the body must mean "keep the current one".
-	got := mergeSettings(cur, settingsUpdate{BaseURL: cur.BaseURL, Model: "deepseek-reasoner"})
+	got := mergeSettings(cur, settingsUpdate{BaseURL: strptr(cur.BaseURL), Model: strptr("deepseek-reasoner")})
 	if got.Provider != "deepseek" || got.Model != "deepseek-reasoner" || got.APIKey != "k" {
 		t.Fatalf("merge = %+v", got)
 	}
 }
+
+// Rotating only the API key of a self-hosted gateway must not repoint the reviews
+// at the vendor's public endpoint. An omitted field keeps what is stored; only an
+// explicit empty string asks for the provider default, which is what the dashboard
+// sends when the operator clears the box.
+func TestSettingsUpdateDistinguishesOmittedFromEmpty(t *testing.T) {
+	st := aiproviders.NewStore(filepath.Join(t.TempDir(), "settings.json"))
+	aiSettingsStore = st
+	webBindIsLoopback = true
+	t.Cleanup(func() { aiSettingsStore = nil })
+
+	seed := aiproviders.Settings{
+		Provider: "openai",
+		APIKey:   "sk-first",
+		BaseURL:  "https://llm.internal.example/v1",
+		Model:    "internal-model-v3",
+	}
+	if err := st.Set(seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// A key-only update: base_url and model are absent from the JSON entirely.
+	rec := httptest.NewRecorder()
+	settingsHandler(rec, localRequest(http.MethodPut, "/api/settings",
+		[]byte(`{"provider":"openai","api_key":"sk-rotated"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	got, err := st.Get()
+	if err != nil {
+		t.Fatalf("store get: %v", err)
+	}
+	if got.BaseURL != seed.BaseURL {
+		t.Errorf("base_url = %q after a key-only update, want the stored %q", got.BaseURL, seed.BaseURL)
+	}
+	if got.Model != seed.Model {
+		t.Errorf("model = %q after a key-only update, want the stored %q", got.Model, seed.Model)
+	}
+	if got.APIKey != "sk-rotated" {
+		t.Errorf("api key = %q, want the rotated one", got.APIKey)
+	}
+
+	// An explicit empty string still means "use the provider default", which is
+	// what the dashboard sends when the field is cleared.
+	rec = httptest.NewRecorder()
+	settingsHandler(rec, localRequest(http.MethodPut, "/api/settings",
+		[]byte(`{"provider":"openai","base_url":"","model":""}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	got, err = st.Get()
+	if err != nil {
+		t.Fatalf("store get: %v", err)
+	}
+	def := aiproviders.Defaults("openai")
+	if got.BaseURL != def.BaseURL || got.Model != def.Model {
+		t.Errorf("after an explicit blank: base_url=%q model=%q, want the openai defaults %q/%q",
+			got.BaseURL, got.Model, def.BaseURL, def.Model)
+	}
+}
+
+func strptr(s string) *string { return &s }
 
 // An operator who supplies a key through the environment must not find it copied
 // into ai_review/settings.json by an unrelated save. Besides putting a secret on

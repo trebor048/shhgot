@@ -1024,6 +1024,55 @@ func TestReviewStreamFlagsTheHistoryFrame(t *testing.T) {
 	}
 }
 
+// Once a review has finished, its terminal event is the last word on the
+// assessment. Output arriving afterwards would be appended to the text a late
+// subscriber is handed as history and to what full() reports, so a client would see
+// content no terminal event ever carried. Both providers call back synchronously
+// today, which is exactly why this needs a guard rather than an argument.
+func TestPublishAfterFinishIsIgnored(t *testing.T) {
+	job := newReviewJob()
+	job.publish("the assessment")
+	job.finish(reviewstore.StatusDone, "")
+
+	job.publish("late deltas")
+	job.publish("more late text")
+
+	if got := job.full(); got != "the assessment" {
+		t.Errorf("full() = %q, want the text from before the job finished", got)
+	}
+	text, status, _ := job.result()
+	if text != "the assessment" || status != reviewstore.StatusDone {
+		t.Errorf("result() = (%q, %q), want the pre-finish text and done", text, status)
+	}
+	if history, _, finished := job.subscribe(); history != "the assessment" || !finished {
+		t.Errorf("subscribe() after finish = (%q, finished=%v), want the pre-finish text", history, finished)
+	}
+}
+
+// A DELETE for an id that has no stored review must not take a running job down
+// with it: the 404 path used to drop the job before checking, so a stream request
+// arriving in between lost the live deltas and was told the review was not running.
+func TestDeleteOfAMissingReviewLeavesRunningJobsAlone(t *testing.T) {
+	withReviewEnv(t)
+
+	// A job with no stored review, which is the state the ordering bug exploited.
+	orphan := newReviewJob()
+	orphan.publish("still working")
+	reviewJobsMu.Lock()
+	reviewJobs["orphan-id"] = orphan
+	reviewJobsMu.Unlock()
+	defer dropJob("orphan-id")
+
+	rec := httptest.NewRecorder()
+	reviewItemHandler(rec, localRequest(http.MethodDelete, "/api/review/orphan-id", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for a review that does not exist", rec.Code)
+	}
+	if lookupJob("orphan-id") == nil {
+		t.Error("the running job was dropped by a DELETE that returned 404")
+	}
+}
+
 // The guard is the only thing standing between a rebound page and every captured
 // secret, so it must fail closed on anything it cannot recognise. Trimming at the
 // last colon used to accept "127.0.0.1:evil.test", which is not an address.

@@ -307,6 +307,12 @@ func (s *Store) List() []*Review {
 // timestamps back into r. The id and CreatedAt of a stored review are
 // immutable: r.ID selects the file and the stored CreatedAt is preserved.
 //
+// Update writes the caller's whole struct, so it must not be handed a Review that
+// was read earlier and then modified: any field changed in between - a chat turn
+// appended by AppendMessage, for one - is reverted, because there is no merge and
+// no version check. Callers that change a couple of fields on a live review should
+// use SetResult or AppendMessage instead.
+//
 // It returns os.ErrNotExist-compatible errors for an unknown or invalid id.
 func (s *Store) Update(r *Review) error {
 	if r == nil {

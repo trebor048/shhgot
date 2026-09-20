@@ -460,6 +460,14 @@ func reviewItemHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			writeJSON(w, http.StatusOK, viewOf(rev, true))
 		case http.MethodDelete:
+			// Only tear down the job once the review is known to exist. Dropping it
+			// first meant a 404 for an unknown id could still have destroyed a
+			// running job, so a stream request arriving in between found no job,
+			// lost the live deltas and was told the review was not running.
+			if _, exists := reviewStore.Get(id); !exists {
+				writeJSONError(w, http.StatusNotFound, "no such review")
+				return
+			}
 			dropJob(id)
 			if err := reviewStore.Delete(id); err != nil {
 				// The store reports a missing review and an invalid id with the
@@ -804,6 +812,14 @@ func newReviewJob() *reviewJob {
 func (j *reviewJob) publish(delta string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	// Ignore output that arrives after the job finished. Both providers call back
+	// synchronously inside Stream today, so this cannot happen yet - but a provider
+	// that streamed from another goroutine would otherwise keep appending after the
+	// terminal event, and the text a late subscriber is handed as history, and the
+	// assessment full() reports, would include output no terminal event carried.
+	if j.done {
+		return
+	}
 	j.text.WriteString(delta)
 	for c := range j.subs {
 		select {

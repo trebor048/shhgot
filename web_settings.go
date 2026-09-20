@@ -32,12 +32,20 @@ type settingsView struct {
 }
 
 // settingsUpdate is the request body accepted by PUT /api/settings and
-// POST /api/settings/test. An empty APIKey means "keep the stored key".
+// POST /api/settings/test.
+//
+// BaseURL and Model are pointers so that "absent" and "empty" can mean different
+// things: an omitted field keeps what is stored, while an explicit empty string
+// asks for the provider default (which is what the dashboard sends when the
+// operator clears the box). Without that distinction a client rotating only the
+// API key of a self-hosted OpenAI-compatible gateway had its custom endpoint and
+// model replaced by the vendor defaults - silently sending the next review, and
+// the finding in it, to the wrong host.
 type settingsUpdate struct {
-	Provider string `json:"provider"`
-	APIKey   string `json:"api_key"`
-	BaseURL  string `json:"base_url"`
-	Model    string `json:"model"`
+	Provider string  `json:"provider"`
+	APIKey   string  `json:"api_key"`
+	BaseURL  *string `json:"base_url"`
+	Model    *string `json:"model"`
 }
 
 func newSettingsView(s aiproviders.Settings) settingsView {
@@ -60,9 +68,9 @@ func newSettingsView(s aiproviders.Settings) settingsView {
 
 // mergeSettings applies a browser-supplied update to the stored settings.
 //
-// Rules: an empty api_key keeps the stored key (so the UI never has to round
-// trip a secret), and an empty base_url/model means "use the provider
-// default" rather than "blank it".
+// Rules: an empty api_key keeps the stored key (so the UI never has to round trip
+// a secret), an omitted base_url/model keeps the stored endpoint, and an explicit
+// empty base_url/model means "use the provider default" rather than "blank it".
 func mergeSettings(cur aiproviders.Settings, in settingsUpdate) aiproviders.Settings {
 	next := cur
 	if p := strings.ToLower(strings.TrimSpace(in.Provider)); p != "" {
@@ -78,8 +86,21 @@ func mergeSettings(cur aiproviders.Settings, in settingsUpdate) aiproviders.Sett
 	if k := strings.TrimSpace(in.APIKey); k != "" {
 		next.APIKey = k
 	}
-	next.BaseURL = strings.TrimSpace(in.BaseURL)
-	next.Model = strings.TrimSpace(in.Model)
+	def := aiproviders.Defaults(next.Provider)
+	if in.BaseURL != nil {
+		if v := strings.TrimSpace(*in.BaseURL); v != "" {
+			next.BaseURL = v
+		} else {
+			next.BaseURL = def.BaseURL
+		}
+	}
+	if in.Model != nil {
+		if v := strings.TrimSpace(*in.Model); v != "" {
+			next.Model = v
+		} else {
+			next.Model = def.Model
+		}
+	}
 	return next
 }
 

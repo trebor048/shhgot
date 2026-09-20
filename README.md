@@ -417,6 +417,14 @@ step, no separate frontend server, nothing extra to deploy.
 | `/api/settings` | `GET` the AI configuration (the key is never sent back), `PUT` to save it. |
 | `/api/settings/test` | `POST` to make one real call against the configured provider. |
 
+`PUT /api/settings` applies a partial update, so a client can rotate one field
+without sending the rest: an omitted `base_url`, `model` or `api_key` keeps the
+stored value, while sending one as an explicit empty string means "use the
+provider default" (which is what the Settings tab sends when a field is cleared).
+This matters for a self-hosted gateway — a save that carried only a new key used to
+replace the endpoint and model with the vendor defaults, quietly redirecting the
+next review, and the finding in it, to a different host.
+
 A mistyped `/api/…` path gets a real `404` with a JSON body, so a broken client
 request is obvious instead of silently returning dashboard HTML. Other unknown
 paths get a plain `404`.
