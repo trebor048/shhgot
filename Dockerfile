@@ -20,7 +20,7 @@ RUN go mod download
 COPY . .
 
 # Static binary — no cgo, no libc, runs on a bare alpine runtime.
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/shhgit .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/shhgit ./cmd/shhgit
 
 # ---------------------------------------------------------------------------
 FROM alpine:3.20 AS runtime

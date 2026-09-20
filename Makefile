@@ -1,13 +1,14 @@
 # ===========================================================================
 # shhgit — build, test and run targets
 #
-# The product is a single static Go binary built from the repo root.
-# The dashboard is embedded from dashboard/index.html; there is no build step
-# for it and no JavaScript toolchain to install.
+# The product is a single static Go binary built from cmd/shhgit.
+# The dashboard is embedded from cmd/shhgit/dashboard/index.html; there is no
+# build step for it and no JavaScript toolchain to install.
 # ===========================================================================
 
 SHELL    := /bin/sh
 BINARY   := shhgit
+MAIN     := ./cmd/shhgit
 GOEXE    := $(shell go env GOEXE)
 DIST     := dist
 LDFLAGS  := -s -w
@@ -28,7 +29,7 @@ help: ## Show this help
 # --- Build -----------------------------------------------------------------
 
 build: ## Build the shhgit binary for this platform
-	$(GOFLAGS) go build -trimpath -ldflags="$(LDFLAGS)" -o $(BINARY)$(GOEXE) .
+	$(GOFLAGS) go build -trimpath -ldflags="$(LDFLAGS)" -o $(BINARY)$(GOEXE) $(MAIN)
 
 build-all: ## Cross-compile Windows, Linux and macOS (amd64 + arm64) into dist/
 	@mkdir -p $(DIST)
@@ -39,7 +40,7 @@ build-all: ## Cross-compile Windows, Linux and macOS (amd64 + arm64) into dist/
 			out="$(DIST)/$(BINARY)-$$os-$$arch$$ext"; \
 			echo "  building $$out"; \
 			$(GOFLAGS) GOOS=$$os GOARCH=$$arch go build -trimpath \
-				-ldflags="$(LDFLAGS)" -o "$$out" . ; \
+				-ldflags="$(LDFLAGS)" -o "$$out" $(MAIN) ; \
 		done; \
 	done
 	@echo ""

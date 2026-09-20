@@ -2,7 +2,9 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"testing"
 
 	"github.com/trebor048/shhgot/core"
@@ -17,9 +19,17 @@ import (
 // This test is what makes that visible: it fails loudly, naming each pattern that
 // can never fire.
 func TestExampleConfigSignaturesAllCompile(t *testing.T) {
-	data, err := os.ReadFile("config.yaml.example")
+	// The example config sits at the repo root, but `go test` runs each package
+	// with its own directory as the working directory, so resolve it from this
+	// file rather than assuming the current directory.
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate this test file to find the repo root")
+	}
+	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "config.yaml.example")
+	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("read config.yaml.example: %v", err)
+		t.Fatalf("read %s: %v", path, err)
 	}
 
 	var doc struct {

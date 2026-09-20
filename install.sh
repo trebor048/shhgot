@@ -180,7 +180,7 @@ do_build() {
     go mod download || fail "go mod download failed (no network?)"
 
     info "Compiling..."
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$BINARY" . || fail "build failed"
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$BINARY" ./cmd/shhgit || fail "build failed"
 
     local size
     size="$(du -h "$BINARY" 2>/dev/null | cut -f1 || echo '?')"

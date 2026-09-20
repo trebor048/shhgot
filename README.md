@@ -49,7 +49,7 @@ something looks like a secret.
 | **Live GitHub monitoring** | Polls the public event firehose (commits, Gists, comments) with your token, at a rate you control. |
 | **Local scanning** | `--local ./some/dir` walks a directory tree. No GitHub token needed. |
 | **Terminal UI** | The default mode: a live, colour-coded match feed as findings arrive. |
-| **Web dashboard** | `--web` serves a self-contained dashboard — live feed, filters, log tail, activity view, full-file viewer, AI review workspace, provider settings. |
+| **Web dashboard** | `--web` serves a self-contained dashboard — live feed, filters, log tail, activity view, AI review workspace, provider settings. |
 | **Alerts** | Discord or Telegram, with separate routing for AI-token and crypto findings. |
 | **Live credential checks** | Optional provider auth-checks (OpenAI, Anthropic, AWS, Stripe, GitHub, Discord) to confirm a found key actually works. |
 | **AI review** | One click on any hit gets a streamed assessment — what the credential is, what it grants, how exploitable it is, how to fix it — then answers follow-up questions. DeepSeek, OpenAI, any OpenAI-compatible endpoint, or local Ollama. |
@@ -95,19 +95,36 @@ INSTALL_DIR=~/tools/shhgot ./install.sh   # install somewhere else
 ./install.sh --docker                     # print the Docker route instead
 ```
 
-On Windows, use WSL2 or the [Docker](#docker) route.
+The installer is a shell script, so it targets Linux and macOS only. On Windows,
+build from source below — shhgit compiles and runs natively there, no WSL or
+container needed — or use the [Docker](#docker) route.
 
 ### Option 2 — build from source
+
+Works on Linux, macOS and Windows.
+
+**Linux and macOS**
 
 ```bash
 git clone https://github.com/trebor048/shhgot
 cd shhgot
 cp config.yaml.example config.yaml        # then add your GitHub token(s)
-go build -o shhgit .
+go build -o shhgit ./cmd/shhgit
 ./shhgit
 ```
 
-Or drive it through the Makefile:
+**Windows (PowerShell)**
+
+```powershell
+git clone https://github.com/trebor048/shhgot
+cd shhgot
+Copy-Item config.yaml.example config.yaml  # then add your GitHub token(s)
+go build -o shhgit.exe ./cmd/shhgit
+.\shhgit.exe
+```
+
+Or drive it through the Makefile (Linux and macOS; on Windows use `make` from Git
+Bash, or run the `go` commands above directly):
 
 ```bash
 make build        # binary for this platform
@@ -137,6 +154,14 @@ See [Docker](#docker) for details.
 cp config.yaml.example config.yaml
 chmod 600 config.yaml      # it will hold tokens
 ```
+
+On Windows (PowerShell):
+
+```powershell
+Copy-Item config.yaml.example config.yaml
+```
+
+The copy inherits your user profile's ACLs, which already keep it private.
 
 **2. Add a GitHub token** — skip this if you only scan local code.
 
@@ -404,6 +429,19 @@ logFormat: "fancy"     # minimal | fancy | ultra fancy | even more fancy | neon
 | `even more fancy` | Higher-contrast presentation for wall displays. |
 | `neon` | Maximum-glow palette for demos and screenshots. |
 
+Colour and hyperlinks are dropped automatically whenever stdout is not a
+terminal — a pipe, a CI transcript, a log file — so nothing has to be configured
+for CI. Two environment variables override the terminal behaviour:
+
+| Variable | Effect |
+|---|---|
+| `NO_COLOR` | Set to anything to disable colour, following the [no-color convention](https://no-color.org/). |
+| `SHHGIT_NO_LINKS` | Set to anything to disable OSC 8 hyperlinks while keeping colour. Useful in terminals that render the escape sequence literally. |
+
+On Windows the console is switched into virtual-terminal mode at startup so
+colours and links render. If the console refuses, output degrades to plain text
+instead of printing raw escape sequences.
+
 ---
 
 ## Web dashboard
@@ -422,9 +460,6 @@ step, no separate frontend server, nothing extra to deploy.
   the table while buffering new hits.
 - **Stats panel** — totals, per-source and per-signature breakdowns, top
   signatures.
-- **Full-file viewer** — click a match to read the file it came from with the
-  secret highlighted. Content is captured at scan time because cloned
-  repositories are deleted afterwards.
 - **Tokens tab** — live credential-validation results.
 - **Logs and activity tabs** — the scanner log tail and an activity view.
 - **Review tab** — the AI security-review workspace: a job list of current and
@@ -721,6 +756,18 @@ says which.
 **Port already in use**
 `--web-port 9000`, or set `SHHGIT_PORT` for Docker.
 
+**Antivirus quarantines the binary, or `go build` fails with "contains a virus"**
+Expected false positive. shhgit embeds hundreds of credential-detection patterns,
+and heuristic scanners read that as a credential-stealer signature. Windows
+Defender flags it as `PUA:Win32/Vigua.A` and can delete `shhgit.exe` mid-run. Add
+an exclusion for the checkout and for the Go build temp directory (`go env
+GOTMPDIR`), then rebuild:
+
+```powershell
+Add-MpPreference -ExclusionPath "C:\path\to\shhgot"
+Add-MpPreference -ExclusionPath (go env GOTMPDIR)
+```
+
 ---
 
 ## Security
@@ -759,20 +806,23 @@ Layout:
 
 | Path | Contents |
 |---|---|
-| `main.go` | Startup, terminal UI, log styles, scan loop. |
-| `modes.go` | Mode selection (`--web`, `--tui`, `--scanner`). |
-| `web.go` | Web server, HTTP API, stats, SSE feed, origin and loopback guards. |
-| `dashboard.go`, `dashboard/index.html` | The embedded dashboard (one self-contained file, compiled in with `go:embed`). |
-| `web_review.go` | AI security review: routes, prompt assembly, in-flight review broker. |
-| `web_settings.go` | The `/api/settings` and `/api/settings/test` routes. |
+| `cmd/shhgit/` | The binary: everything in `package main`. |
+| `cmd/shhgit/main.go` | Startup, log styles, scan loop, match and event publishing. |
+| `cmd/shhgit/modes.go` | Mode selection (`--web`, `--tui`, `--scanner`). |
+| `cmd/shhgit/tui.go`, `tui_review.go` | The interactive full-screen terminal UI (`--tui`) and its review pane. |
+| `cmd/shhgit/console_*.go` | Platform bits: Windows virtual-terminal setup, hiding the console, opening the browser. |
+| `cmd/shhgit/web.go` | Web server, HTTP API, stats, SSE feed, origin and loopback guards. |
+| `cmd/shhgit/dashboard.go`, `cmd/shhgit/dashboard/index.html` | The embedded dashboard (one self-contained file, compiled in with `go:embed`). |
+| `cmd/shhgit/web_review.go` | AI security review: routes, prompt assembly, in-flight review broker. |
+| `cmd/shhgit/web_settings.go` | The `/api/settings` and `/api/settings/test` routes. |
 | `aiproviders/` | One client for DeepSeek, OpenAI, any OpenAI-compatible endpoint and Ollama, plus the settings store. |
 | `reviewstore/` | On-disk review and chat history (one JSON file per review). |
 | `core/` | Scanner, signatures, validators, config, webhooks. |
 | `cmd/apikey-check/` | Standalone API-key checking utility. |
 
-To change the dashboard, edit `dashboard/index.html` and rebuild — there is no
-build step, package manager or bundler, and no network access is needed at
-runtime.
+To change the dashboard, edit `cmd/shhgit/dashboard/index.html` and rebuild —
+there is no build step, package manager or bundler, and no network access is
+needed at runtime.
 
 CI (`go.yml`) checks formatting, runs `go vet`, runs the tests including under
 `-race`, and builds all six OS/arch combinations. Releases attach binaries for
