@@ -177,14 +177,17 @@ func storeMatchFile(id string, url string, file string, content string, secret s
 func getMatchFile(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "missing id")
 		return
 	}
 	fileMu.Lock()
 	d, ok := fileDetails[id]
 	fileMu.Unlock()
 	if !ok {
-		http.Error(w, "not found", http.StatusNotFound)
+		// JSON like the rest of the API, including this route's own errors: the
+		// dashboard ignores the body, but a plain-text one contradicted the
+		// documented contract that /api/... answers 404 with JSON.
+		writeJSONError(w, http.StatusNotFound, "not found")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

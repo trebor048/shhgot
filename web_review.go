@@ -677,6 +677,14 @@ func reviewStreamHandler(w http.ResponseWriter, r *http.Request, id string) {
 		}
 	}
 
+	// A review can take minutes and may produce no output for long stretches, and
+	// an idle SSE connection is exactly what an intermediary drops. The match feed
+	// already keeps itself alive this way; without it a proxied dashboard - the
+	// Cloudflare Tunnel profile, for one - would lose the stream mid-review and the
+	// operator would wait on a review that had already finished.
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
 	for {
 		select {
 		case delta, open := <-ch:
@@ -690,6 +698,11 @@ func reviewStreamHandler(w http.ResponseWriter, r *http.Request, id string) {
 				return
 			}
 			if err := sseSend(w, flusher, map[string]any{"type": "delta", "text": delta}); err != nil {
+				return
+			}
+
+		case <-heartbeat.C:
+			if err := sseSend(w, flusher, map[string]any{"type": "ping"}); err != nil {
 				return
 			}
 

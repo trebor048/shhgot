@@ -448,7 +448,7 @@ function matchFilter(m){if(!prioFilter(m))return false;if(state.source&&m.source
 function render(){
 var shown=matches.filter(matchFilter);
 document.getElementById('cnt-matches').textContent=shown.length;
-document.getElementById('showing').textContent=shown.length+' matches / '+matches.length+' total';
+document.getElementById('showing').textContent=shown.length+' matches / '+matches.length+' total'+(shown.length>500?' (listing the first 500)':'');
 var el=document.getElementById('panel-matches');
 if(shown.length===0){if(!el.firstChild||el.firstChild.className!=='empty')el.innerHTML='<div class="empty">No matches yet - waiting for the scanner...</div>';}
 else{
@@ -463,7 +463,12 @@ document.getElementById('cnt-tokens').textContent=tokens.length;
 if(tokens.length===0){if(!tt.firstChild||tt.firstChild.className!=='empty')tt.innerHTML='<div class="empty">No token validation results yet.</div>';}
 else{
 if(tt.firstChild&&tt.firstChild.className==='empty')tt.innerHTML='';
-syncList(tt,tokens.slice(0,500),function(t){return t.token+'|'+t.valid},tokenBuild);
+/* Keyed by position, not by content: the same token can legitimately be validated
+   twice with the same result, and keying by its value collapsed the repeats into
+   one row while the badge kept counting them. */
+var shownTokens=[];var tStart=Math.max(0,tokens.length-500);
+for(var i=tStart;i<tokens.length;i++)shownTokens.push({n:i,t:tokens[i]});
+syncList(tt,shownTokens,function(x){return 'T'+x.n},function(x){return tokenBuild(x.t)});
 }
 }
 function renderLogs(){
@@ -472,8 +477,11 @@ document.getElementById('cnt-logs').textContent=logs.length;
 if(logs.length===0){if(!ll.firstChild||ll.firstChild.className!=='empty')ll.innerHTML='<div class="empty">No log output yet.</div>';}
 else{
 if(ll.firstChild&&ll.firstChild.className==='empty')ll.innerHTML='';
-var shownLogs=logs.slice(-400).reverse();
-syncList(ll,shownLogs,function(l){return l},logBuild);
+/* Newest first, and keyed by position for the same reason as tokens: an identical
+   line logged twice is two events, and the badge counts two. */
+var shownLogs=[];var lStart=Math.max(0,logs.length-400);
+for(var j=logs.length-1;j>=lStart;j--)shownLogs.push({n:j,text:logs[j]});
+syncList(ll,shownLogs,function(x){return 'G'+x.n},function(x){return logBuild(x.text)});
 }
 }
 function matchBuild(m){
@@ -650,7 +658,8 @@ return d;
 }
 function shortRepo(u){u=String(u||'').replace(/\.git$/,'').replace(/^https?:\/\//,'').replace(/^www\./,'');var parts=u.split('/');if(parts.length>=3)return parts.slice(-2).join('/');return u}
 function short(s,n){s=String(s||'');return s.length>n?s.slice(0,n-1)+'\u2026':s}
-function copy(btn){var v=btn.parentElement.querySelector('.v').textContent;navigator.clipboard.writeText(v).then(function(){btn.textContent='copied';setTimeout(function(){btn.textContent='copy'},1200)})}
+/* Removed: a dead copy(btn) helper. The copy buttons are wired through copyVal and
+   copyText below; nothing referenced it. */
 function copyText(v,btn){v=v==null?'':v;var o=btn.textContent;navigator.clipboard.writeText(v).then(function(){btn.textContent='copied';setTimeout(function(){btn.textContent=o},1200)})}
 function copyVal(btn){copyText(btn.parentElement.querySelector('.secval').getAttribute('data-full'),btn)}
 /* ---- file viewer modal ---- */
@@ -744,7 +753,10 @@ return html;
 }
 function viewFile(id,btn){
 if(btn)btn.disabled=true;
-fetch('/api/file?id='+encodeURIComponent(id)).then(function(r){if(!r.ok)throw new Error('not found');return r.json();}).then(function(d){openModal(d);if(btn)btn.disabled=false;}).catch(function(){if(btn)btn.disabled=false;});
+/* A 404 here is normal rather than exceptional: the dashboard keeps only the most
+   recently seen files, so "view full file" on an older match cannot be served.
+   Saying so beats a button that appears to do nothing. */
+fetch('/api/file?id='+encodeURIComponent(id)).then(function(r){if(!r.ok)throw new Error('not found');return r.json();}).then(function(d){openModal(d);if(btn)btn.disabled=false;}).catch(function(){if(btn)btn.disabled=false;toast('That file is no longer cached - the dashboard keeps only the most recently seen files.','err');});
 }
 function modalEsc(e){if(e.key==='Escape')closeModal();}
 function closeModal(){document.removeEventListener('keydown',modalEsc);var ovl=document.getElementById('file-modal');if(ovl)ovl.remove();modalState={detail:null,raw:false};}
@@ -781,11 +793,44 @@ else if(ev.type==='token'){if(ev.token)tokens.push(ev.token);renderTokens();}
 else if(ev.type==='log'){if(ev.log)logs.push(ev.log);renderLogs();}
 else if(ev.type==='activity'){if(ev.activity)activityData=ev.activity;renderActivity();}
 else if(ev.type==='snapshot'){if(ev.activity)activityData=ev.activity;renderActivity();}
+else if(ev.type==='review'){onReviewEvent(ev.review);}
+}
+/* The server broadcasts a review event whenever a review changes state. The Review
+   tab polls, but that poll only runs while the tab is visible, so without this the
+   badge stays wrong for as long as the operator is looking at anything else - and
+   the review they just started shows up only after switching tabs. One review
+   produces several events in a row (queued, running, done, plus each chat turn),
+   so coalesce them into a single refresh. */
+var reviewEventTimer=null;
+function onReviewEvent(rev){
+if(!rev)return;
+var id=rv.selected==null?null:String(rv.selected);
+if(id!=null&&String(rev.id)===id){
+var st=String(rev.status||'');
+/* The open review changed state. If it is no longer running its stream is about
+   to end - and may already have died - so re-read the detail to pick up the final
+   assessment instead of waiting for the poll to notice. While it is still running
+   the stream carries the text, so there is nothing to fetch. */
+if(st&&st!==String(rv.status)&&!rvIsActive(st))selectReview(rv.selected);
+}
+if(reviewEventTimer)return;
+reviewEventTimer=setTimeout(function(){reviewEventTimer=null;loadReviews();},250);
+}
+/* The initial snapshots are taken before they arrive, so they must be merged into
+   whatever the live feed has already delivered rather than assigned over it: a
+   match found while /api/ws was in flight used to be replaced by the older
+   snapshot and never appeared until a reload. Snapshot entries go in front because
+   both feeds are in arrival order and the snapshot is the older of the two. */
+function mergeOlder(existing,snapshot,keyFn){
+var have={};for(var i=0;i<existing.length;i++){var k=keyFn(existing[i]);if(k!=null&&k!=='')have[k]=1;}
+var older=[];
+for(var j=0;j<snapshot.length;j++){var x=snapshot[j];var k2=keyFn(x);if(k2!=null&&k2!==''&&!have[k2]){have[k2]=1;older.push(x);}}
+return older.length?older.concat(existing):existing;
 }
 function loadInitial(){
-fetch('/api/ws').then(function(r){return r.json()}).then(function(d){matches=d.matches||[];applyStats(d.stats||{});updateSigSelect();render();}).catch(function(){});
-fetch('/api/tokens').then(function(r){return r.json()}).then(function(d){tokens=d.tokens||[];renderTokens();}).catch(function(){});
-fetch('/api/logs').then(function(r){return r.json()}).then(function(d){logs=d.logs||[];renderLogs();}).catch(function(){});
+fetch('/api/ws').then(function(r){return r.json()}).then(function(d){matches=mergeOlder(matches,d.matches||[],function(m){return m&&m.id});applyStats(d.stats||{});updateSigSelect();render();}).catch(function(){});
+fetch('/api/tokens').then(function(r){return r.json()}).then(function(d){tokens=mergeOlder(tokens,d.tokens||[],function(t){return t&&(t.token+'|'+t.valid)});renderTokens();}).catch(function(){});
+fetch('/api/logs').then(function(r){return r.json()}).then(function(d){logs=mergeOlder(logs,d.logs||[],function(l){return l});renderLogs();}).catch(function(){});
 }
 function updateSigSelect(){
 var map={};matches.forEach(function(m){map[m.signature]=(map[m.signature]||0)+1});
@@ -814,6 +859,9 @@ es.onerror=function(){/* EventSource auto-reconnects */};
 /* ================= AI review workspace (Review tab) ================= */
 var RV_POLL_MS=4000;
 var rv={list:[],selected:null,detail:null,status:'',error:'',assessment:'',messages:[],stream:null,chatBusy:false,draft:'',stick:true,assessRAF:false,chatRAF:false};
+/* Bumped by every loadReviews call so an older response cannot be applied after a
+   newer one has already refreshed the workspace. */
+var reviewsGen=0;
 function aiIcon(){return '<span class="ai-ico">&#9889;</span>';}
 function rvIsActive(s){s=String(s||'').toLowerCase();return s==='queued'||s==='running';}
 function rvStatusClass(s){s=String(s||'').toLowerCase();return (s==='queued'||s==='running'||s==='done'||s==='failed')?s:'other';}
@@ -853,13 +901,21 @@ setTimeout(function(){el.classList.add('leaving');setTimeout(function(){if(el.pa
 function mdInline(s){
 var codes=[];
 s=esc(s);
+/* Drop NUL bytes before parking code spans. Code spans are parked as
+   "\u0000N\u0000" and restored at the end, so model text containing that sequence
+   could forge a placeholder and make the renderer print its own bookkeeping or,
+   worse, splice markup into a URL built in between. */
+s=s.replace(/\u0000/g,'');
 s=s.replace(/`([^`]+)`/g,function(m,c){codes.push(c);return '\u0000'+(codes.length-1)+'\u0000';});
-s=s.replace(/\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,function(m,t,u){return '<a href="'+u+'" target="_blank" rel="noopener">'+(t||u)+'</a>';});
-s=s.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g,function(m,p,u){return p+'<a href="'+u+'" target="_blank" rel="noopener">'+u+'</a>';});
+/* The URL classes exclude NUL so a parked code span cannot be swallowed into an
+   href: that put a literal <code class="md-inline"> inside the attribute, which
+   broke the link and leaked the renderer's own markup as visible text. */
+s=s.replace(/\[([^\]]*)\]\((https?:\/\/[^\s)\u0000]+)\)/g,function(m,t,u){return '<a href="'+u+'" target="_blank" rel="noopener">'+(t||u)+'</a>';});
+s=s.replace(/(^|[\s(])(https?:\/\/[^\s<)\u0000]+)/g,function(m,p,u){return p+'<a href="'+u+'" target="_blank" rel="noopener">'+u+'</a>';});
 s=s.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
 s=s.replace(/__([^_]+)__/g,'<strong>$1</strong>');
 s=s.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\*)/g,'$1<em>$2</em>');
-s=s.replace(/\u0000(\d+)\u0000/g,function(m,i){return '<code class="md-inline">'+codes[+i]+'</code>';});
+s=s.replace(/\u0000(\d+)\u0000/g,function(m,i){return codes[+i]===undefined?'':('<code class="md-inline">'+codes[+i]+'</code>');});
 return s;
 }
 function mdRender(src){
@@ -912,23 +968,42 @@ var items=el.querySelectorAll('.rv-item');
 for(var j=0;j<items.length;j++)items[j].onclick=function(){selectReview(this.getAttribute('data-rvid'));};
 }
 async function loadReviews(selectId){
+var gen=++reviewsGen;
 try{
 var d=await apiJson('/api/review');
+/* Drop a response that a newer call has already superseded. The 4 s poll can be in
+   flight when a review is created, and its snapshot predates the POST: applying it
+   would deselect the review that was just started, wipe its pane and close its
+   stream, so the operator sees the review they asked for vanish. */
+if(gen!==reviewsGen)return;
 var list=(d&&d.reviews)||[];
 list.sort(function(a,b){return (Date.parse(b.created_at||'')||0)-(Date.parse(a.created_at||'')||0);});
 rv.list=list;
 var c=document.getElementById('cnt-review');if(c)c.textContent=list.length;
 if(selectId!=null)rv.selected=String(selectId);
 /* This poll refreshes the list, while the open review's pane is driven by its own
-   stream. If that stream dies - a server restart, a dropped connection - the pane
-   would sit on "running" while the list already says "done", so refetch the
-   detail whenever the two disagree. Only when no stream is attached, and only for
-   a plain poll: a caller that passed selectId is switching reviews itself, and
-   selectReview ignores a response for a review that is no longer selected. */
+   stream. If that stream dies - a server restart, a dropped connection - or simply
+   never delivers the closing frame, the pane would sit on "running" while the list
+   already says "done", so refetch the detail whenever the two disagree. Two cases
+   warrant that:
+     - the stream is gone, so nothing will ever update the pane; or
+     - the list reports a settled status (done/failed) while this pane still thinks
+       the review is running. The list comes from a fresh response, so it is the
+       authoritative one, and a healthy-looking stream is no guarantee that the
+       closing frame survived.
+   A queued-versus-running disagreement is deliberately ignored: it is transient and
+   repairing it would reset the pane and reopen the stream on every poll. Only a
+   plain poll does this - a caller that passed selectId is switching reviews itself,
+   and selectReview ignores a response for a review that is no longer selected. */
 if(selectId==null){
 var sel=null;
 for(var i=0;i<list.length;i++){if(String(list[i].id)===String(rv.selected)){sel=list[i];break;}}
-if(sel&&rv.selected!=null&&!rv.stream&&String(sel.status)!==String(rv.status))selectReview(rv.selected);
+if(sel&&rv.selected!=null){
+var selStatus=String(sel.status||'');
+var streamGone=(!rv.stream)||(rv.stream.readyState===2);
+var listSettled=(selStatus==='done'||selStatus==='failed');
+if(selStatus!==String(rv.status)&&(streamGone||(listSettled&&rvIsActive(rv.status))))selectReview(rv.selected);
+}
 }
 if(rv.selected!=null&&!findReview(rv.selected)){
 rv.selected=null;rv.detail=null;rv.status='';rv.error='';rv.assessment='';rv.messages=[];rv.draft='';
@@ -957,7 +1032,7 @@ rv.error=d.error||'';
 rv.assessment=typeof d.assessment==='string'?d.assessment:'';
 rv.messages=Array.isArray(d.messages)?d.messages.slice():[];
 renderReviewDetail();
-if(rvIsActive(rv.status))openReviewStream(id);
+if(rvIsActive(rv.status))openReviewStream(id);else closeReviewStream();
 }catch(e){
 if(rv.selected!==id)return;
 if(pane)pane.innerHTML='<div class="rv-errbox">Could not load this review: '+esc((e&&e.message)?e.message:String(e))+'</div>';
@@ -1062,6 +1137,14 @@ var es;
 try{es=new EventSource('/api/review/'+encodeURIComponent(id)+'/stream');}catch(e){return;}
 es.__closed=false;
 rv.stream=es;
+/* The first frame of a newly opened stream is the whole assessment so far, so it
+   must replace rather than append even if it arrives without the reset flag - a
+   reconnect would otherwise double the text. */
+rv.streamFirst=true;
+/* EventSource reconnects by itself and the same object delivers the frames, so
+   treat every (re)open as a fresh stream: the first frame after it is the whole
+   assessment, whatever the server flags. */
+es.onopen=function(){if(!es.__closed)rv.streamFirst=true;};
 es.onmessage=function(e){
 if(es.__closed)return;
 var msg=null;try{msg=JSON.parse(e.data);}catch(err){return;}
@@ -1070,7 +1153,8 @@ if(msg.type==='delta'){
 var t=(typeof msg.text==='string'?msg.text:'');
 /* the first frame of a stream carries the whole assessment so far and is flagged
    reset; a reconnected stream must replace, not append, or the text doubles */
-if(msg.reset)rv.assessment=t;else rv.assessment+=t;
+if(msg.reset||rv.streamFirst)rv.assessment=t;else rv.assessment+=t;
+rv.streamFirst=false;
 if(rv.status==='queued')rv.status='running';
 scheduleAssessment();
 }else if(msg.type==='done'){
