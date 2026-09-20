@@ -192,7 +192,7 @@ func TestScanProgressEndpointReturnsSnapshot(t *testing.T) {
 
 func TestRegexStatsEndpointReturnsStats(t *testing.T) {
 	prev := core.GlobalRegexOptimizer
-	core.GlobalRegexOptimizer = core.NewRegexOptimizer(4, 16, 1000, true)
+	core.GlobalRegexOptimizer = core.NewRegexOptimizer(4, 1000)
 	t.Cleanup(func() { core.GlobalRegexOptimizer = prev })
 
 	if _, err := core.GlobalRegexOptimizer.CompilePattern(`AKIA[0-9A-Z]{16}`, "AWS Access Key ID", 3, "contents"); err != nil {

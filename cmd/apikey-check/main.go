@@ -576,13 +576,6 @@ func NewChecker() *Checker {
 	}
 }
 
-func maskKey(k string) string {
-	if len(k) <= 12 {
-		return strings.Repeat("*", len(k))
-	}
-	return k[:8] + "..." + k[len(k)-4:]
-}
-
 func (c *Checker) checkProvider(ctx context.Context, p Provider, keys []string, sem chan struct{}) {
 	if len(keys) == 0 {
 		c.mu.Lock()

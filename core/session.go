@@ -83,7 +83,6 @@ func (s *Session) Start() {
 	s.InitCleanupManager()
 	s.InitTokenValidator()
 	s.InitRegexOptimizer()
-	s.InitWorkerPool()
 }
 
 func (s *Session) InitLogger() {
@@ -417,14 +416,11 @@ func (s *Session) AddGitHubToken(token string) bool {
 
 // InitRegexOptimizer initializes the global regex optimizer
 func (s *Session) InitRegexOptimizer() {
-	// Initialize with reasonable defaults: 100 workers, 10000 cache size, 5s timeout, cache enabled
 	maxWorkers := *s.Options.Threads * 2 // 2x threads for better parallelism
-	cacheSize := 10000
 	timeoutMs := 5000
-	enableCache := true
 
-	InitGlobalOptimizer(maxWorkers, cacheSize, timeoutMs, enableCache)
-	s.Log.Debug("Regex optimizer initialized: %d workers, cache=%d", maxWorkers, cacheSize)
+	InitGlobalOptimizer(maxWorkers, timeoutMs)
+	s.Log.Debug("Regex optimizer initialized: %d workers", maxWorkers)
 
 	// Pre-compile all signature patterns
 	for _, sig := range s.Signatures {
@@ -438,19 +434,4 @@ func (s *Session) InitRegexOptimizer() {
 		}
 	}
 	s.Log.Info("Pre-compiled %d regex patterns", len(s.Signatures))
-}
-
-// InitWorkerPool initializes the global worker pool
-func (s *Session) InitWorkerPool() {
-	if GlobalRegexOptimizer == nil {
-		s.Log.Warn("Regex optimizer not initialized, skipping worker pool init")
-		return
-	}
-
-	numWorkers := *s.Options.Threads
-	queueSize := 1000
-
-	InitGlobalWorkerPool(numWorkers, queueSize, GlobalRegexOptimizer)
-	GlobalWorkerPool.Start()
-	s.Log.Debug("Worker pool initialized: %d workers, queue=%d", numWorkers, queueSize)
 }

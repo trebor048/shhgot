@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -84,14 +83,6 @@ func (wq *WebhookQueue) Start() {
 			}
 		}
 	}()
-}
-
-// Stop stops processing the webhook queue
-func (wq *WebhookQueue) Stop() {
-	if wq.isRunning {
-		wq.stopChan <- true
-		time.Sleep(100 * time.Millisecond)
-	}
 }
 
 // Enqueue adds a webhook message to the queue (non-blocking)
@@ -270,80 +261,4 @@ type OutputFileQueue struct {
 	queue     chan string
 	mu        sync.Mutex
 	isRunning bool
-}
-
-// NewOutputFileQueue creates a new file output queue
-func NewOutputFileQueue(filePath string, bufferSize int) *OutputFileQueue {
-	return &OutputFileQueue{
-		filePath: filePath,
-		queue:    make(chan string, bufferSize),
-	}
-}
-
-// Start begins processing file outputs
-func (oq *OutputFileQueue) Start() {
-	if oq.isRunning {
-		return
-	}
-	oq.isRunning = true
-
-	go func() {
-		for payload := range oq.queue {
-			oq.writeToFile(payload)
-		}
-	}()
-}
-
-// Stop stops the file output processor
-func (oq *OutputFileQueue) Stop() {
-	if oq.isRunning {
-		close(oq.queue)
-		oq.isRunning = false
-	}
-}
-
-// Enqueue adds a message to be written to file
-func (oq *OutputFileQueue) Enqueue(payload string) {
-	if !oq.isRunning {
-		oq.Start()
-	}
-
-	select {
-	case oq.queue <- payload:
-		// Successfully queued
-	default:
-		// Queue full, write immediately (blocking)
-		oq.writeToFile(payload)
-	}
-}
-
-// writeToFile writes a payload to the file
-// Splits into multiple files if needed (by date or size)
-func (oq *OutputFileQueue) writeToFile(payload string) {
-	oq.mu.Lock()
-	defer oq.mu.Unlock()
-
-	// Generate timestamped filename to split output
-	timestamp := time.Now().Format("2006-01-02")
-	filePath := strings.Replace(oq.filePath, ".jsonl", fmt.Sprintf("_%s.jsonl", timestamp), 1)
-
-	// Try to write to file
-	file, err := openFileAppend(filePath)
-	if err != nil {
-		Say("[output-file] Failed to open %s: %v\n", filePath, err)
-		return
-	}
-	defer file.Close()
-
-	// Write payload as JSONL (one JSON object per line). Success is not logged:
-	// one line per write is the same noise as the old per-send webhook log.
-	if _, err := io.WriteString(file, payload+"\n"); err != nil {
-		Say("[output-file] Failed to write to %s: %v\n", filePath, err)
-		return
-	}
-}
-
-// openFileAppend opens a file for appending, creating it if needed
-func openFileAppend(filePath string) (*os.File, error) {
-	return os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 }

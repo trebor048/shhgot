@@ -8,7 +8,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1179,15 +1178,6 @@ func TestPushRejectsAnOversizedBody(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d for a %d-byte body, want 400", rec.Code, len(big))
 	}
-}
-
-func mustURL(t *testing.T, raw string) *url.URL {
-	t.Helper()
-	u, err := url.Parse(raw)
-	if err != nil {
-		t.Fatalf("parse %s: %v", raw, err)
-	}
-	return u
 }
 
 func TestReconcileInterruptedReviews(t *testing.T) {

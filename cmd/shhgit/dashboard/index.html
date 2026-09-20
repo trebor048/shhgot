@@ -678,12 +678,10 @@ return html;
 function regexCard(){
 if(!regexStats)return '';
 var r=regexStats;
-var rate=(typeof r.cache_hit_rate==='number')?r.cache_hit_rate.toFixed(1):'0.0';
 var html='<div class="act-sec"><span class="live-dot"></span> Regex engine</div>';
 html+='<div class="act-grid">';
-html+='<div class="act-stat"><div class="n">'+esc(rate)+'%</div><div class="l">Cache hit rate</div></div>';
 html+='<div class="act-stat"><div class="n">'+(r.patterns_compiled||0)+'</div><div class="l">Patterns compiled</div></div>';
-html+='<div class="act-stat"><div class="n">'+(r.cache_size||0)+' / '+(r.cache_max||0)+'</div><div class="l">Cache usage</div></div>';
+html+='<div class="act-stat"><div class="n">'+(r.patterns_total||0)+'</div><div class="l">Patterns loaded</div></div>';
 html+='<div class="act-stat"><div class="n">'+(r.max_workers||0)+'</div><div class="l">Workers</div></div>';
 html+='</div>';
 return html;

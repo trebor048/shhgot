@@ -30,17 +30,6 @@ var LogColors = map[int]*color.Color{
 	DEBUG:     color.New(color.Faint),
 }
 
-// HexToRGB converts hex color to RGB values
-func HexToRGB(hex string) (uint8, uint8, uint8) {
-	hex = strings.TrimPrefix(hex, "#")
-	if len(hex) != 6 {
-		return 255, 255, 255
-	}
-	var r, g, b uint8
-	fmt.Sscanf(hex, "%02x%02x%02x", &r, &g, &b)
-	return r, g, b
-}
-
 // GetColorFromHex creates a color.Color from hex string
 func GetColorFromHex(hex string) *color.Color {
 	// Use a simple approach - map common colors to ANSI codes
@@ -235,11 +224,6 @@ func (l *Logger) LogWithColor(hexColor string, format string, args ...interface{
 	} else {
 		fmt.Print(line)
 	}
-}
-
-// RecordRateLimit increments the rate-limited token counter (for progress display).
-func (l *Logger) RecordRateLimit() {
-	l.RateLimited.Add(1)
 }
 
 func (l *Logger) Fatal(format string, args ...interface{}) {

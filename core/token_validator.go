@@ -160,13 +160,6 @@ func NewTokenValidator(logger *Logger) *TokenValidator {
 	}
 }
 
-// SetRateLimit adjusts the delay between requests
-func (tv *TokenValidator) SetRateLimit(interval time.Duration) {
-	tv.rateLimitMutex.Lock()
-	defer tv.rateLimitMutex.Unlock()
-	tv.minInterval = interval
-}
-
 // waitForRateLimit prevents API bans
 func (tv *TokenValidator) waitForRateLimit() {
 	tv.rateLimitMutex.Lock()
@@ -1023,42 +1016,6 @@ func (tv *TokenValidator) ValidateHuggingFaceToken(token string) (bool, string, 
 		return true, ProviderHuggingFace, "Valid HuggingFace Token"
 	}
 	return false, ProviderHuggingFace, fmt.Sprintf("Invalid (%d)", resp.StatusCode)
-}
-
-// ValidateGroqToken validates Groq
-func (tv *TokenValidator) ValidateGroqToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
-	req, _ := http.NewRequest("GET", "https://api.groq.com/openai/v1/models", nil)
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-
-	resp, err := tv.httpClient.Do(req)
-	if err != nil {
-		return false, ProviderGroq, fmt.Sprintf("Net Err: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		return true, ProviderGroq, "Valid Groq Token"
-	}
-	return false, ProviderGroq, fmt.Sprintf("Invalid (%d)", resp.StatusCode)
-}
-
-// ValidatePerplexityToken validates Perplexity
-func (tv *TokenValidator) ValidatePerplexityToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
-	req, _ := http.NewRequest("GET", "https://api.perplexity.ai/models", nil)
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-
-	resp, err := tv.httpClient.Do(req)
-	if err != nil {
-		return false, ProviderPerplexity, fmt.Sprintf("Net Err: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		return true, ProviderPerplexity, "Valid Perplexity Token"
-	}
-	return false, ProviderPerplexity, fmt.Sprintf("Invalid (%d)", resp.StatusCode)
 }
 
 // ValidateReplicateToken validates Replicate

@@ -329,30 +329,8 @@ var (
 
 // Pre-compiled regexes for performance (compiled once at startup)
 var (
-	githubURLRegex   = regexp.MustCompile(`https://github\.com/([^/]+)/([^/]+)`)
 	repoExtractRegex = regexp.MustCompile(`https://github\.com/([^/]+)/([^/]+?)(?:\.git)?(?:/|$)`)
 )
-
-// colorizeGitHubURL colors the username/repo portion of a GitHub URL magenta.
-func colorizeGitHubURL(url string) string {
-	matches := githubURLRegex.FindStringSubmatch(url)
-	if len(matches) == 3 {
-		return "https://github.com/" +
-			color.HiMagentaString(matches[1]) + "/" +
-			color.HiMagentaString(matches[2])
-	}
-	return url
-}
-
-// extractRepoName extracts the username/repo from a GitHub URL.
-// Thread-safe as it only works with local variables.
-func extractRepoName(url string) string {
-	matches := repoExtractRegex.FindStringSubmatch(url)
-	if len(matches) >= 3 {
-		return matches[1] + "/" + matches[2]
-	}
-	return ""
-}
 
 // terminalVTSupported records whether the console can render ANSI/OSC 8 output.
 // It is set once at scanner startup from enableVT (console_vt_*.go); it defaults
@@ -670,8 +648,6 @@ func cosmicBox(borderColor func(...interface{}) string, titleColor func(...inter
 	lockWrite(sb.String())
 }
 
-func switchLogFormat() {}
-
 func initLogFormat() {
 	f := strings.ToLower(strings.TrimSpace(getSession().Config.LogFormat))
 	setLogFormat(f)
@@ -696,9 +672,6 @@ func initLogFormat() {
 	}
 	lockWrite(sb.String())
 }
-
-// startHotkeyListener is no longer needed — bubbletea handles keyboard input via the TUI.
-func startHotkeyListener() {}
 
 // ──────────────────────────────────────────────────────────────
 //  LOG FUNCTIONS  (5 presets each)

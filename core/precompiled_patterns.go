@@ -66,27 +66,6 @@ func (pc *PatternCache) Match(patternName string, text string) bool {
 	return pattern.MatchString(text)
 }
 
-// Get retrieves a pre-compiled pattern
-func (pc *PatternCache) Get(patternName string) *regexp.Regexp {
-	pc.mu.RLock()
-	defer pc.mu.RUnlock()
-	return pc.patterns[patternName]
-}
-
-// Add dynamically adds a new pattern
-func (pc *PatternCache) Add(name string, pattern string) error {
-	compiled, err := regexp.Compile(pattern)
-	if err != nil {
-		return err
-	}
-
-	pc.mu.Lock()
-	pc.patterns[name] = compiled
-	pc.mu.Unlock()
-
-	return nil
-}
-
 // FastMatch is a convenience function for one-off matches
 func FastMatch(patternName string, text string) bool {
 	// Lazy init on first use

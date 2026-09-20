@@ -553,9 +553,6 @@ func getRegexStats(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"patterns_compiled": 0,
 			"patterns_total":    0,
-			"cache_size":        0,
-			"cache_max":         0,
-			"cache_hit_rate":    0.0,
 			"max_workers":       0,
 		})
 		return

@@ -95,14 +95,6 @@ func (a *RepoActivity) FailRepo(url string) {
 	a.afterChange()
 }
 
-// IncRateLimited bumps the rate-limited counter.
-func (a *RepoActivity) IncRateLimited() {
-	a.mu.Lock()
-	a.RateLimited++
-	a.mu.Unlock()
-	a.afterChange()
-}
-
 // ActivityItem is a single in-flight repository in the snapshot.
 type ActivityItem struct {
 	URL   string `json:"url"`
