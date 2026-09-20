@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 )
 
@@ -275,11 +276,32 @@ func redactError(err error, apiKey string) error {
 	return fmt.Errorf("%s", masked)
 }
 
-// redactString replaces every occurrence of the key with [redacted]. Keys
-// shorter than 4 characters are ignored to avoid mangling unrelated text.
+// bearerToken matches an Authorization value wherever an upstream echoes one
+// back. "Bearer" is unambiguous, so this is redacted whatever the key's length.
+var bearerToken = regexp.MustCompile(`(?i)\bbearer\s+[A-Za-z0-9._~+/=@-]+`)
+
+// redactString removes the API key and any echoed Authorization value from a
+// provider error.
+//
+// A key of four characters or more is replaced wherever it appears. A shorter one
+// is replaced only where it stands alone as a token: replacing it blindly would
+// corrupt unrelated words, but ignoring it entirely - as this used to - lets a
+// short credential through in text that is stored with the review as its error
+// and broadcast on the live feed.
 func redactString(s, apiKey string) string {
-	if len(apiKey) < 4 || !strings.Contains(s, apiKey) {
+	if s == "" {
 		return s
 	}
-	return strings.ReplaceAll(s, apiKey, "[redacted]")
+
+	out := s
+	switch {
+	case len(apiKey) >= 4:
+		out = strings.ReplaceAll(out, apiKey, "[redacted]")
+	case apiKey != "":
+		// Require a non-alphanumeric boundary on both sides, so a short key is
+		// not matched inside a longer unrelated word.
+		standalone := regexp.MustCompile(`(^|[^A-Za-z0-9])` + regexp.QuoteMeta(apiKey) + `([^A-Za-z0-9]|$)`)
+		out = standalone.ReplaceAllString(out, "${1}[redacted]${2}")
+	}
+	return bearerToken.ReplaceAllString(out, "Bearer [redacted]")
 }

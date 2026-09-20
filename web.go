@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -387,7 +388,10 @@ func receiveMatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var match Match
-	if err := json.NewDecoder(r.Body).Decode(&match); err != nil {
+	// Cap the body the same way the review and settings APIs do: this route is
+	// reachable without credentials, so an unbounded decode would let any local
+	// process - or a rebound page - grow the process's memory at will.
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBody)).Decode(&match); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -577,8 +581,7 @@ func health(w http.ResponseWriter, r *http.Request) {
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if origin := r.Header.Get("Origin"); origin != "" {
-			u, err := url.Parse(origin)
-			if err != nil || !strings.EqualFold(u.Host, r.Host) {
+			if !sameOrigin(origin, r) {
 				w.Header().Set("Vary", "Origin")
 				http.Error(w, "cross-origin requests are not allowed", http.StatusForbidden)
 				return
@@ -614,19 +617,48 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 //     applies.
 func localGuard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if webBindIsLoopback && !isLoopbackHost(r.Host) {
-			writeJSONError(w, http.StatusForbidden, "forbidden: this endpoint is local-only")
-			return
-		}
-		if origin := r.Header.Get("Origin"); origin != "" {
-			u, err := url.Parse(origin)
-			if err != nil || !strings.EqualFold(u.Host, r.Host) {
-				writeJSONError(w, http.StatusForbidden, "cross-origin request blocked")
+		if webBindIsLoopback {
+			if !isLoopbackHost(r.Host) {
+				writeJSONError(w, http.StatusForbidden, "forbidden: this endpoint is local-only")
+				return
+			}
+			// An absolute-form request line ("GET http://host/path") carries its
+			// own authority, which net/http prefers: it assigns r.Host from the
+			// URI and discards the Host header, so that header cannot steer
+			// anything. Check the URI's authority as well, or a proxy or a raw
+			// client could name a loopback Host in the header while the request
+			// is really addressed elsewhere.
+			if r.URL != nil && r.URL.Host != "" && !isLoopbackHost(r.URL.Host) {
+				writeJSONError(w, http.StatusForbidden, "forbidden: this endpoint is local-only")
 				return
 			}
 		}
+		if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r) {
+			writeJSONError(w, http.StatusForbidden, "cross-origin request blocked")
+			return
+		}
 		next(w, r)
 	}
+}
+
+// sameOrigin reports whether an Origin header names the same origin the request
+// arrived at.
+//
+// It requires a real absolute origin: a protocol-relative value ("//host") or
+// one carrying userinfo ("http://user@host") parses to a matching Host, and
+// while no browser sends either, neither is something to accept silently.
+func sameOrigin(origin string, r *http.Request) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if u.User != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
 }
 
 // webBindIsLoopback records whether the dashboard was bound to loopback, which
@@ -648,18 +680,31 @@ func normalizeWebHost(host string) string {
 
 // isLoopbackHost reports whether a Host header (optionally with a port) names
 // the local machine.
+//
+// It fails closed: anything that is not recognisably a loopback address or
+// "localhost" is rejected, including values whose host and port cannot be told
+// apart. Trimming at the last colon used to turn "127.0.0.1:evil.test" into
+// "127.0.0.1" and accept it, which matters because a fronting proxy or a raw
+// client can send any Host at all.
 func isLoopbackHost(host string) bool {
 	h := strings.TrimSpace(host)
 	if h == "" {
 		return false
 	}
-	if strings.HasPrefix(h, "[") { // [::1]:8080
-		if end := strings.Index(h, "]"); end != -1 {
-			h = h[1:end]
+
+	if hostOnly, port, err := net.SplitHostPort(h); err == nil {
+		// A bracketed IPv6 literal passes through SplitHostPort; anything else
+		// must carry a numeric port, so a rogue suffix is not mistaken for one.
+		if _, perr := strconv.Atoi(port); perr != nil {
+			return false
 		}
-	} else if i := strings.LastIndex(h, ":"); i != -1 {
-		h = h[:i]
+		h = hostOnly
+	} else if strings.Contains(h, ":") && !strings.HasPrefix(h, "[") {
+		// A colon with no usable port: not an address we should trust.
+		return false
 	}
+	h = strings.Trim(h, "[]")
+
 	if strings.EqualFold(h, "localhost") {
 		return true
 	}

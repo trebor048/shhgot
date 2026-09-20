@@ -1024,6 +1024,113 @@ func TestReviewStreamFlagsTheHistoryFrame(t *testing.T) {
 	}
 }
 
+// The guard is the only thing standing between a rebound page and every captured
+// secret, so it must fail closed on anything it cannot recognise. Trimming at the
+// last colon used to accept "127.0.0.1:evil.test", which is not an address.
+func TestIsLoopbackHostFailsClosed(t *testing.T) {
+	accept := []string{
+		"127.0.0.1",
+		"127.0.0.1:8080",
+		"localhost",
+		"localhost:8080",
+		"LocalHost:8080",
+		"[::1]",
+		"[::1]:8080",
+		"127.1.2.3:80",
+	}
+	for _, h := range accept {
+		if !isLoopbackHost(h) {
+			t.Errorf("isLoopbackHost(%q) = false, want true", h)
+		}
+	}
+
+	reject := []string{
+		"",
+		"   ",
+		"127.0.0.1:evil.test",   // the port is not a port
+		"[::1].evil.test:51427", // bracketed literal with a suffix
+		"127.0.0.1:0x50",        // sneaky port form
+		"localhost.:8080",       // a fully qualified name is not "localhost"
+		"127.0.0.1.:8080",
+		"127.0.0.1.nip.io:8080", // resolves here, but is not a loopback address
+		"0.0.0.0:8080",
+		"attacker.example",
+		"attacker.example:8080",
+		"127.1",
+		"evil.test@127.0.0.1:8080",
+	}
+	for _, h := range reject {
+		if isLoopbackHost(h) {
+			t.Errorf("isLoopbackHost(%q) = true: the guard would accept it", h)
+		}
+	}
+}
+
+// An Origin that is not a real absolute origin must not count as same-origin. No
+// browser sends these, but accepting them silently would let a proxy or a raw
+// client widen the check.
+func TestSameOriginRequiresAnAbsoluteOrigin(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/matches", nil)
+	req.Host = "127.0.0.1:8080"
+
+	for _, origin := range []string{
+		"http://127.0.0.1:8080",
+		"HTTP://127.0.0.1:8080",
+	} {
+		if !sameOrigin(origin, req) {
+			t.Errorf("sameOrigin(%q) = false, want true", origin)
+		}
+	}
+	for _, origin := range []string{
+		"//127.0.0.1:8080",                // protocol-relative
+		"http://evil.test@127.0.0.1:8080", // userinfo, which url.Parse discards
+		"ftp://127.0.0.1:8080",            // not a browser origin scheme
+		"null",                            // sandboxed document
+		"http://127.0.0.1:9999",           // different port
+		"http://localhost:8080",           // different host spelling
+		"",
+		"http://",
+	} {
+		if sameOrigin(origin, req) {
+			t.Errorf("sameOrigin(%q) = true, want false", origin)
+		}
+	}
+}
+
+// An absolute-form request line carries its own authority. Go prefers it over the
+// Host header when it fills in r.Host, so a loopback Host must not be enough.
+func TestGuardRejectsAnAbsoluteFormRequestLine(t *testing.T) {
+	prev := webBindIsLoopback
+	webBindIsLoopback = true
+	defer func() { webBindIsLoopback = prev }()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/matches", nil)
+	req.Host = "127.0.0.1:8080" // the header a proxy would forward
+	req.URL.Host = "evil.test"  // the authority the proxy actually dialled
+
+	rec := httptest.NewRecorder()
+	localGuard(getMatches).ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d for an absolute-form URI naming another host, want 403", rec.Code)
+	}
+}
+
+// /api/push needs no credentials, so an unbounded body would let any local
+// process grow the server's memory at will.
+func TestPushRejectsAnOversizedBody(t *testing.T) {
+	withReviewEnv(t)
+	ensureWebHub()
+
+	big := `{"signature":"x","secret":"y","padding":"` + strings.Repeat("A", maxJSONBody+1024) + `"}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/push", strings.NewReader(big))
+	req.Host = "127.0.0.1:8080"
+	receiveMatch(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d for a %d-byte body, want 400", rec.Code, len(big))
+	}
+}
+
 func mustURL(t *testing.T, raw string) *url.URL {
 	t.Helper()
 	u, err := url.Parse(raw)

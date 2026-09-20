@@ -438,7 +438,15 @@ paths get a plain `404`.
   `/health` and the dashboard page itself stay reachable by any hostname.
 - **Binding a routable address** (`--web-host 0.0.0.0`) disables that Host check,
   leaving only the same-origin comparison. Treat it as an explicit opt-in to
-  exposure, and only do it behind something that authenticates.
+  exposure, and only do it behind something that authenticates. **This is the
+  Docker default**, because a container cannot be reached on `127.0.0.1` from
+  outside its network namespace: even though `docker-compose.yml` publishes the
+  port on the host's loopback only, the container itself binds `0.0.0.0` and the
+  rebinding check is off. The same applies to the Cloudflare Tunnel profile. A
+  page you visit could then read your findings through `127.0.0.1:8080`, so put
+  Cloudflare Access (or any authenticating proxy) in front of either deployment.
+  Running the binary directly on the host keeps the check, which is the
+  recommended way to use the dashboard locally.
 - **The feed contains live secrets.** Treat the dashboard as a secrets console:
   do not screen-share it, do not put it on a public interface.
 
@@ -618,7 +626,11 @@ non-root user.
   shhgit prunes revoked tokens from it.
 - **Optional tunnel** — `docker compose --profile tunnel up -d` publishes the
   dashboard through Cloudflare Tunnel using `CLOUDFLARE_TUNNEL_TOKEN`. A tunnel
-  exposes it to the internet; put Cloudflare Access in front of it.
+  exposes it to the internet; put Cloudflare Access in front of it. Note that the
+  tunnel forwards its public hostname as `Host`, and that the compose file binds
+  `0.0.0.0` inside the container, so the DNS-rebinding check described under
+  [Web security notes](#web-security-notes) does not apply here — an
+  authenticating proxy is required, not optional.
 
 Plain Docker works too:
 
