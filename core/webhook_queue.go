@@ -10,7 +10,24 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/fatih/color"
 )
+
+// webhookWarnOnce makes the queue report webhook trouble at most once per run.
+// A successful delivery is never logged: one line per send would drown the
+// match feed, which is what the operator is actually watching. A failure or a
+// rate limit is worth surfacing, but only the first one.
+var webhookWarnOnce sync.Once
+
+// warnWebhookOnce prints a red one-line warning the first time it is called and
+// stays silent afterwards.
+func warnWebhookOnce(reason string) {
+	webhookWarnOnce.Do(func() {
+		red := color.New(color.FgHiRed, color.Bold).SprintFunc()
+		Say("%s %s\n", red("[webhook]"), red(reason+" - further webhook errors will be suppressed"))
+	})
+}
 
 // WebhookQueueItem represents a single webhook message to send
 type WebhookQueueItem struct {
@@ -104,8 +121,8 @@ func (wq *WebhookQueue) Enqueue(url, payload string) {
 	case wq.queue <- item:
 		// Successfully queued
 	default:
-		// Queue full, log and continue (don't block)
-		fmt.Printf("[webhook-queue] Queue full, dropping message (hash: %s)\n", hash)
+		// Queue full: warn once, then keep going (never block the scanner).
+		warnWebhookOnce("delivery queue is full, dropping messages")
 	}
 }
 
@@ -114,37 +131,37 @@ func (wq *WebhookQueue) processItem(item *WebhookQueueItem) {
 	for {
 		err := wq.sendWebhook(item.URL, item.Payload)
 		if err == nil {
-			// Mark as sent
+			// Mark as sent. Success is deliberately not logged.
 			wq.sentMutex.Lock()
 			wq.sent[item.Hash] = time.Now()
 			wq.sentMutex.Unlock()
 
 			// Clean old entries from sent map (keep memory bounded)
 			wq.cleanupSentMap()
-
-			fmt.Printf("[webhook-queue] Sent (hash: %s, size: %d bytes)\n", item.Hash, len(item.Payload))
 			return
+		}
+
+		// Rate limiting is worth calling out on its own, once.
+		if strings.Contains(err.Error(), "rate limited") {
+			warnWebhookOnce("endpoint is rate limiting deliveries")
 		}
 
 		item.RetryCount++
 		if item.RetryCount >= item.MaxRetries {
-			fmt.Printf("[webhook-queue] Failed after %d retries (hash: %s, error: %v)\n", item.MaxRetries, item.Hash, err)
+			warnWebhookOnce(fmt.Sprintf("delivery failed after %d attempts (%v)", item.MaxRetries, err))
 
 			// Write to file instead if webhook fails permanently
 			if wq.outputFileChan != nil {
 				select {
 				case wq.outputFileChan <- item.Payload:
-					fmt.Printf("[webhook-queue] Fallback: queued for file output\n")
 				default:
-					fmt.Printf("[webhook-queue] Fallback queue full\n")
 				}
 			}
 			return
 		}
 
-		// Exponential backoff before retry
+		// Exponential backoff before the silent retry.
 		backoff := time.Duration((1<<uint(item.RetryCount))*100) * time.Millisecond
-		fmt.Printf("[webhook-queue] Retry %d/%d after %v (hash: %s)\n", item.RetryCount, item.MaxRetries, backoff, item.Hash)
 		time.Sleep(backoff)
 	}
 }
@@ -313,18 +330,17 @@ func (oq *OutputFileQueue) writeToFile(payload string) {
 	// Try to write to file
 	file, err := openFileAppend(filePath)
 	if err != nil {
-		fmt.Printf("[output-file] Failed to open %s: %v\n", filePath, err)
+		Say("[output-file] Failed to open %s: %v\n", filePath, err)
 		return
 	}
 	defer file.Close()
 
-	// Write payload as JSONL (one JSON object per line)
+	// Write payload as JSONL (one JSON object per line). Success is not logged:
+	// one line per write is the same noise as the old per-send webhook log.
 	if _, err := io.WriteString(file, payload+"\n"); err != nil {
-		fmt.Printf("[output-file] Failed to write to %s: %v\n", filePath, err)
+		Say("[output-file] Failed to write to %s: %v\n", filePath, err)
 		return
 	}
-
-	fmt.Printf("[output-file] Wrote to %s (size: %d bytes)\n", filePath, len(payload))
 }
 
 // openFileAppend opens a file for appending, creating it if needed

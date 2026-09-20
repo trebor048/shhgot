@@ -366,8 +366,13 @@ func (kv *KeyValidator) ScanDirectoryForKeys(dir string, session *Session) []Val
 	foundKeys := make(map[string]bool)
 
 	for _, file := range files {
+		// Contents are loaded lazily, so the field is nil until GetContents runs. This
+		// loop read the raw field, which is why --scan-keys always reported "0 keys
+		// found" and wrote an empty log. One load per file also lets every pattern
+		// reuse the same buffer instead of re-reading the file.
+		contents := string(file.GetContents())
 		for provider, pattern := range keyPatterns {
-			matches := pattern.FindAllString(string(file.Contents), -1)
+			matches := pattern.FindAllString(contents, -1)
 			for _, match := range matches {
 				if !foundKeys[match] {
 					foundKeys[match] = true

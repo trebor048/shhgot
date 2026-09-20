@@ -69,7 +69,32 @@ var (
 	ErrUnknownProvider = errors.New("unknown AI provider")
 	ErrNoAPIKey        = errors.New("API key is required for this provider")
 	ErrBadConfig       = errors.New("incomplete AI configuration")
+	// ErrEmptyResponse is returned when the endpoint answered 200 but carried no
+	// completion at all: an HTML error page from a proxy, an error object sent with a
+	// 200 status, or an empty body. Without this, such a response looked like a
+	// successful call that happened to produce no text, so a review was stored as
+	// finished and empty with no error to explain it.
+	ErrEmptyResponse = errors.New("the provider returned no content")
+	// ErrStreamTruncated is returned when a stream delivered text and then ended
+	// without the completion marker the protocol defines (SSE "[DONE]" or a chunk
+	// carrying a finish reason; "done":true for Ollama). The text is real but
+	// incomplete, and presenting it as a finished answer - which is what happened
+	// before - hides a dropped connection or a gateway that cut the response short.
+	ErrStreamTruncated = errors.New("the response stream ended before the model finished")
 )
+
+// streamVerdict decides what it means when a response stream ended: nothing to
+// report when the protocol's completion marker was seen, "empty" when no text ever
+// arrived, and "truncated" when text arrived but the marker never did.
+func streamVerdict(name string, sawDelta, sawCompletion bool) error {
+	if sawCompletion {
+		return nil
+	}
+	if !sawDelta {
+		return fmt.Errorf("%s: %w", name, ErrEmptyResponse)
+	}
+	return fmt.Errorf("%s: %w", name, ErrStreamTruncated)
+}
 
 // Provider ids, used verbatim in error messages, persisted settings and as the
 // Client name.

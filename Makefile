@@ -15,7 +15,7 @@ GOFLAGS  := CGO_ENABLED=0
 
 .DEFAULT_GOAL := help
 .PHONY: help build build-all test test-race vet fmt fmt-check tidy clean \
-        run run-web run-tui run-scanner scan test-tokens \
+        run run-web run-tui run-terminal run-scanner scan test-tokens \
         docker-build docker-up docker-down docker-logs
 
 help: ## Show this help
@@ -77,10 +77,13 @@ run: run-web ## Alias for run-web
 run-web: ## Run the web dashboard on 127.0.0.1:8080
 	./$(BINARY)$(GOEXE) --web --web-host 127.0.0.1 --web-port 8080 --config-path .
 
-run-tui: ## Run the terminal UI (same as running with no flags)
+run-tui: ## Run the interactive full-screen terminal UI
 	./$(BINARY)$(GOEXE) --tui --config-path .
 
-run-scanner: ## Run scanner-only mode (no UI)
+run-terminal: ## Run the plain terminal live match feed (the default)
+	./$(BINARY)$(GOEXE) --terminal --config-path .
+
+run-scanner: ## Run scanner-only mode (alias for the terminal live match feed)
 	./$(BINARY)$(GOEXE) --scanner --config-path .
 
 scan: ## Scan a local directory, e.g. make scan DIR=/path/to/code

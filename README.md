@@ -151,7 +151,7 @@ written first — so a dead token is never retried.
 **3. Run it**
 
 ```bash
-./shhgit                 # terminal UI
+./shhgit                 # live match feed (default)
 ./shhgit --web           # web dashboard on http://127.0.0.1:8080
 ./shhgit --local ./code  # scan a directory, no token required
 ```
@@ -167,14 +167,31 @@ running from elsewhere, e.g. `./shhgit --config-path /etc/shhgit`.
 
 ## Running shhgit
 
-### Terminal UI (default)
+### Terminal live match feed (default)
 
 ```bash
 ./shhgit
+./shhgit --terminal      # explicit alias
+./shhgit --scanner       # explicit alias, documented for CI/systemd use
 ```
 
 Matches stream in, colour-coded by priority. The visual style comes from
-`logFormat` in `config.yaml` — see [Log styles](#log-styles).
+`logFormat` in `config.yaml` — see [Log styles](#log-styles). The process runs in
+the foreground and exits `1` when a scan finds something, `0` when it is clean,
+which is what CI jobs rely on.
+
+### Interactive terminal UI
+
+```bash
+./shhgit --tui
+```
+
+A full-screen UI with Findings, Tokens, Logs and Help tabs (`?` for keys, `q` to
+quit). The scanner runs alongside it and streams findings and logs into the UI,
+so nothing is written over the live frame. If the terminal cannot support the UI
+— stdout or stdin is not a TTY, `TERM=dumb`, or the window is smaller than
+60x15 — `--tui` prints a notice and falls back to the plain live match feed
+instead of emitting escape sequences into a pipe or file.
 
 ### Web dashboard
 
@@ -197,8 +214,10 @@ start. Your browser opens automatically.
 ./shhgit --scanner
 ```
 
-No UI at all — for systemd units, containers, or CI where you only want webhook
-alerts and log files.
+`--scanner` is an explicit alias for the default terminal mode — there is no UI
+beyond the live match feed on stdout. It is kept because it has always been
+documented, and reads better in systemd units, containers and CI where you only
+want webhook alerts and log files.
 
 ### Scanning local code
 
@@ -227,8 +246,9 @@ Tests the Claude/OpenAI tokens in `config.yaml` and writes the valid ones to
 | Flag | Default | Description |
 |---|---|---|
 | `--web` | off | Run the web dashboard mode. |
-| `--tui`, `--terminal` | on | Run the terminal UI mode (the default). |
-| `--scanner` | off | Run the scanner with no UI. |
+| `--tui` | off | Run the interactive full-screen terminal UI. |
+| `--terminal` | on | Plain terminal live match feed (the default). |
+| `--scanner` | on | Alias for `--terminal`. |
 | `--web-port` | `8080` | Dashboard port. |
 | `--web-host` | `127.0.0.1` | Dashboard bind address. |
 | `-threads` | `0` (one per logical CPU) | Concurrent worker count, capped by the `max_*_threads` keys below. |
@@ -251,6 +271,13 @@ Tests the Claude/OpenAI tokens in `config.yaml` and writes the valid ones to
 | `--scan-keys` | – | Scan a directory for API keys and validate them. |
 
 Both `-flag` and `--flag` forms work.
+
+Mode flags are resolved **last one wins**: `--web --tui` runs the interactive
+terminal UI, `--tui --web` runs the web dashboard, and a later `--terminal` or
+`--scanner` switches back to the plain live match feed. `--web-port` and
+`--web-host` only set the dashboard address; on their own they never select a
+mode. A value flag written without a value (`--web-port --tui`) is ignored and
+does not consume the flag that follows it.
 
 ---
 
@@ -292,10 +319,17 @@ signatures:
     priority: 3                      # 3 = critical, 2 = high, 1 = medium, 0 = info
     color: '#d53d46'
     exclude_in_modes: ['local']      # optional: skip this rule in these modes
+    not_regex: 'example|test'        # optional: discard a candidate matching this
 ```
 
 Adding your own is just another list entry: the dashboard's priority filters and
 the priority colouring pick it up automatically.
+
+Patterns are Go (RE2) regular expressions, which have no lookarounds: a rule
+needing "match X unless it looks like Y" puts the broad pattern in `regex`
+and the false-positive guard in `not_regex` (tested against each matched
+string, or the path for path rules). A rule whose `regex` does not compile is
+skipped at startup with a warning, so check the log if a rule never fires.
 
 ### Performance keys
 

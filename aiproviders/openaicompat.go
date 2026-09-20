@@ -65,6 +65,10 @@ type chatStreamChunk struct {
 		Delta struct {
 			Content *string `json:"content"`
 		} `json:"delta"`
+		// FinishReason is set by OpenAI-compatible endpoints on the final chunk
+		// ("stop", "length", ...) and is a valid end of stream even when the
+		// endpoint does not send the "[DONE]" sentinel.
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 }
 
@@ -144,6 +148,8 @@ func (c *openAICompatClient) Stream(ctx context.Context, msgs []Message, onDelta
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxStreamLine)
 
+	sawDelta := false
+	sawCompletion := false
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -163,12 +169,18 @@ func (c *openAICompatClient) Stream(ctx context.Context, msgs []Message, onDelta
 			continue
 		}
 		if payload == "[DONE]" {
+			sawCompletion = true
 			return nil
 		}
 
 		var chunk chatStreamChunk
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			return fmt.Errorf("%s: decode stream chunk: %w (data: %s)", c.name, err, snippet([]byte(payload)))
+		}
+		if len(chunk.Choices) > 0 && chunk.Choices[0].FinishReason != "" {
+			// A non-empty finish reason ("stop", "length", ...) is a valid end of
+			// stream for endpoints that do not send the "[DONE]" sentinel.
+			sawCompletion = true
 		}
 		if len(chunk.Choices) == 0 || chunk.Choices[0].Delta.Content == nil {
 			continue
@@ -177,6 +189,7 @@ func (c *openAICompatClient) Stream(ctx context.Context, msgs []Message, onDelta
 		if delta == "" {
 			continue
 		}
+		sawDelta = true
 		if onDelta != nil {
 			if err := onDelta(delta); err != nil {
 				return err
@@ -189,7 +202,14 @@ func (c *openAICompatClient) Stream(ctx context.Context, msgs []Message, onDelta
 		}
 		return fmt.Errorf("%s: read stream: %w", c.name, err)
 	}
-	return ctx.Err()
+	if cerr := ctx.Err(); cerr != nil {
+		return cerr
+	}
+	// The stream ended on its own. Without a completion marker the answer we just
+	// handed the caller is a fragment - an HTML error page from a proxy carries no
+	// text at all, a dropped connection carries half a sentence - and reporting that
+	// as a finished review is what let a truncated assessment look complete.
+	return streamVerdict(c.name, sawDelta, sawCompletion)
 }
 
 // post sends one JSON request to {base}/{path}. The Authorization header is

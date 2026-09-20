@@ -117,6 +117,12 @@ type ConfigSignature struct {
 	Priority       int      `yaml:"priority,omitempty"`
 	Color          string   `yaml:"color,omitempty"`
 	ExcludeInModes []string `yaml:"exclude_in_modes,omitempty"`
+	// NotRegex is an optional RE2 guard tested against each candidate match
+	// (the matched text for contents rules, the path string for path rules).
+	// A hit discards that candidate. It replaces PCRE negative lookaheads
+	// ((?!...)), which Go's RE2 engine cannot compile: put the broad pattern
+	// in Regex and the false-positive guard here.
+	NotRegex string `yaml:"not_regex,omitempty"`
 }
 
 func ParseConfig(options *Options) (*Config, error) {

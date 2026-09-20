@@ -21,6 +21,7 @@ type ollamaClient struct {
 	name    string
 	baseURL string
 	model   string
+	apiKey  string
 	http    *http.Client
 	// streamHTTP has no total timeout; a local model generating a long
 	// assessment must be bounded by the caller's context, not by the 60s
@@ -33,6 +34,7 @@ func newOllamaClient(s Settings) *ollamaClient {
 		name:       s.Provider,
 		baseURL:    s.BaseURL,
 		model:      s.Model,
+		apiKey:     s.APIKey,
 		http:       &http.Client{Timeout: chatTimeout},
 		streamHTTP: streamHTTPClient,
 	}
@@ -137,6 +139,8 @@ func (c *ollamaClient) Stream(ctx context.Context, msgs []Message, onDelta func(
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxStreamLine)
 
+	sawDelta := false
+	sawCompletion := false
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -154,12 +158,16 @@ func (c *ollamaClient) Stream(ctx context.Context, msgs []Message, onDelta func(
 		if chunk.Error != "" {
 			return fmt.Errorf("%s: %s", c.name, chunk.Error)
 		}
-		if chunk.Message.Content != "" && onDelta != nil {
-			if err := onDelta(chunk.Message.Content); err != nil {
-				return err
+		if chunk.Message.Content != "" {
+			sawDelta = true
+			if onDelta != nil {
+				if err := onDelta(chunk.Message.Content); err != nil {
+					return err
+				}
 			}
 		}
 		if chunk.Done {
+			sawCompletion = true
 			return nil
 		}
 	}
@@ -169,12 +177,20 @@ func (c *ollamaClient) Stream(ctx context.Context, msgs []Message, onDelta func(
 		}
 		return fmt.Errorf("%s: read stream: %w", c.name, err)
 	}
-	return ctx.Err()
+	if cerr := ctx.Err(); cerr != nil {
+		return cerr
+	}
+	// Ollama marks the end of a stream with "done":true. A stream that stops without
+	// it was cut short, and the caller must not treat the text as a finished answer.
+	return streamVerdict(c.name, sawDelta, sawCompletion)
 }
 
 // post sends one JSON request to {base}/{path}. Ollama's native API takes no
-// credentials, so no Authorization header is ever sent. hc selects the timeout
-// policy: c.http for a bounded Chat call, c.streamHTTP for a stream whose
+// credentials and needs none for a direct connection; when a key is configured it is
+// still sent, because the same base URL is often an authenticated proxy in front of
+// Ollama and the dashboard reports api_key_set for it - a key that is displayed as
+// configured but never put on the wire is worse than one that is rejected. hc selects
+// the timeout policy: c.http for a bounded Chat call, c.streamHTTP for a stream whose
 // budget is the caller's context.
 func (c *ollamaClient) post(ctx context.Context, path string, body []byte, hc *http.Client) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL(c.baseURL, path), bytes.NewReader(body))
@@ -183,6 +199,9 @@ func (c *ollamaClient) post(ctx context.Context, path string, body []byte, hc *h
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/x-ndjson, application/json")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 
 	resp, err := hc.Do(req)
 	if err != nil {

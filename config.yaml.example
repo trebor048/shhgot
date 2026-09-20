@@ -26,6 +26,7 @@ performance:
   max_file_count: 10000            # files processed per repository before skipping
 
 logFormat: "fancy"                 # minimal | fancy | ultra fancy | even more fancy | neon
+                                   # minimal prints exactly one line per finding (for CI); the rest add styling.
 
 # ---------------------------------------------------------------------------
 # AI security review
@@ -309,6 +310,13 @@ blacklisted_paths: ["node_modules{sep}", "vendor{sep}"]
 blacklisted_entropy_extensions: [".pem", "id_rsa", ".asc", ".ovpn", ".sqlite", ".log"]
 
 signatures:
+  # Patterns are Go (RE2) regexes: no lookarounds or backreferences. A rule
+  # that should ignore placeholders uses not_regex for the guard, tested
+  # against each matched string (or the path for path rules):
+  #   - part: 'contents'
+  #     regex: '\bpassword\s*[:=]\s*["'\''][^"\'']{8,}["'\'']'
+  #     not_regex: '["'\''](?:test|example|changeme)'
+  #     name: 'Hardcoded Password'
   # PRIORITY 3 - CRITICAL - AI/ML API Keys
   - part: 'contents'
     regex: 'sk-[a-zA-Z0-9]{48}'
@@ -1084,12 +1092,12 @@ signatures:
     priority: 2
     color: '#F6851B'
   - part: 'contents'
-    regex: '0x[A-Fa-f0-9]{64}(?=\s|$|[,;:\)])'
+    regex: '0x[A-Fa-f0-9]{64}'
     name: 'Ethereum Private Key (Standalone)'
     priority: 3
     color: '#FF0000'
   - part: 'contents'
-    regex: '0x[A-Fa-f0-9]{40}(?=\s|$|[,;:\)])'
+    regex: '0x[A-Fa-f0-9]{40}'
     name: 'Ethereum Address (Standalone)'
     priority: 2
     color: '#F6851B'
@@ -1104,7 +1112,7 @@ signatures:
     priority: 3
     color: '#F7931A'
   - part: 'contents'
-    regex: '\b(abandon|ability|able|about|above|absent|absorb|abstract|absurd|abuse|access|accident|account|accuse|achieve|acid|acoustic|acquire|across|act|action|actor|actress|actual|adapt|add|addict|address|adjust|admit|adult|advance|advice|aerobic|affair|afford|afraid|again|age|agent|agree|ahead|aim|air|airport|aisle|alarm|album|alcohol|alert|alien|all|alley|allow|almost|alone|alpha|already|also|alter|always|amateur|amazing|among|amount|amused|analyst|anchor|ancient|anger|angle|angry|animal|ankle|announce|annual|another|answer|antenna|antique|anxiety|any|apart|apology|appear|apple|approve|april|arch|arctic|area|arena|argue|arm|armed|armor|army|around|arrange|arrest|arrive|arrow|art|artefact|artist|artwork|ask|aspect|assault|asset|assist|assume|asthma|athlete|atom|attack|attend|attitude|attract|auction|audit|august|aunt|author|auto|autumn|average|avocado|avoid|awake|aware|away|awesome|awful|awkward|axis|baby|bachelor|bacon|badge|bag|balance|balcony|ball|bamboo|banana|banner|bar|barely|bargain|barrel|base|basic|basket|battle|beach|bean|beauty|because|become|beef|before|begin|behave|behind|believe|below|belt|bench|benefit|best|betray|better|between|beyond|bicycle|bid|bike|bind|biology|bird|birth|bitter|black|blade|blame|blanket|blast|bleak|bless|blind|blood|blossom|blouse|blue|blur|blush|board|boat|body|boil|bomb|bone|bonus|book|boost|border|boring|borrow|boss|bottom|bounce|box|boy|bracket|brain|brand|brass|brave|bread|breeze|brick|bridge|brief|bright|bring|brisk|broccoli|broken|bronze|broom|brother|brown|brush|bubble|buddy|budget|buffalo|build|bulb|bulk|bullet|bundle|bunker|burden|burger|burst|bus|business|busy|butter|buyer|buzz)(\s+\1){11}\b'
+    regex: '\b(?:abandon|ability|able|about|above|absent|absorb|abstract|absurd|abuse|access|accident|account|accuse|achieve|acid|acoustic|acquire|across|act|action|actor|actress|actual|adapt|add|addict|address|adjust|admit|adult|advance|advice|aerobic|affair|afford|afraid|again|age|agent|agree|ahead|aim|air|airport|aisle|alarm|album|alcohol|alert|alien|all|alley|allow|almost|alone|alpha|already|also|alter|always|amateur|amazing|among|amount|amused|analyst|anchor|ancient|anger|angle|angry|animal|ankle|announce|annual|another|answer|antenna|antique|anxiety|any|apart|apology|appear|apple|approve|april|arch|arctic|area|arena|argue|arm|armed|armor|army|around|arrange|arrest|arrive|arrow|art|artefact|artist|artwork|ask|aspect|assault|asset|assist|assume|asthma|athlete|atom|attack|attend|attitude|attract|auction|audit|august|aunt|author|auto|autumn|average|avocado|avoid|awake|aware|away|awesome|awful|awkward|axis|baby|bachelor|bacon|badge|bag|balance|balcony|ball|bamboo|banana|banner|bar|barely|bargain|barrel|base|basic|basket|battle|beach|bean|beauty|because|become|beef|before|begin|behave|behind|believe|below|belt|bench|benefit|best|betray|better|between|beyond|bicycle|bid|bike|bind|biology|bird|birth|bitter|black|blade|blame|blanket|blast|bleak|bless|blind|blood|blossom|blouse|blue|blur|blush|board|boat|body|boil|bomb|bone|bonus|book|boost|border|boring|borrow|boss|bottom|bounce|box|boy|bracket|brain|brand|brass|brave|bread|breeze|brick|bridge|brief|bright|bring|brisk|broccoli|broken|bronze|broom|brother|brown|brush|bubble|buddy|budget|buffalo|build|bulb|bulk|bullet|bundle|bunker|burden|burger|burst|bus|business|busy|butter|buyer|buzz)(?:\s+(?:abandon|ability|able|about|above|absent|absorb|abstract|absurd|abuse|access|accident|account|accuse|achieve|acid|acoustic|acquire|across|act|action|actor|actress|actual|adapt|add|addict|address|adjust|admit|adult|advance|advice|aerobic|affair|afford|afraid|again|age|agent|agree|ahead|aim|air|airport|aisle|alarm|album|alcohol|alert|alien|all|alley|allow|almost|alone|alpha|already|also|alter|always|amateur|amazing|among|amount|amused|analyst|anchor|ancient|anger|angle|angry|animal|ankle|announce|annual|another|answer|antenna|antique|anxiety|any|apart|apology|appear|apple|approve|april|arch|arctic|area|arena|argue|arm|armed|armor|army|around|arrange|arrest|arrive|arrow|art|artefact|artist|artwork|ask|aspect|assault|asset|assist|assume|asthma|athlete|atom|attack|attend|attitude|attract|auction|audit|august|aunt|author|auto|autumn|average|avocado|avoid|awake|aware|away|awesome|awful|awkward|axis|baby|bachelor|bacon|badge|bag|balance|balcony|ball|bamboo|banana|banner|bar|barely|bargain|barrel|base|basic|basket|battle|beach|bean|beauty|because|become|beef|before|begin|behave|behind|believe|below|belt|bench|benefit|best|betray|better|between|beyond|bicycle|bid|bike|bind|biology|bird|birth|bitter|black|blade|blame|blanket|blast|bleak|bless|blind|blood|blossom|blouse|blue|blur|blush|board|boat|body|boil|bomb|bone|bonus|book|boost|border|boring|borrow|boss|bottom|bounce|box|boy|bracket|brain|brand|brass|brave|bread|breeze|brick|bridge|brief|bright|bring|brisk|broccoli|broken|bronze|broom|brother|brown|brush|bubble|buddy|budget|buffalo|build|bulb|bulk|bullet|bundle|bunker|burden|burger|burst|bus|business|busy|butter|buyer|buzz)){11}\b'
     name: 'BIP39 Mnemonic (12 words from wordlist)'
     priority: 3
     color: '#F7931A'
@@ -1474,17 +1482,17 @@ signatures:
 
   # Additional AI Provider Keys & Comprehensive API Key Patterns
   - part: 'contents'
-    regex: 'sk-[a-f0-9]{32}(?![a-f0-9])'
+    regex: 'sk-[a-f0-9]{32}'
     name: 'Qwen / Deepseek API Key (32-char hex)'
     priority: 3
     color: '#d53d46'
   - part: 'contents'
-    regex: 'sk-[A-Za-z0-9]{48}(?![A-Za-z0-9])'
+    regex: 'sk-[A-Za-z0-9]{48}'
     name: 'Moonshot / SiliconFlow / Generic sk- API Key (48-char)'
     priority: 3
     color: '#d53d46'
   - part: 'contents'
-    regex: 'sk-[a-f0-9]{64}(?![a-f0-9])'
+    regex: 'sk-[a-f0-9]{64}'
     name: 'Claude Alternative / Long Hex sk- API Key (64-char)'
     priority: 3
     color: '#d53d46'

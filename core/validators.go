@@ -137,20 +137,20 @@ func ValidateTelegramToken(token string) bool {
 // ValidateDiscordWebhook validates a Discord webhook URL
 func ValidateDiscordWebhook(webhookURL string) bool {
 	if webhookURL == "" {
-		fmt.Printf("[WARN] Discord webhook URL is empty\n")
+		Say("[WARN] Discord webhook URL is empty\n")
 		return false
 	}
 
 	// Discord webhook URL pattern: https://discord.com/api/webhooks/ID/TOKEN
 	if !strings.HasPrefix(webhookURL, "https://discord.com/api/webhooks/") {
-		fmt.Printf("[ERROR] Invalid Discord webhook URL format. Expected: https://discord.com/api/webhooks/ID/TOKEN\n")
+		Say("[ERROR] Invalid Discord webhook URL format. Expected: https://discord.com/api/webhooks/ID/TOKEN\n")
 		return false
 	}
 
 	// Extract webhook ID and token
 	parts := strings.Split(strings.TrimPrefix(webhookURL, "https://discord.com/api/webhooks/"), "/")
 	if len(parts) < 2 {
-		fmt.Printf("[ERROR] Discord webhook URL missing ID or token\n")
+		Say("[ERROR] Discord webhook URL missing ID or token\n")
 		return false
 	}
 
@@ -158,7 +158,7 @@ func ValidateDiscordWebhook(webhookURL string) bool {
 	webhookID := parts[0]
 	for _, char := range webhookID {
 		if char < '0' || char > '9' {
-			fmt.Printf("[ERROR] Discord webhook ID must be numeric\n")
+			Say("[ERROR] Discord webhook ID must be numeric\n")
 			return false
 		}
 	}
@@ -176,46 +176,46 @@ func ValidateDiscordWebhook(webhookURL string) bool {
 
 	jsonData, err := json.Marshal(testPayload)
 	if err != nil {
-		fmt.Printf("[ERROR] Failed to marshal validation payload: %v\n", err)
+		Say("[ERROR] Failed to marshal validation payload: %v\n", err)
 		return false
 	}
 
 	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(string(jsonData)))
 	if err != nil {
-		fmt.Printf("[ERROR] Discord webhook POST failed: %v\n", err)
+		Say("[ERROR] Discord webhook POST failed: %v\n", err)
 		return false
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 204 || resp.StatusCode == 200 {
-		fmt.Printf("[✓] Discord webhook is valid and has proper permissions\n")
+		Say("[✓] Discord webhook is valid and has proper permissions\n")
 		return true
 	}
 
 	body, _ := io.ReadAll(resp.Body)
-	fmt.Printf("[ERROR] Discord webhook validation failed:\n")
-	fmt.Printf("  HTTP Status: %d\n", resp.StatusCode)
-	fmt.Printf("  Response: %s\n", string(body))
+	Say("[ERROR] Discord webhook validation failed:\n")
+	Say("  HTTP Status: %d\n", resp.StatusCode)
+	Say("  Response: %s\n", string(body))
 
 	switch resp.StatusCode {
 	case 401, 403:
-		fmt.Printf("  → Permission denied. Check webhook has 'Send Messages' permission in Discord channel.\n")
+		Say("  → Permission denied. Check webhook has 'Send Messages' permission in Discord channel.\n")
 		return false
 	case 404:
-		fmt.Printf("  → Webhook not found. Verify the webhook URL is correct and hasn't been deleted.\n")
+		Say("  → Webhook not found. Verify the webhook URL is correct and hasn't been deleted.\n")
 		return false
 	case 429:
 		// Rate limited - Discord is temporarily blocking us
 		// The webhook is valid, just can't test it right now
 		// The webhook queue will handle retries with backoff
-		fmt.Printf("  → Rate limited (429). Assuming webhook is valid.\n")
-		fmt.Printf("  → The webhook queue system will retry with exponential backoff.\n")
+		Say("  → Rate limited (429). Assuming webhook is valid.\n")
+		Say("  → The webhook queue system will retry with exponential backoff.\n")
 		return true // Consider valid since it's a transient rate limit, not a permission error
 	case 400:
-		fmt.Printf("  → Bad request. The webhook payload may be invalid.\n")
+		Say("  → Bad request. The webhook payload may be invalid.\n")
 		return false
 	default:
-		fmt.Printf("  → Unexpected status code. Check Discord API status.\n")
+		Say("  → Unexpected status code. Check Discord API status.\n")
 		return false
 	}
 }
@@ -564,14 +564,14 @@ func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, m
 
 	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(payload))
 	if err != nil {
-		fmt.Printf("[ERROR] Generic webhook POST failed: %v\n", err)
+		Say("[ERROR] Generic webhook POST failed: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		fmt.Printf("[ERROR] Generic webhook returned %d: %s\n", resp.StatusCode, string(body))
+		Say("[ERROR] Generic webhook returned %d: %s\n", resp.StatusCode, string(body))
 	}
 }
 
@@ -682,7 +682,7 @@ func sendDiscordMatchWebhook(webhookURL string, url string, signature string, fi
 
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
-		fmt.Printf("[ERROR] Failed to marshal Discord webhook payload: %v\n", err)
+		Say("[ERROR] Failed to marshal Discord webhook payload: %v\n", err)
 		return
 	}
 

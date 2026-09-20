@@ -13,6 +13,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+
+	"github.com/trebor048/shhgot/core"
 )
 
 // Match represents a detected secret match.
@@ -148,7 +151,14 @@ func storeMatchFile(id string, url string, file string, content string, secret s
 	}
 	truncated := false
 	if len(content) > maxStoreFileBytes {
-		content = content[:maxStoreFileBytes]
+		// Cut on a rune boundary: slicing at an arbitrary byte split a multi-byte
+		// character in half, and json.Marshal then replaced the fragment with
+		// U+FFFD, so the file viewer showed a stray replacement glyph at the cut.
+		cut := maxStoreFileBytes
+		for cut > 0 && !utf8.RuneStart(content[cut]) {
+			cut--
+		}
+		content = content[:cut]
 		truncated = true
 	}
 	d := &MatchFileDetail{
@@ -161,9 +171,18 @@ func storeMatchFile(id string, url string, file string, content string, secret s
 		Truncated:  truncated,
 	}
 	fileMu.Lock()
-	if _, exists := fileDetails[id]; !exists {
-		fileOrder = append(fileOrder, id)
+	// Re-storing an id must refresh its position in the eviction order, not just
+	// its content: a file captured again later was still holding its original,
+	// older slot, so it could be evicted before files that were actually seen
+	// earlier. Drop any previous occurrence and append, making this id the most
+	// recent.
+	for i, oid := range fileOrder {
+		if oid == id {
+			fileOrder = append(fileOrder[:i], fileOrder[i+1:]...)
+			break
+		}
 	}
+	fileOrder = append(fileOrder, id)
 	fileDetails[id] = d
 	for len(fileOrder) > maxFileDetails {
 		old := fileOrder[0]
@@ -386,7 +405,8 @@ func (h *WebHub) updateTopSignatures() {
 // ReceiveMatch handles POST requests with match data (external CLI push).
 func receiveMatch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", "POST")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
@@ -395,7 +415,7 @@ func receiveMatch(w http.ResponseWriter, r *http.Request) {
 	// reachable without credentials, so an unbounded decode would let any local
 	// process - or a rebound page - grow the process's memory at will.
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBody)).Decode(&match); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -510,6 +530,39 @@ func getActivity(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(activity.Snapshot())
 }
 
+// GetScanProgress returns the scanner's aggregate progress counters
+// (repositories scanned, files processed, matches found, throughput, ETA).
+//
+// This is the endpoint the dashboard's scan-progress panel polls. It exposes
+// the repository and file currently being scanned, which is why it carries the
+// same localGuard as the rest of the captured-material API.
+func getScanProgress(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(core.GlobalScanProgress.GetSnapshot())
+}
+
+// GetRegexStats returns the regex engine's cache and compilation statistics for
+// the dashboard's performance panel.
+//
+// The optimizer is created by the scanner's session, so a request that arrives
+// before it exists (or in a build that never initialises it) must answer with
+// zeroed counters rather than dereferencing a nil singleton.
+func getRegexStats(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if core.GlobalRegexOptimizer == nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"patterns_compiled": 0,
+			"patterns_total":    0,
+			"cache_size":        0,
+			"cache_max":         0,
+			"cache_hit_rate":    0.0,
+			"max_workers":       0,
+		})
+		return
+	}
+	json.NewEncoder(w).Encode(core.GlobalRegexOptimizer.Stats())
+}
+
 // eventsHandler streams live FeedEvents to the dashboard over Server-Sent
 // Events. The client reconnects automatically if the connection drops.
 func eventsHandler(w http.ResponseWriter, r *http.Request) {
@@ -541,12 +594,20 @@ func eventsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, ": connected\n\n")
 	flusher.Flush()
 
-	// Send a snapshot of the current state on connect so the UI fills in
-	// without waiting for the next event.
+	// Send a snapshot of the current state on connect. This runs on every
+	// (re)connect, so a dashboard that lost the stream - or one that connected
+	// after matches had already been found - resyncs in place instead of
+	// silently missing everything broadcast while it was away.
 	{
+		hub := ensureWebHub()
+		hub.matchesMutex.RLock()
 		snap, _ := json.Marshal(map[string]interface{}{
-			"type": "snapshot", "activity": activity.Snapshot(),
+			"type":     "snapshot",
+			"activity": activity.Snapshot(),
+			"matches":  append([]*Match(nil), hub.matches...),
+			"stats":    hub.stats.snapshot(),
 		})
+		hub.matchesMutex.RUnlock()
 		fmt.Fprintf(w, "data: %s\n\n", snap)
 		flusher.Flush()
 	}
@@ -768,6 +829,8 @@ func registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/tokens", corsMiddleware(localGuard(getTokens)))
 	mux.HandleFunc("/api/signatures", corsMiddleware(localGuard(getSignatures)))
 	mux.HandleFunc("/api/activity", corsMiddleware(localGuard(getActivity)))
+	mux.HandleFunc("/api/scan/progress", corsMiddleware(localGuard(getScanProgress)))
+	mux.HandleFunc("/api/stats/regex", corsMiddleware(localGuard(getRegexStats)))
 	mux.HandleFunc("/api/file", corsMiddleware(localGuard(getMatchFile)))
 	mux.HandleFunc("/api/events", corsMiddleware(localGuard(eventsHandler)))
 	registerReviewRoutes(mux)

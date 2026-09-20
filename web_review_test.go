@@ -662,6 +662,7 @@ func TestEverySecretRouteRejectsAReboundHost(t *testing.T) {
 		"/api/matches", "/api/file", "/api/logs", "/api/tokens",
 		"/api/stats", "/api/activity", "/api/signatures", "/api/push",
 		"/api/review", "/api/settings", "/api/settings/test",
+		"/api/scan/progress", "/api/stats/regex",
 	}
 	for _, path := range guarded {
 		rec := httptest.NewRecorder()
@@ -1466,5 +1467,109 @@ func TestInitAIReviewSurvivesAnUnusableSeed(t *testing.T) {
 	}
 	if got.Provider != "deepseek" {
 		t.Errorf("provider = %q, want the built-in default", got.Provider)
+	}
+}
+
+// A review that fails after the model has already produced text (a truncated
+// stream, say) keeps that text. The stream's terminal error frame must carry it
+// as well as the reason, or a client that missed the deltas - or connected
+// late - shows an empty pane and loses the only copy of what was generated.
+func TestReviewStreamErrorCarriesPartialAssessment(t *testing.T) {
+	withReviewEnv(t)
+
+	rev := &reviewstore.Review{Signature: "Stripe Key", Secret: "sk_live_x", Status: reviewstore.StatusRunning}
+	if err := reviewStore.Create(rev); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	job := newReviewJob()
+	job.publish("## What it is\nA Stripe key.")
+	job.finish(reviewstore.StatusFailed, "the answer was cut off")
+	reviewJobsMu.Lock()
+	reviewJobs[rev.ID] = job
+	reviewJobsMu.Unlock()
+	defer dropJob(rev.ID)
+
+	rec := httptest.NewRecorder()
+	reviewStreamHandler(rec, localRequest(http.MethodGet, "/api/review/"+rev.ID+"/stream", nil), rev.ID)
+
+	frame := errorFrameOf(t, rec.Body.String())
+	if frame == nil {
+		t.Fatal("stream produced no error frame")
+	}
+	if frame["error"] != "the answer was cut off" {
+		t.Errorf("error frame reason = %v", frame["error"])
+	}
+	if frame["assessment"] != "## What it is\nA Stripe key." {
+		t.Errorf("error frame dropped the partial assessment: %v", frame["assessment"])
+	}
+}
+
+// The same guarantee for a review whose in-flight job is already gone: a client
+// that connects after the failure must still be handed the stored partial text.
+func TestReviewStreamFailedReplayCarriesPartialAssessment(t *testing.T) {
+	withReviewEnv(t)
+
+	rev := &reviewstore.Review{Signature: "Stripe Key", Secret: "sk_live_x", Status: reviewstore.StatusQueued}
+	if err := reviewStore.Create(rev); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	rev.Status = reviewstore.StatusFailed
+	rev.Assessment = "half an assessment"
+	rev.Error = "the answer was cut off"
+	if err := reviewStore.Update(rev); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	reviewStreamHandler(rec, localRequest(http.MethodGet, "/api/review/"+rev.ID+"/stream", nil), rev.ID)
+
+	frame := errorFrameOf(t, rec.Body.String())
+	if frame == nil {
+		t.Fatal("stream produced no error frame")
+	}
+	if frame["assessment"] != "half an assessment" {
+		t.Errorf("error frame dropped the stored partial assessment: %v", frame["assessment"])
+	}
+}
+
+// errorFrameOf returns the last error frame in an SSE body, or nil.
+func errorFrameOf(t *testing.T, body string) map[string]any {
+	t.Helper()
+	var out map[string]any
+	sc := bufio.NewScanner(strings.NewReader(body))
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		var f map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &f); err != nil {
+			continue
+		}
+		if f["type"] == "error" {
+			out = f
+		}
+	}
+	return out
+}
+
+// The assessment must be exactly five sections, and the dashboard renders
+// whatever the model returns. Pin the prompt so a future edit cannot silently
+// drop one, and keep the instruction that stops the credential being echoed.
+func TestReviewPromptHasTheFiveRequiredSections(t *testing.T) {
+	for _, want := range []string{
+		"## What it is",
+		"## Impact if abused",
+		"## Exploitability",
+		"## Remediation",
+		"## Confidence and unknowns",
+	} {
+		if !strings.Contains(defaultReviewSystemPrompt, want) {
+			t.Errorf("the review prompt is missing the %q section", want)
+		}
+	}
+	if !strings.Contains(defaultReviewSystemPrompt, "Never repeat the credential") {
+		t.Error("the prompt no longer tells the model not to echo the credential")
 	}
 }

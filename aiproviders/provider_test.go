@@ -317,7 +317,11 @@ func TestStreamOpenAICompatibleSplitEventsAndEscapes(t *testing.T) {
 		flusher.Flush()
 		fmt.Fprint(w, part2)
 		flusher.Flush()
-		fmt.Fprint(w, "[DONE]")
+		// The sentinel needs its "data: " field name on the wire, exactly as a real
+		// OpenAI-compatible endpoint writes it. Sending a bare "[DONE]" meant this
+		// stub never exercised the sentinel at all: the provider skipped the line and
+		// only ever succeeded because the old code accepted an unterminated stream.
+		fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 	}))
 	defer srv.Close()
@@ -802,7 +806,39 @@ func TestStreamServerClosedWithoutDone(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
 		w.(http.Flusher).Flush()
-		// Return without sending [DONE]: EOF is a clean end of stream.
+		// Return without sending [DONE] or a finish reason: the connection simply ends.
+	}))
+	defer srv.Close()
+
+	client, err := aiproviders.New(aiproviders.Settings{Provider: "openai", APIKey: testKey, BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var got string
+	err = client.Stream(ctxT(t), []aiproviders.Message{{Role: aiproviders.RoleUser, Content: "hi"}}, func(d string) error {
+		got += d
+		return nil
+	})
+	// The text that arrived is real but the answer is not: a stream that stops without
+	// the protocol's end marker was cut short (a dropped connection, a gateway
+	// timeout). Accepting it silently is what let a half-written security assessment
+	// be stored and displayed as a finished review.
+	if !errors.Is(err, aiproviders.ErrStreamTruncated) {
+		t.Fatalf("Stream error = %v, want ErrStreamTruncated", err)
+	}
+	if got != "partial" {
+		t.Errorf("got %q, want partial: the deltas delivered before the failure must survive", got)
+	}
+}
+
+func TestStreamEndedByFinishReasonInsteadOfDone(t *testing.T) {
+	// OpenAI-compatible endpoints may close with a chunk carrying a finish reason and
+	// never send "[DONE]". That is a complete answer, not a truncated one.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"complete\"},\"finish_reason\":null}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		w.(http.Flusher).Flush()
 	}))
 	defer srv.Close()
 
@@ -817,8 +853,43 @@ func TestStreamServerClosedWithoutDone(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-	if got != "partial" {
-		t.Errorf("got %q, want partial", got)
+	if got != "complete" {
+		t.Errorf("got %q, want complete", got)
+	}
+}
+
+func TestStreamSuccessStatusWithoutAnyCompletionIsAnError(t *testing.T) {
+	// A proxy that answers 200 with an HTML error page, or an error object sent with a
+	// 200 status, must not look like a successful empty completion: the review pipeline
+	// stored that as "done" with an empty assessment and no error at all.
+	cases := map[string]struct {
+		contentType string
+		body        string
+	}{
+		"html error page": {"text/html", "<html><body>502 Bad Gateway</body></html>"},
+		"json error body": {"application/json", `{"error":{"message":"rate limited"}}`},
+		"empty body":      {"text/event-stream", ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				fmt.Fprint(w, tc.body)
+			}))
+			defer srv.Close()
+
+			client, err := aiproviders.New(aiproviders.Settings{Provider: "openai", APIKey: testKey, BaseURL: srv.URL})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			err = client.Stream(ctxT(t), []aiproviders.Message{{Role: aiproviders.RoleUser, Content: "hi"}}, func(string) error {
+				t.Errorf("no delta may be reported for a response with no completion")
+				return nil
+			})
+			if !errors.Is(err, aiproviders.ErrEmptyResponse) {
+				t.Fatalf("Stream error = %v, want ErrEmptyResponse", err)
+			}
+		})
 	}
 }
 

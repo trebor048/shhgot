@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/trebor048/shhgot/core"
+	"golang.org/x/term"
 )
 
 // ═══════════════════════════════════════════════════════════════
@@ -105,24 +108,155 @@ var outputMu sync.Mutex
 // so the dashboard can show the live scanner log stream.
 var webLogCapture bool
 
+// tuiScreenActive, when true, means the interactive terminal UI owns stdout.
+// The scanner's styled output is then diverted into the TUI Logs tab instead of
+// being printed, because anything written to stdout would land on top of the
+// live frame and corrupt it. It is only set once the UI is known to be able to
+// take over the terminal.
+var tuiScreenActive bool
+
 func lockPrintf(format string, args ...interface{}) {
 	outputMu.Lock()
-	s := fmt.Sprintf(format, args...)
-	fmt.Print(s)
-	if webLogCapture {
-		appendLogLine(s)
-	}
+	emitLocked(fmt.Sprintf(format, args...))
 	outputMu.Unlock()
 }
 
 func lockPrintln(args ...interface{}) {
 	outputMu.Lock()
-	s := fmt.Sprintln(args...)
-	fmt.Print(s)
+	emitLocked(fmt.Sprintln(args...))
+	outputMu.Unlock()
+}
+
+// carriageReturnLines rewrites s so that every line begins in column 0 by
+// putting a bare carriage return in front of it. Styled scanner output already
+// carries that guarantee (core prefixes its log lines with "\r\033[K", and the
+// block builders start at column 0), but the standard logger - used by the
+// regex optimizer and the worker pool - emits plain "\n"-terminated lines.
+// On a console left with DISABLE_NEWLINE_AUTO_RETURN set, "\n" advances the
+// cursor without returning it to column 0, so those lines would start where the
+// previous one ended and march across the screen (the staircase effect).
+// "\r" is an ordinary control character rather than an escape sequence, so it
+// is safe even on consoles that never enabled virtual-terminal processing.
+func carriageReturnLines(s string) string {
+	if s == "" {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	atLineStart := true
+	for i := 0; i < len(s); i++ {
+		if atLineStart {
+			b.WriteByte('\r')
+			atLineStart = false
+		}
+		c := s[i]
+		b.WriteByte(c)
+		if c == '\n' {
+			atLineStart = true
+		}
+	}
+	return b.String()
+}
+
+// liveTerminal reports whether writes to f reach a real terminal. Only then may
+// the output carry carriage returns; a pipe, a CI transcript or a log file must
+// stay free of control characters.
+func liveTerminal(f *os.File) bool {
+	return f != nil && term.IsTerminal(int(f.Fd()))
+}
+
+// emitLocked writes one already-formatted chunk to the current destination.
+// Callers must hold outputMu.
+func emitLocked(s string) {
+	if tuiScreenActive {
+		AddTUILog(s)
+		return
+	}
 	if webLogCapture {
 		appendLogLine(s)
 	}
+	if liveTerminal(os.Stdout) {
+		s = carriageReturnLines(s)
+	}
+	fmt.Print(s)
+}
+
+// lockWrite emits one pre-built block as a single write under the shared
+// console mutex. Every multi-line styled block (startup banner, match cards)
+// must be built with the blog* helpers below and emitted here, so background
+// worker lines can neither split it mid-line nor slip into its middle.
+// Single lines keep using lockPrintf/lockPrintln.
+func lockWrite(s string) {
+	if s == "" {
+		return
+	}
+	outputMu.Lock()
+	emitLocked(s)
 	outputMu.Unlock()
+}
+
+// blogPrintf appends formatted output to a batch builder. It never touches
+// the console, so it is safe to call while building a block.
+func blogPrintf(sb *strings.Builder, format string, args ...interface{}) {
+	fmt.Fprintf(sb, format, args...)
+}
+
+// blogPrintln appends its arguments plus a newline to a batch builder.
+func blogPrintln(sb *strings.Builder, args ...interface{}) {
+	sb.WriteString(fmt.Sprintln(args...))
+}
+
+// lockedWriter funnels the standard logger - used by core's regex optimizer
+// and worker pool - through the shared console mutex (and the same TUI/web
+// diversions as lockPrintf). Without it those timestamped lines are written
+// concurrently with styled output and split it mid-line.
+type lockedWriter struct{ toStderr bool }
+
+func (w lockedWriter) Write(p []byte) (int, error) {
+	outputMu.Lock()
+	defer outputMu.Unlock()
+	s := string(p)
+	if tuiScreenActive {
+		AddTUILog(s)
+		return len(p), nil
+	}
+	if webLogCapture {
+		appendLogLine(s)
+	}
+	dest := os.Stdout
+	if w.toStderr {
+		dest = os.Stderr
+	}
+	// The standard logger writes bare "\n"-terminated lines, so they need the
+	// same column-0 guarantee as the styled output (see carriageReturnLines).
+	if liveTerminal(dest) {
+		s = carriageReturnLines(s)
+	}
+	fmt.Fprint(dest, s)
+	return len(p), nil
+}
+
+// routeEarlyOutput serializes the session-independent background writers.
+// It needs no session, so main() calls it before anything can log.
+func routeEarlyOutput() {
+	log.SetOutput(lockedWriter{toStderr: true})
+	core.ConsoleWriter = func(format string, args ...interface{}) {
+		lockPrintf(format, args...)
+	}
+}
+
+// routeCoreLogger funnels core.Logger output through the shared console mutex
+// in plain terminal mode. Web and TUI modes install their own richer hooks
+// and must not be clobbered, so this only applies when no hook is set.
+// LogWriterIsTerminal keeps the live "\r\033[K" progress prefix exactly as if
+// no hook were installed.
+func routeCoreLogger() {
+	if l := getSession().Log; l != nil && l.LogWriter == nil {
+		l.LogWriter = func(line string) {
+			lockPrintf("%s", line)
+		}
+		l.LogWriterIsTerminal = true
+	}
 }
 
 // ── MINIMAL palette ──────────────────────────────────────────
@@ -220,12 +354,110 @@ func extractRepoName(url string) string {
 	return ""
 }
 
+// terminalVTSupported records whether the console can render ANSI/OSC 8 output.
+// It is set once at scanner startup from enableVT (console_vt_*.go); it defaults
+// to true so redirected streams and non-Windows platforms, where VT is either
+// irrelevant or always available, keep working.
+var terminalVTSupported = true
+
+// linksEnabled reports whether the terminal can be expected to render OSC 8
+// hyperlinks. When output is redirected - a pipe, a CI transcript, a log file -
+// the escape sequence would be written into the text verbatim, so links degrade to
+// their visible label instead. The same applies to a Windows console whose
+// virtual-terminal mode could not be switched on.
+func linksEnabled() bool {
+	if !terminalVTSupported {
+		return false
+	}
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("SHHGIT_NO_LINKS") != "" {
+		return false
+	}
+	return term.IsTerminal(int(os.Stdout.Fd()))
+}
+
+// formatHyperlink wraps text in an OSC 8 hyperlink sequence. It is kept separate
+// from createClickableLink so the escape sequence itself can be tested without a
+// terminal: createClickableLink is the gate that decides whether to use it.
+// OSC 8 ; params ; URL ST text OSC 8 ; ; ST, with OSC = \033] and ST = \033\\.
+func formatHyperlink(target, text string) string {
+	return fmt.Sprintf("\033]8;;%s\033\\%s\033]8;;\033\\", target, text)
+}
+
 // createClickableLink creates a terminal hyperlink with ANSI escape sequences.
 // Thread-safe as it only works with local variables.
-func createClickableLink(url, text string) string {
-	// ANSI escape sequence for hyperlink: OSC 8 ; params ; URL ST text OSC 8 ; ; ST
-	// OSC = \033] and ST = \033\\ (or \007)
-	return fmt.Sprintf("\033]8;;%s\033\\%s\033]8;;\033\\", url, text)
+func createClickableLink(target, text string) string {
+	if !linksEnabled() {
+		return text
+	}
+	return formatHyperlink(target, text)
+}
+
+// oneLine collapses a match onto a single line so a multi-line regex match (or a
+// filename with a stray newline) cannot break the one-finding-per-line layout,
+// which CI parsers rely on.
+func oneLine(s string) string {
+	replacer := strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ")
+	return replacer.Replace(s)
+}
+
+// previewMatch renders a matched value for the terminal. Very long values are
+// truncated rather than redacted: the operator needs to see what actually
+// matched, but a multi-line PEM body or a huge base64 blob must not flood the
+// log, the CI transcript or a screenshot. The head of the value is kept so the
+// finding stays identifiable.
+func previewMatch(match string) string {
+	const maxPreview = 120
+	s := oneLine(match)
+	if len(s) <= maxPreview {
+		return s
+	}
+	return fmt.Sprintf("%s... [truncated, %d chars]", s[:maxPreview], len(s))
+}
+
+// fileRef renders a finding's location as "path:line", or just the path when the
+// line is unknown (a filename/path rule matches the file itself).
+func fileRef(filePath string, line int) string {
+	if line > 0 {
+		return fmt.Sprintf("%s:%d", oneLine(filePath), line)
+	}
+	return oneLine(filePath)
+}
+
+// starSuffix renders the repository's star count in the same form for every
+// preset, or an empty string when it is unknown (local scans, gists).
+func starSuffix(stars int) string {
+	if stars > 0 {
+		return fmt.Sprintf("  ★ %d", stars)
+	}
+	return ""
+}
+
+// displayWidth returns the number of terminal cells a string occupies, counting
+// East Asian wide characters and emoji as two columns. ANSI escapes must already
+// have been stripped by the caller. It exists so the cosmic preset's box stays
+// square: padding computed from rune count drifts by one column per emoji.
+func displayWidth(s string) int {
+	w := 0
+	for _, r := range s {
+		switch {
+		case r == 0x200d, r >= 0xfe00 && r <= 0xfe0f: // ZWJ, variation selectors
+			// zero width
+		case r >= 0x1100 && (r <= 0x115f || // Hangul Jamo
+			r == 0x2329 || r == 0x232a ||
+			(r >= 0x2e80 && r <= 0xa4cf && r != 0x303f) || // CJK
+			(r >= 0xac00 && r <= 0xd7a3) || // Hangul syllables
+			(r >= 0xf900 && r <= 0xfaff) ||
+			(r >= 0xfe30 && r <= 0xfe6f) ||
+			(r >= 0xff00 && r <= 0xff60) ||
+			(r >= 0xffe0 && r <= 0xffe6) ||
+			(r >= 0x2600 && r <= 0x27bf) || // misc symbols, dingbats
+			(r >= 0x1f000 && r <= 0x1faff)): // emoji
+			w += 2
+		default:
+			w++
+		}
+	}
+	return w
 }
 
 // extractRepoInfo extracts username, repo, and creates GitHub URLs.
@@ -303,16 +535,16 @@ func isCryptoSignature(sig string) bool {
 	return false
 }
 
-// createFileLink creates a clickable link to a specific file in the repository.
-// Thread-safe as it only works with local variables.
-func createFileLink(repoUrl, filePath, branch string) string {
+// githubFileURL builds the GitHub "blob" URL for a file at a specific line. The
+// branch is normalised - a "refs/heads/" prefix is stripped and an empty branch
+// defaults to main - and the path is normalised to forward slashes, so the URL
+// always points at the file (and the exact line) rather than at the repo root.
+func githubFileURL(repoUrl, filePath, branch string, line int) string {
 	if branch == "" {
 		branch = "main" // Default to main branch
 	}
 	// Handle different branch reference formats
-	if strings.Contains(branch, "refs/heads/") {
-		branch = strings.Replace(branch, "refs/heads/", "", 1)
-	}
+	branch = strings.TrimPrefix(branch, "refs/heads/")
 
 	// Clean up the file path - remove leading slashes and convert backslashes to forward slashes
 	filePath = strings.TrimPrefix(filePath, "/")
@@ -320,16 +552,70 @@ func createFileLink(repoUrl, filePath, branch string) string {
 	filePath = strings.ReplaceAll(filePath, "\\", "/")
 
 	fileUrl := fmt.Sprintf("%s/blob/%s/%s", repoUrl, branch, filePath)
-	maskedText := fmt.Sprintf("📄 %s", filepath.Base(filePath))
-	return createClickableLink(fileUrl, maskedText)
+	if line > 0 {
+		// GitHub's own anchor for "the line this finding is on".
+		fileUrl = fmt.Sprintf("%s#L%d", fileUrl, line)
+	}
+	return fileUrl
+}
+
+// createFileLink creates a clickable link to a specific file in the repository,
+// pointing at the line of the finding when one is known.
+// Thread-safe as it only works with local variables.
+func createFileLink(repoUrl, filePath, branch string, line int) string {
+	return createClickableLink(githubFileURL(repoUrl, filePath, branch, line), fileLinkLabel(filePath, line))
+}
+
+// fileLinkLabel is the visible text of a finding's link: the file's base name plus
+// the line number. Keeping it short matters in the terminal, and "path:line" is what
+// a terminal without hyperlink support still lets you copy or ctrl-click.
+func fileLinkLabel(filePath string, line int) string {
+	name := filepath.Base(filePath)
+	if line > 0 {
+		return fmt.Sprintf("📄 %s:%d", name, line)
+	}
+	return fmt.Sprintf("📄 %s", name)
+}
+
+// localFileURL builds a file:// URL for a finding in a local scan so the terminal can
+// hand it to the desktop's file handler. The #L fragment is understood by some
+// viewers and ignored by others, which is why the visible label always carries
+// "path:line" as well.
+func localFileURL(root, filePath string, line int) string {
+	abs := filePath
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(root, filePath)
+	}
+	if a, err := filepath.Abs(abs); err == nil {
+		abs = a
+	}
+	// url.URL with a "file" scheme and no host renders as file://<path>. The path
+	// must start with exactly one slash: on Unix it already does, while a Windows
+	// drive path ("C:/Users/...") needs one prepended. Prepending unconditionally
+	// produced "file:////home/..." on Unix.
+	slashPath := filepath.ToSlash(abs)
+	if !strings.HasPrefix(slashPath, "/") {
+		slashPath = "/" + slashPath
+	}
+	u := url.URL{Scheme: "file", Path: slashPath}
+	if line > 0 {
+		u.Fragment = fmt.Sprintf("L%d", line)
+	}
+	return u.String()
 }
 
 // getEnhancedLinkInfo returns enhanced repo info with user/repo display and file links.
 // Thread-safe as it only works with local variables and calls thread-safe functions.
-func getEnhancedLinkInfo(url, filePath, branch string) (userRepo string, repoLink string, fileLink string) {
+func getEnhancedLinkInfo(url, filePath, branch string, line int) (userRepo string, repoLink string, fileLink string) {
 	username, repo, repoUrl := extractRepoInfo(url)
 	if username == "" || repo == "" {
-		// Not a GitHub URL, return as-is
+		// Not a GitHub URL - this is a local scan. The link used to be the scanned
+		// directory itself, which is useless when a scan covers thousands of files:
+		// point it at the file that actually holds the secret instead.
+		if filePath != "" {
+			link := createClickableLink(localFileURL(url, filePath, line), fileLinkLabel(filePath, line))
+			return url, url, link
+		}
 		return url, url, url
 	}
 
@@ -341,7 +627,7 @@ func getEnhancedLinkInfo(url, filePath, branch string) (userRepo string, repoLin
 
 	// Create file-specific link if filePath provided
 	if filePath != "" {
-		fileLink = createFileLink(repoUrl, filePath, branch)
+		fileLink = createFileLink(repoUrl, filePath, branch, line)
 	} else {
 		fileLink = repoLink
 	}
@@ -350,14 +636,38 @@ func getEnhancedLinkInfo(url, filePath, branch string) (userRepo string, repoLin
 }
 
 // cosmicBox renders a centered 3-line bordered box (Even More Fancy / Cosmic preset).
-func cosmicBox(borderColor func(...interface{}) string, titleColor func(...interface{}) string, title string) {
+// Padding is measured in terminal cells, not runes: the titles contain emoji, and a
+// rune-count pad drifts by one column per wide glyph, leaving the box ragged.
+// blogCosmicBox appends a centered 3-line bordered box (Even More Fancy /
+// Cosmic preset) to a batch builder. Padding is measured in terminal cells,
+// not runes: the titles contain emoji, and a rune-count pad drifts by one
+// column per wide glyph, leaving the box ragged.
+func blogCosmicBox(sb *strings.Builder, borderColor func(...interface{}) string, titleColor func(...interface{}) string, title string) {
 	const width = 62
 	bar := strings.Repeat("═", width)
-	pad := (width - len([]rune(title))) / 2
-	padded := strings.Repeat(" ", pad) + title + strings.Repeat(" ", width-pad-len([]rune(title)))
-	lockPrintln(borderColor("╔" + bar + "╗"))
-	lockPrintln(borderColor("║") + titleColor(padded) + borderColor("║"))
-	lockPrintln(borderColor("╚" + bar + "╝"))
+
+	tw := displayWidth(title)
+	if tw > width {
+		// Truncate on rune boundaries so a long title cannot burst the frame.
+		runes := []rune(title)
+		for len(runes) > 0 && displayWidth(string(runes)) > width {
+			runes = runes[:len(runes)-1]
+		}
+		title = string(runes)
+		tw = displayWidth(title)
+	}
+	pad := (width - tw) / 2
+	padded := strings.Repeat(" ", pad) + title + strings.Repeat(" ", width-pad-tw)
+	blogPrintln(sb, borderColor("╔"+bar+"╗"))
+	blogPrintln(sb, borderColor("║")+titleColor(padded)+borderColor("║"))
+	blogPrintln(sb, borderColor("╚"+bar+"╝"))
+}
+
+// cosmicBox renders a centered 3-line bordered box (Even More Fancy / Cosmic preset).
+func cosmicBox(borderColor func(...interface{}) string, titleColor func(...interface{}) string, title string) {
+	var sb strings.Builder
+	blogCosmicBox(&sb, borderColor, titleColor, title)
+	lockWrite(sb.String())
 }
 
 func switchLogFormat() {}
@@ -366,22 +676,25 @@ func initLogFormat() {
 	f := strings.ToLower(strings.TrimSpace(getSession().Config.LogFormat))
 	setLogFormat(f)
 
-	// Announce the active preset with its own style
+	// Announce the active preset with its own style, as one atomic write so
+	// background worker lines cannot slip between its lines.
+	var sb strings.Builder
 	switch getLogFormat() {
 	case LogFormatMinimal:
-		lockPrintf("%s log preset -> %s\n\n", minInfo("◆"), minSearch(strings.ToUpper(getLogFormat())))
+		blogPrintf(&sb, "%s log preset -> %s\n\n", minInfo("◆"), minSearch(strings.ToUpper(getLogFormat())))
 	case LogFormatFancy:
-		lockPrintf("%s Log styling -> %s\n\n", fancyAccent("◆"), fancySearch(strings.ToUpper(getLogFormat())))
+		blogPrintf(&sb, "%s Log styling -> %s\n\n", fancyAccent("◆"), fancySearch(strings.ToUpper(getLogFormat())))
 	case LogFormatUltraFancy:
-		lockPrintf("%s %s\n\n", ultraBadge(" PRESET "), ultraAccent(strings.ToUpper(getLogFormat())))
+		blogPrintf(&sb, "%s %s\n\n", ultraBadge(" PRESET "), ultraAccent(strings.ToUpper(getLogFormat())))
 	case LogFormatEvenMoreFancy:
-		cosmicBox(cosmicBorder, cosmicTitle, "🎨  LOG PRESET: "+strings.ToUpper(getLogFormat())+"  🎨")
-		lockPrintln()
+		blogCosmicBox(&sb, cosmicBorder, cosmicTitle, "🎨  LOG PRESET: "+strings.ToUpper(getLogFormat())+"  🎨")
+		blogPrintln(&sb)
 	case LogFormatNeon:
-		lockPrintf("%s %s\n\n",
+		blogPrintf(&sb, "%s %s\n\n",
 			neonSearchLabel(" PRESET "),
 			neonValue(strings.ToUpper(getLogFormat())))
 	}
+	lockWrite(sb.String())
 }
 
 // startHotkeyListener is no longer needed — bubbletea handles keyboard input via the TUI.
@@ -391,189 +704,182 @@ func startHotkeyListener() {}
 //  LOG FUNCTIONS  (5 presets each)
 // ──────────────────────────────────────────────────────────────
 
-// logSearch logs a search-query match event.
-func logSearch(count int, url, file, matches, branch string) {
-	plural := core.Pluralize(count, "match", "matches")
-	userRepo, _, fileLink := getEnhancedLinkInfo(url, file, branch)
+// searchSignatureName is the pseudo-signature reported for --search-query hits.
+// It matches the value published to the dashboard and written to the CSV.
+const searchSignatureName = "Search Query"
 
+// logSearch logs a search-query match event, as one atomic write so
+// background worker lines cannot split the card mid-scan.
+func logSearch(count int, url, file, matches, branch string, line, stars int) {
+	plural := core.Pluralize(count, "match", "matches")
+	starStr := starSuffix(stars)
+	userRepo, _, fileLink := getEnhancedLinkInfo(url, file, branch, line)
+	fileAt := fileRef(file, line)
+	matchText := previewMatch(matches)
+
+	var sb strings.Builder
 	switch getLogFormat() {
 
 	// ── 1. MINIMAL ────────────────────────────────────────────
+	// Exactly one line per finding: greppable, and safe to parse in CI.
 	case LogFormatMinimal:
-		lockPrintf("%s %s  %s %s  %s\n",
+		blogPrintf(&sb, "%s %s  %s  %s  match=%s%s  %s\n",
 			minSearch("🔍"),
-			minDim(fmt.Sprintf("%d %s", count, plural)),
-			minDim("→"),
-			minInfo(file),
-			userRepo)
-		lockPrintf("       %s  %s\n", minDim(matches), fileLink)
-		lockPrintln(minDim(strings.Repeat("─", 80)))
+			userRepo,
+			minInfo(fileAt),
+			minEntropy(searchSignatureName),
+			minDim(matchText),
+			minDim(starStr),
+			minLink(fileLink))
 
 	// ── 2. FANCY ──────────────────────────────────────────────
 	case LogFormatFancy:
-		lockPrintln()
-		lockPrintf("%s %d %s in %s  %s\n",
+		blogPrintln(&sb, color.HiBlackString(strings.Repeat("━", 80)))
+		blogPrintf(&sb, "%s  %s  %s  %s%s  %s\n",
 			fancySearch("🔍 [SEARCH]"),
-			count, plural,
-			fancyFile(file),
+			fancyAccent(fmt.Sprintf("%d %s", count, plural)),
+			fancyAccent(searchSignatureName),
+			fancyFile(fileAt),
+			color.HiBlueString(starStr),
 			userRepo)
-		lockPrintf("  %s %s  %s\n", fancyArrow("→"), matches, fileLink)
-		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
+		blogPrintf(&sb, "  %s %s\n", fancyArrow("match:"), matchText)
+		blogPrintf(&sb, "  %s %s\n", fancyLink("link: "), fileLink)
 
 	// ── 3. ULTRA FANCY ────────────────────────────────────────
 	case LogFormatUltraFancy:
-		lockPrintln()
-		lockPrintf("%s  %s  %s %s  %s\n",
+		blogPrintln(&sb, color.HiBlackString(strings.Repeat("━", 80)))
+		blogPrintf(&sb, "%s  %s  %s  %s%s  %s\n",
 			ultraBadge(" 🔍 SEARCH "),
 			ultraAccent(fmt.Sprintf("%d %s", count, plural)),
-			ultraSearch("in"),
-			ultraFile(file),
+			ultraSearch(searchSignatureName),
+			ultraFile(fileAt),
+			ultraAccent(starStr),
 			userRepo)
-		lockPrintf("  %s %s  %s\n", ultraAccent("✦ →"), matches, fileLink)
-		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
+		blogPrintf(&sb, "  %s %s\n", ultraSecret("match:"), matchText)
+		blogPrintf(&sb, "  %s %s\n", ultraLink("link: "), fileLink)
 
 	// ── 4. EVEN MORE FANCY (Cosmic) ───────────────────────────
 	case LogFormatEvenMoreFancy:
-		lockPrintln()
-		cosmicBox(cosmicSearch, cosmicTitle, "🌌  🔍 SEARCH MATCH  🌌")
-		lockPrintf("  %s  %d %s in %s  %s\n",
+		blogPrintln(&sb, cosmicBorder(strings.Repeat("═", 80)))
+		blogCosmicBox(&sb, cosmicSearch, cosmicTitle, "🌌  🔍 SEARCH MATCH  🌌")
+		blogPrintf(&sb, "  %s %d %s%s  %s\n",
 			cosmicSearch("◈"),
 			count, plural,
-			cosmicFile(file),
-			userRepo)
-		lockPrintf("  %s %s  %s\n", cosmicAccent("➜"), matches, fileLink)
-		lockPrintln(cosmicBorder(strings.Repeat("═", 80)))
+			starStr,
+			cosmicAccent(searchSignatureName))
+		blogPrintf(&sb, "  %s file: %s  %s\n", cosmicSearch("◈"), cosmicFile(fileAt), userRepo)
+		blogPrintf(&sb, "  %s match: %s\n", cosmicAccent("➜"), matchText)
+		blogPrintf(&sb, "  %s link:  %s\n", cosmicAccent("➜"), fileLink)
+		blogPrintln(&sb, cosmicBorder(strings.Repeat("═", 80)))
 
 	// ── 5. NEON ───────────────────────────────────────────────
 	default:
-		lockPrintln()
-		lockPrintf("%s %s %s  %s\n",
+		blogPrintln(&sb, neonSearchLabel(strings.Repeat("─", 80)))
+		blogPrintf(&sb, "%s  %s  %s%s  %s\n",
 			neonSearchLabel(" 🔍 SEARCH "),
-			neonValue(fmt.Sprintf("%d %s", count, plural)),
-			neonDim("in "+file),
+			neonValue(searchSignatureName),
+			neonDim(fileAt),
+			neonStar(starStr),
 			userRepo)
-		lockPrintf("  %s %s  %s\n", neonMatch("⟶"), matches, fileLink)
-		lockPrintln(neonEntropyLabel(strings.Repeat("─", 80)))
+		blogPrintf(&sb, "  %s  %s %s\n",
+			neonDim(fmt.Sprintf("%d %s", count, plural)),
+			neonMatch("match:"),
+			matchText)
+		blogPrintf(&sb, "  %s %s\n", neonLink("link: "), fileLink)
 	}
+	lockWrite(sb.String())
 }
 
-// logSecret logs a signature/secret match event with visual separation.
-func logSecret(count int, url, sig, file, matches, branch string, stars int) {
+// logSecret logs a signature/secret match event with visual separation, as
+// one atomic write so background worker lines cannot split it mid-scan.
+func logSecret(count int, url, sig, file, matches, branch string, line, stars int) {
 	plural := core.Pluralize(count, "match", "matches")
-	starStr := ""
-	if stars > 0 {
-		starStr = fmt.Sprintf("  ★ %d", stars)
-	}
+	starStr := starSuffix(stars)
+	userRepo, _, fileLink := getEnhancedLinkInfo(url, file, branch, line)
+	fileAt := fileRef(file, line)
+	sigText := oneLine(sig)
+	matchText := previewMatch(matches)
 
-	userRepo, _, fileLink := getEnhancedLinkInfo(url, file, branch)
-
-	// Hide preview for PEM keys and other large private keys
-	shouldHidePreview := strings.Contains(matches, "-----BEGIN") ||
-		strings.Contains(matches, "-----END") ||
-		len(matches) > 200
-
-	displayMatches := matches
-	if shouldHidePreview {
-		displayMatches = "[REDACTED - Private key content hidden]"
-	}
-
+	var sb strings.Builder
 	switch getLogFormat() {
+	// ── 1. MINIMAL ────────────────────────────────────────────
+	// Exactly one line per finding: greppable, and safe to parse in CI.
 	case LogFormatMinimal:
-		lockPrintln(minDim(strings.Repeat("─", 80)))
-		lockPrintf("%s %s  %s %s%s  %s\n",
+		blogPrintf(&sb, "%s %s  %s  %s  match=%s%s  %s\n",
 			minSecret("🚨"),
-			minDim(fmt.Sprintf("%d %s", count, plural)),
-			minDim("→"),
-			minInfo(file),
+			userRepo,
+			minInfo(fileAt),
+			minEntropy(sigText),
+			minDim(matchText),
 			minDim(starStr),
-			userRepo)
-		lockPrintf("       %s %s  %s\n", minEntropy(sig+":"), minDim(displayMatches), fileLink)
-		lockPrintln()
-		lockPrintf("  %s\n", minInfo("<match>"))
-		lockPrintf("    %s\n", minDim(displayMatches))
-		lockPrintf("  %s\n", minInfo("</match>"))
+			minLink(fileLink))
 
+	// ── 2. FANCY ──────────────────────────────────────────────
 	case LogFormatFancy:
-		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
-		lockPrintf("%s %d %s  %s  in %s%s  %s\n",
+		blogPrintln(&sb, color.HiBlackString(strings.Repeat("━", 80)))
+		blogPrintf(&sb, "%s  %s  %s  %s%s  %s\n",
 			fancySecret("🚨 [SECRET]"),
-			count, plural,
-			fancyAccent(sig),
-			fancyFile(file),
+			fancyAccent(fmt.Sprintf("%d %s", count, plural)),
+			fancyAccent(sigText),
+			fancyFile(fileAt),
 			color.HiBlueString(starStr),
 			userRepo)
-		lockPrintf("  %s %s  %s\n", fancyArrow("→"), displayMatches, fileLink)
-		lockPrintln()
-		lockPrintf("  %s\n", fancyAccent("<match>"))
-		lockPrintf("    %s\n", color.HiYellowString(displayMatches))
-		lockPrintf("  %s\n", fancyAccent("</match>"))
+		blogPrintf(&sb, "  %s %s\n", fancyArrow("match:"), matchText)
+		blogPrintf(&sb, "  %s %s\n", fancyLink("link: "), fileLink)
 
+	// ── 3. ULTRA FANCY ────────────────────────────────────────
 	case LogFormatUltraFancy:
-		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
-		starsFormatted := ""
-		if stars > 0 {
-			starsFormatted = "  " + ultraAccent(fmt.Sprintf("⭐ %d", stars))
-		}
-		lockPrintf("%s  %s  %s %s%s  %s\n",
+		blogPrintln(&sb, color.HiBlackString(strings.Repeat("━", 80)))
+		blogPrintf(&sb, "%s  %s  %s  %s%s  %s\n",
 			ultraDanger(" 🚨 SECRET "),
 			ultraAccent(fmt.Sprintf("%d %s", count, plural)),
-			ultraSecret(sig),
-			ultraFile("→ "+file),
-			starsFormatted,
+			ultraSecret(sigText),
+			ultraFile(fileAt),
+			ultraAccent(starStr),
 			userRepo)
-		lockPrintf("  %s %s  %s\n", ultraSecret("✦ →"), displayMatches, fileLink)
-		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
-		lockPrintln()
-		lockPrintf("  %s\n", ultraAccent("<match>"))
-		lockPrintf("    %s\n", ultraDanger(displayMatches))
-		lockPrintf("  %s\n", ultraAccent("</match>"))
+		blogPrintf(&sb, "  %s %s\n", ultraSecret("match:"), matchText)
+		blogPrintf(&sb, "  %s %s\n", ultraLink("link: "), fileLink)
 
+	// ── 4. EVEN MORE FANCY (Cosmic) ───────────────────────────
 	case LogFormatEvenMoreFancy:
-		lockPrintln()
-		cosmicBox(cosmicSecret, cosmicTitle, "🔥  🚨 LEGENDARY SECRET BREACH  🔥")
-		if stars > 0 {
-			lockPrintf("  %s ⭐ %d stars\n", cosmicSecret("║"), stars)
-		}
-		lockPrintf("  %s %d %s  sig: %s\n",
+		blogPrintln(&sb, cosmicBorder(strings.Repeat("═", 80)))
+		blogCosmicBox(&sb, cosmicSecret, cosmicTitle, "🔥  🚨 LEGENDARY SECRET BREACH  🔥")
+		blogPrintf(&sb, "  %s %d %s%s  %s\n",
 			cosmicSecret("║"),
 			count, plural,
-			cosmicAccent(sig))
-		lockPrintf("  %s file: %s  %s\n", cosmicSecret("║"), cosmicFile(file), userRepo)
-		lockPrintf("  %s %s  %s\n", cosmicAccent("➜"), displayMatches, fileLink)
-		lockPrintln(cosmicBorder(strings.Repeat("═", 80)))
-		lockPrintln()
-		lockPrintf("  %s\n", cosmicAccent("<match>"))
-		lockPrintf("    %s\n", cosmicSecret(displayMatches))
-		lockPrintf("  %s\n", cosmicAccent("</match>"))
+			starStr,
+			cosmicAccent(sigText))
+		blogPrintf(&sb, "  %s file: %s  %s\n", cosmicSecret("║"), cosmicFile(fileAt), userRepo)
+		blogPrintf(&sb, "  %s match: %s\n", cosmicAccent("➜"), matchText)
+		blogPrintf(&sb, "  %s link:  %s\n", cosmicAccent("➜"), fileLink)
+		blogPrintln(&sb, cosmicBorder(strings.Repeat("═", 80)))
 
-	default: // Neon
-		lockPrintln()
-		neonStars := ""
-		if stars > 0 {
-			neonStars = "  " + neonStar(fmt.Sprintf("⭐ %d", stars))
-		}
-		lockPrintf("%s %s  %s%s  %s\n",
+	// ── 5. NEON ───────────────────────────────────────────────
+	default:
+		blogPrintln(&sb, neonSecretLabel(strings.Repeat("─", 80)))
+		blogPrintf(&sb, "%s  %s  %s%s  %s\n",
 			neonSecretLabel(" 🚨 SECRET "),
-			neonValue(sig),
-			neonDim(file),
-			neonStars,
+			neonValue(sigText),
+			neonDim(fileAt),
+			neonStar(starStr),
 			userRepo)
-		lockPrintf("  %s  %s %s  %s\n",
+		blogPrintf(&sb, "  %s  %s %s\n",
 			neonDim(fmt.Sprintf("%d %s", count, plural)),
-			neonMatch("⟶"),
-			displayMatches,
-			fileLink)
-		lockPrintln(neonEntropyLabel(strings.Repeat("─", 80)))
-		lockPrintln()
-		lockPrintf("  %s\n", neonValue("<match>"))
-		lockPrintf("    %s\n", neonMatch(displayMatches))
-		lockPrintf("  %s\n", neonValue("</match>"))
+			neonMatch("match:"),
+			matchText)
+		blogPrintf(&sb, "  %s %s\n", neonLink("link: "), fileLink)
 	}
+	lockWrite(sb.String())
 }
 
-// logFile logs a file-pattern match event with visual separation.
+// logFile logs a file-pattern match event with visual separation, as one
+// atomic write so background worker lines cannot split it mid-scan.
 func logFile(url, sig, file, branch string, stars int) {
-	userRepo, _, fileLink := getEnhancedLinkInfo(url, file, branch)
+	// A file/name rule matches the file itself, so there is no line to point at.
+	userRepo, _, fileLink := getEnhancedLinkInfo(url, file, branch, 0)
+	fileAt := oneLine(file)
+	sigText := oneLine(sig)
+	starStr := starSuffix(stars)
 
 	// For .env files, show that we're including full content in webhook
 	isEnvFile := strings.HasSuffix(strings.ToLower(file), ".env") ||
@@ -585,147 +891,154 @@ func logFile(url, sig, file, branch string, stars int) {
 		envNotice = " [FULL CONTENT → WEBHOOK]"
 	}
 
+	var sb strings.Builder
 	switch getLogFormat() {
+	// ── 1. MINIMAL ────────────────────────────────────────────
+	// Exactly one line per finding: greppable, and safe to parse in CI.
 	case LogFormatMinimal:
-		lockPrintln(minDim(strings.Repeat("─", 80)))
-		lockPrintf("%s %s %s %s  %s%s\n",
+		blogPrintf(&sb, "%s %s  %s  %s  match=%s%s  %s%s\n",
 			minFile("📄"),
-			minDim(sig),
-			minDim("→"),
-			minInfo(file),
 			userRepo,
-			minDim(envNotice))
-		lockPrintf("       %s\n", fileLink)
-		lockPrintln(minDim(""))
-		lockPrintf("  %s\n", minInfo("<match>"))
-		lockPrintf("    %s\n", minDim("📄 "+file))
-		lockPrintf("  %s\n", minInfo("</match>"))
+			minInfo(fileAt),
+			minEntropy(sigText),
+			minDim(fileAt),
+			minDim(starStr),
+			minLink(fileLink),
+			minDim(oneLine(envNotice)))
 
+	// ── 2. FANCY ──────────────────────────────────────────────
 	case LogFormatFancy:
-		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
-		lockPrintf("%s %s  matches  %s  %s%s\n",
+		blogPrintln(&sb, color.HiBlackString(strings.Repeat("━", 80)))
+		blogPrintf(&sb, "%s  %s  %s%s  %s%s\n",
 			fancyFile("📄 [FILE]"),
-			fancyFile(file),
-			fancyAccent(sig),
+			fancyAccent(sigText),
+			fancyFile(fileAt),
+			color.HiBlueString(starStr),
 			userRepo,
 			color.HiGreenString(envNotice))
-		lockPrintf("  %s\n", fileLink)
-		lockPrintln()
-		lockPrintf("  %s\n", fancyFile("<match>"))
-		lockPrintf("    %s\n", fancyAccent("📄 "+file))
-		lockPrintf("  %s\n", fancyFile("</match>"))
+		blogPrintf(&sb, "  %s %s\n", fancyArrow("match:"), fileAt)
+		blogPrintf(&sb, "  %s %s\n", fancyLink("link: "), fileLink)
 
+	// ── 3. ULTRA FANCY ────────────────────────────────────────
 	case LogFormatUltraFancy:
-		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
-		lockPrintf("%s  %s  %s %s  %s%s\n",
+		blogPrintln(&sb, color.HiBlackString(strings.Repeat("━", 80)))
+		blogPrintf(&sb, "%s  %s  %s%s  %s%s\n",
 			ultraBadge(" 📄 FILE "),
-			ultraFile(file),
-			ultraSearch("matches"),
-			ultraAccent(sig),
+			ultraAccent(sigText),
+			ultraFile(fileAt),
+			ultraAccent(starStr),
 			userRepo,
 			ultraSearch(envNotice))
-		lockPrintf("  %s\n", fileLink)
-		lockPrintln()
-		lockPrintf("  %s\n", ultraFile("<match>"))
-		lockPrintf("    %s\n", ultraAccent("📄 "+file))
-		lockPrintf("  %s\n", ultraFile("</match>"))
+		blogPrintf(&sb, "  %s %s\n", ultraSecret("match:"), fileAt)
+		blogPrintf(&sb, "  %s %s\n", ultraLink("link: "), fileLink)
 
+	// ── 4. EVEN MORE FANCY (Cosmic) ───────────────────────────
 	case LogFormatEvenMoreFancy:
-		lockPrintln(cosmicBorder(strings.Repeat("═", 80)))
-		cosmicBox(cosmicFile, cosmicTitle, "📁  📄 EPIC FILE PATTERN MATCH  📁")
-		lockPrintf("  %s %s %s %s  %s%s\n",
+		blogPrintln(&sb, cosmicBorder(strings.Repeat("═", 80)))
+		blogCosmicBox(&sb, cosmicFile, cosmicTitle, "📁  📄 EPIC FILE PATTERN MATCH  📁")
+		blogPrintf(&sb, "  %s %s%s  %s\n",
 			cosmicFile("◈"),
-			cosmicAccent(sig),
-			cosmicFile("→"),
-			cosmicFile(file),
-			userRepo,
-			cosmicSearch(envNotice))
-		lockPrintf("  %s\n", fileLink)
-		if stars > 0 {
-			lockPrintf("  %s ⭐ %d stars\n", cosmicFile("◈"), stars)
-		}
-		lockPrintln()
-		lockPrintf("  %s\n", cosmicFile("<match>"))
-		lockPrintf("    %s\n", cosmicAccent("📄 "+file))
-		lockPrintf("  %s\n", cosmicFile("</match>"))
+			cosmicAccent(sigText),
+			starStr,
+			userRepo)
+		blogPrintf(&sb, "  %s file: %s%s\n", cosmicFile("◈"), cosmicFile(fileAt), cosmicSearch(envNotice))
+		blogPrintf(&sb, "  %s match: %s\n", cosmicAccent("➜"), fileAt)
+		blogPrintf(&sb, "  %s link:  %s\n", cosmicAccent("➜"), fileLink)
+		blogPrintln(&sb, cosmicBorder(strings.Repeat("═", 80)))
 
-	default: // Neon
-		lockPrintln(neonEntropyLabel(strings.Repeat("─", 80)))
-		lockPrintf("%s %s  %s %s  %s%s\n",
+	// ── 5. NEON ───────────────────────────────────────────────
+	default:
+		blogPrintln(&sb, neonFileLabel(strings.Repeat("─", 80)))
+		blogPrintf(&sb, "%s  %s  %s%s  %s%s\n",
 			neonFileLabel(" 📄 FILE "),
-			neonValue(sig),
-			neonDim(file),
-			neonDim("→"),
+			neonValue(sigText),
+			neonDim(fileAt),
+			neonStar(starStr),
 			userRepo,
 			neonStar(envNotice))
-		lockPrintf("  %s\n", fileLink)
-		if stars > 0 {
-			lockPrintf("  %s ⭐ %d stars\n", neonStar("·"), stars)
-		}
-		lockPrintln()
-		lockPrintf("  %s\n", neonValue("<match>"))
-		lockPrintf("    %s\n", neonDim("📄 "+file))
-		lockPrintf("  %s\n", neonValue("</match>"))
+		blogPrintf(&sb, "  %s %s\n", neonMatch("match:"), fileAt)
+		blogPrintf(&sb, "  %s %s\n", neonLink("link: "), fileLink)
 	}
+	lockWrite(sb.String())
 }
 
-// logEntropy logs a high-entropy string detection event with visual separation.
-func logEntropy(url, file, line, branch string, stars int) {
-	userRepo, _, fileLink := getEnhancedLinkInfo(url, file, branch)
+// entropySignatureName is the pseudo-signature reported for high-entropy hits.
+// It matches the value published to the dashboard and written to the CSV.
+const entropySignatureName = "High entropy string"
 
+// logEntropy logs a high-entropy string detection event with visual
+// separation, as one atomic write so background worker lines cannot split it.
+func logEntropy(url, file, line, branch string, lineNo, stars int) {
+	userRepo, _, fileLink := getEnhancedLinkInfo(url, file, branch, lineNo)
+	fileAt := fileRef(file, lineNo)
+	matchText := previewMatch(line)
+	starStr := starSuffix(stars)
+
+	var sb strings.Builder
 	switch getLogFormat() {
+	// ── 1. MINIMAL ────────────────────────────────────────────
+	// Exactly one line per finding: greppable, and safe to parse in CI.
 	case LogFormatMinimal:
-		lockPrintln(minDim(strings.Repeat("─", 80)))
-		lockPrintf("%s %s  %s\n",
+		blogPrintf(&sb, "%s %s  %s  %s  match=%s%s  %s\n",
 			minEntropy("⚡"),
-			minInfo(file),
-			userRepo)
-		lockPrintf("         %s  %s\n", minDim(line), fileLink)
+			userRepo,
+			minInfo(fileAt),
+			minEntropy(entropySignatureName),
+			minDim(matchText),
+			minDim(starStr),
+			minLink(fileLink))
 
+	// ── 2. FANCY ──────────────────────────────────────────────
 	case LogFormatFancy:
-		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
-		lockPrintf("%s potential secret in %s  %s\n",
+		blogPrintln(&sb, color.HiBlackString(strings.Repeat("━", 80)))
+		blogPrintf(&sb, "%s  %s  %s%s  %s\n",
 			fancyEntropy("⚡ [ENTROPY]"),
-			fancyFile(file),
+			fancyAccent(entropySignatureName),
+			fancyFile(fileAt),
+			color.HiBlueString(starStr),
 			userRepo)
-		lockPrintf("  %s %s  %s\n", fancyArrow("→"), line, fileLink)
+		blogPrintf(&sb, "  %s %s\n", fancyArrow("match:"), matchText)
+		blogPrintf(&sb, "  %s %s\n", fancyLink("link: "), fileLink)
 
+	// ── 3. ULTRA FANCY ────────────────────────────────────────
 	case LogFormatUltraFancy:
-		lockPrintln(color.HiBlackString(strings.Repeat("━", 80)))
-		lockPrintf("%s  %s %s  %s\n",
+		blogPrintln(&sb, color.HiBlackString(strings.Repeat("━", 80)))
+		blogPrintf(&sb, "%s  %s  %s%s  %s\n",
 			ultraBadge(" ⚡ ENTROPY "),
-			ultraFile(file),
-			ultraEntropy("HIGH"),
+			ultraEntropy(entropySignatureName),
+			ultraFile(fileAt),
+			ultraAccent(starStr),
 			userRepo)
-		lockPrintf("  %s %s  %s\n", ultraEntropy("✦ →"), line, fileLink)
+		blogPrintf(&sb, "  %s %s\n", ultraSecret("match:"), matchText)
+		blogPrintf(&sb, "  %s %s\n", ultraLink("link: "), fileLink)
 
+	// ── 4. EVEN MORE FANCY (Cosmic) ───────────────────────────
 	case LogFormatEvenMoreFancy:
-		lockPrintln(cosmicBorder(strings.Repeat("═", 80)))
-		cosmicBox(cosmicEntropy, cosmicTitle, "⚡  ⚙️  COSMIC HIGH ENTROPY DETECTED  ⚙️  ⚡")
-		lockPrintf("  %s %s  HIGH entropy string\n",
+		blogPrintln(&sb, cosmicBorder(strings.Repeat("═", 80)))
+		blogCosmicBox(&sb, cosmicEntropy, cosmicTitle, "⚡  ⚙️  COSMIC HIGH ENTROPY DETECTED  ⚙️  ⚡")
+		blogPrintf(&sb, "  %s %s%s  %s\n",
 			cosmicEntropy("◈"),
-			cosmicFile(file))
-		lockPrintf("  %s %s  %s\n", cosmicAccent("➜"), line, userRepo)
-		lockPrintf("  %s\n", fileLink)
-		if stars > 0 {
-			lockPrintf("  %s ⭐ %d stars\n", cosmicEntropy("◈"), stars)
-		}
-
-	default: // Neon
-		lockPrintln(neonEntropyLabel(strings.Repeat("─", 80)))
-		neonStars := ""
-		if stars > 0 {
-			neonStars = "  " + neonStar(fmt.Sprintf("⭐ %d", stars))
-		}
-		lockPrintf("%s %s %s %s%s  %s\n",
-			neonEntropyLabel(" ⚡ ENTROPY "),
-			neonValue(file),
-			neonDim("→"),
-			neonMatch("HIGH"),
-			neonStars,
+			cosmicAccent(entropySignatureName),
+			starStr,
 			userRepo)
-		lockPrintf("  %s %s  %s\n", neonMatch("⟶"), line, fileLink)
+		blogPrintf(&sb, "  %s file: %s\n", cosmicEntropy("◈"), cosmicFile(fileAt))
+		blogPrintf(&sb, "  %s match: %s\n", cosmicAccent("➜"), matchText)
+		blogPrintf(&sb, "  %s link:  %s\n", cosmicAccent("➜"), fileLink)
+		blogPrintln(&sb, cosmicBorder(strings.Repeat("═", 80)))
+
+	// ── 5. NEON ───────────────────────────────────────────────
+	default:
+		blogPrintln(&sb, neonEntropyLabel(strings.Repeat("─", 80)))
+		blogPrintf(&sb, "%s  %s  %s%s  %s\n",
+			neonEntropyLabel(" ⚡ ENTROPY "),
+			neonValue(entropySignatureName),
+			neonDim(fileAt),
+			neonStar(starStr),
+			userRepo)
+		blogPrintf(&sb, "  %s %s\n", neonMatch("match:"), matchText)
+		blogPrintf(&sb, "  %s %s\n", neonLink("link: "), fileLink)
 	}
+	lockWrite(sb.String())
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -990,16 +1303,37 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 
 	// CRITICAL PERFORMANCE FIX: Pre-compile search query regex ONCE outside the file loop
 	var queryRegex *regexp.Regexp
-	if *getSession().Options.SearchQuery != "" {
-		queryRegex = regexp.MustCompile(*getSession().Options.SearchQuery)
+	if q := *getSession().Options.SearchQuery; q != "" {
+		re, err := regexp.Compile(q)
+		if err != nil {
+			// MustCompile here panicked on a malformed query - "(" was enough - and
+			// took the whole scan down with a stack trace.
+			getSession().Log.Error("--search-query is not a valid regular expression: %v", err)
+			exitScanner(1)
+			return false
+		}
+		queryRegex = re
 	}
 
 	for _, file := range core.GetMatchingFiles(dir) {
+		// MatchFile.Contents is loaded lazily, and every match engine below reads the
+		// field directly. Reading it without loading saw nil for every file, which
+		// silently disabled --search-query, the high-entropy scan, the PEM
+		// completeness check, the Vite-only-env filter, --scan-keys and the
+		// dashboard's file viewer. Loading it here, once per file, has a second
+		// effect: Signature.Match takes MatchFile by value, so its own GetContents
+		// call only ever cached into the copy it was given - meaning a contents-based
+		// signature re-read the file from disk, once per signature, up to 305 times
+		// per file. The load has to happen before any of those readers, including
+		// isViteOnlyEnvFile.
+		file.Contents = file.GetContents()
+
 		// Env files whose only assignments are public VITE_* variables (Vite
 		// client-side envs ship to the browser by design) are not findings.
 		if isViteOnlyEnvFile(file) {
 			continue
 		}
+
 		var (
 			matches          []string
 			relativeFileName string
@@ -1032,15 +1366,22 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 				matches = append(matches, string(match[0]))
 			}
 			if len(matches) > 0 {
+				// A search-query hit is a finding like any other: without this the
+				// scan printed the match and then reported "No secrets found", and
+				// exited 0, so a CI job using --search-query never failed.
+				matchedAny = true
 				count := len(matches)
 				m := strings.Join(matches, ", ")
+				// The line of the finding has to be computed from the secret itself,
+				// not from the joined summary string, or the link points nowhere.
+				lineNo := secretLineNum(file.Contents, matches[0])
 				// Search-query matches must feed the web dashboard too, exactly
 				// like signature matches — otherwise they show in the terminal
 				// but never appear in the Matches tab.
-				publish(&MatchEvent{Source: source, Url: url, Matches: matches, Signature: "Search Query", File: relativeFileName, Stars: stars, Priority: 0, Color: "", FileContent: string(file.Contents), Secret: matches[0], SecretLine: secretLineNum(file.Contents, matches[0])})
-				logSearch(count, url, relativeFileName, m, ref)
-				getSession().WriteToCsv([]string{url, "Search Query", relativeFileName, m})
-				getSession().LogMatch("Search Query", url, relativeFileName, matches)
+				publish(&MatchEvent{Source: source, Url: url, Matches: matches, Signature: searchSignatureName, File: relativeFileName, Stars: stars, Priority: 0, Color: "", FileContent: string(file.Contents), Secret: matches[0], SecretLine: lineNo})
+				logSearch(count, url, relativeFileName, m, ref, lineNo, stars)
+				getSession().WriteToCsv([]string{url, searchSignatureName, relativeFileName, m})
+				getSession().LogMatch(searchSignatureName, url, relativeFileName, matches)
 			}
 		} else {
 			for _, signature := range getSession().Signatures {
@@ -1081,7 +1422,7 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 
 							publish(&MatchEvent{Source: source, Url: url, Matches: matches, Signature: signature.Name(), File: relativeFileName, Stars: stars, Priority: signature.GetPriority(), Color: signature.GetColor(), FileContent: fileContent, Secret: secret, SecretLine: secretLineNum(file.Contents, secret)})
 							matchedAny = true
-							logSecret(count, url, signature.Name(), relativeFileName, m, ref, stars)
+							logSecret(count, url, signature.Name(), relativeFileName, m, ref, secretLineNum(file.Contents, secret), stars)
 							getSession().WriteToCsv([]string{url, signature.Name(), relativeFileName, m})
 							getSession().LogMatch(signature.Name(), url, relativeFileName, matches)
 
@@ -1122,11 +1463,11 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 											}
 										}
 										if !blacklistedMatch {
-											publish(&MatchEvent{Source: source, Url: url, Matches: []string{line}, Signature: "High entropy string", File: relativeFileName, Stars: stars, Priority: 0, Color: "", FileContent: string(file.Contents), Secret: line, SecretLine: lineNo})
+											publish(&MatchEvent{Source: source, Url: url, Matches: []string{line}, Signature: entropySignatureName, File: relativeFileName, Stars: stars, Priority: 0, Color: "", FileContent: string(file.Contents), Secret: line, SecretLine: lineNo})
 											matchedAny = true
-											logEntropy(url, relativeFileName, line, ref, stars)
-											getSession().WriteToCsv([]string{url, "High entropy string", relativeFileName, line})
-											getSession().LogMatch("High entropy string", url, relativeFileName, []string{line})
+											logEntropy(url, relativeFileName, line, ref, lineNo, stars)
+											getSession().WriteToCsv([]string{url, entropySignatureName, relativeFileName, line})
+											getSession().LogMatch(entropySignatureName, url, relativeFileName, []string{line})
 										}
 									}
 								}
@@ -1207,17 +1548,27 @@ func publish(event *MatchEvent) {
 
 	// Feed the TUI (when running with --tui).
 	if tuiState != nil {
+		id := newMatchID()
 		AddTUIMatch(&TUIMatch{
-			ID:        newMatchID(),
+			ID:        id,
 			Timestamp: time.Now(),
 			Source:    sourceName(event.Source),
 			URL:       event.Url,
 			File:      event.File,
 			Signature: event.Signature,
 			Matches:   event.Matches,
+			Secret:    event.Secret,
+			Line:      event.SecretLine,
 			Stars:     event.Stars,
 			Priority:  event.Priority,
 		})
+		// Keep the captured file body under the same id the UI sees, so the "v"
+		// key can show the file around the finding exactly like the dashboard's
+		// viewer. Only while the TUI owns the screen: in web mode the branch
+		// above already stored it under the dashboard's own id.
+		if tuiScreenActive && event.FileContent != "" {
+			storeMatchFile(id, event.Url, event.File, event.FileContent, event.Secret, event.SecretLine)
+		}
 	}
 
 	if len(*getSession().Options.Live) > 0 {
@@ -1290,27 +1641,45 @@ func publish(event *MatchEvent) {
 // ──────────────────────────────────────────────────────────────
 
 func main() {
+	// Repair the console before the first byte is written: a previous run can
+	// leave DISABLE_NEWLINE_AUTO_RETURN set, which makes "\n" advance without
+	// returning to column 0 and turns the output into a staircase.
+	repairNewlineMode()
+
+	// Serialize every background writer before anything can log: the worker
+	// pool and regex optimizer log through the standard logger from other
+	// goroutines, and without this their lines split the styled output.
+	routeEarlyOutput()
+
 	// Print mode information BEFORE initializing session
 	fmt.Println()
 	modeConfig.PrintModeInfo()
 	fmt.Println()
 
-	// Handle UI modes - this will call initLogFormat() when needed
-	if modeConfig.Mode == ModeWeb {
+	// Dispatch on the mode selected by InitIntegratedMode/scanModeArgs. The mode
+	// flags are stripped before flag.Parse, so this is the only place that
+	// decides which UI runs. ModeScanner is an alias of ModeDefault and is never
+	// selected (scanModeArgs maps "scanner" onto ModeDefault), so the default arm
+	// covers both.
+	switch modeConfig.Mode {
+	case ModeWeb:
 		runWebMode()
-		return
+	case ModeTUI:
+		runTUIMode()
+	default:
+		// Default, --terminal and --scanner: the scanner runs in the foreground
+		// and every finding is printed as it is found.
+		runScannerCLI()
 	}
-
-	// --tui, --scanner and default all behave the same: normal terminal
-	// scanner with logs printing to the terminal.
-	runScannerCLI()
 }
 
-// exitScanner terminates a one-shot scanner flow. In web mode the scanner
-// runs in a goroutine alongside the dashboard, so it must NOT kill the
-// process; it just returns and the web server keeps serving results.
+// exitScanner terminates a one-shot scanner flow. In web and TUI mode the
+// scanner runs alongside a UI that owns the process lifetime, so it must NOT
+// kill the process: it just returns and the UI keeps serving results. In the
+// plain terminal mode it exits with the scan's status code (1 on a hit, 0
+// clean), which is what CI depends on.
 func exitScanner(code int) {
-	if modeConfig != nil && modeConfig.Mode == ModeWeb {
+	if modeConfig != nil && (modeConfig.Mode == ModeWeb || modeConfig.Mode == ModeTUI) {
 		return
 	}
 	os.Exit(code)
@@ -1334,12 +1703,13 @@ func runWebMode() {
 	color.NoColor = false
 
 	// Capture scanner log output (Logger writes) into the web log buffer so
-	// the dashboard's Logs tab shows everything.
+	// the dashboard's Logs tab shows everything. The locked printer keeps
+	// those lines from interleaving with live match output.
 	if getSession().Log != nil {
 		getSession().Log.LogWriter = func(line string) {
-			fmt.Print(line)
-			appendLogLine(line)
+			lockPrintf("%s", line)
 		}
+		getSession().Log.LogWriterIsTerminal = false
 	}
 
 	// Route token-validation results into the web "Tokens" view. Without this
@@ -1379,58 +1749,139 @@ func runWebMode() {
 	}
 }
 
+// tuiCanStart reports whether the interactive UI can actually take over the
+// terminal. TUIAvailable() covers stdout and the window size; the UI also needs
+// a keyboard, so stdin must be a terminal too.
+func tuiCanStart() bool {
+	return TUIAvailable() && tuiIsTerminal(tuiStdin)
+}
+
+// runTUIMode runs the interactive terminal UI around the scanner. The UI owns
+// the screen: the scanner runs in a goroutine and feeds the UI through
+// publish()->AddTUIMatch plus the log/token hooks below, and nothing is written
+// to stdout while the UI is up. If the terminal cannot support the UI - it is
+// piped, TERM=dumb, too small, or stdin is not a TTY - this degrades to the
+// plain terminal mode with a clear message and never emits escape sequences
+// into a pipe or file.
+func runTUIMode() {
+	if !tuiCanStart() {
+		fmt.Println("⚠️  --tui requested, but this terminal cannot run the interactive UI")
+		fmt.Println("   (stdout or stdin is not a TTY, TERM=dumb, or the window is too small).")
+		fmt.Println("   Falling back to the plain terminal live match feed.")
+		fmt.Println()
+		// Terminal mode is now the real mode: exitScanner must be allowed to
+		// exit with the scan's status code instead of returning to a UI that
+		// will never start.
+		modeConfig.Mode = ModeDefault
+		runScannerCLI()
+		return
+	}
+
+	initLogFormat()
+
+	// The UI draws its own colours, and the scanner's log lines are captured
+	// into the Logs tab as plain text. Disable the terminal palette so those
+	// lines do not carry ANSI escapes into the tab.
+	color.NoColor = true
+
+	// From here on the UI owns stdout: scanner output goes to the Logs tab, not
+	// the screen, and live token results go to the Tokens tab.
+	tuiScreenActive = true
+	if getSession().Log != nil {
+		getSession().Log.LogWriter = func(line string) {
+			AddTUILog(line)
+		}
+	}
+	if getSession().TokenValidator != nil {
+		getSession().TokenValidator.OnTokenResult = func(token string, valid bool, provider string) {
+			AddTUIToken(token, valid, provider)
+		}
+	}
+
+	// Enable the AI review engine so the "r" key can ask the model about the
+	// selected finding. It is optional: without a configured provider the key
+	// reports that review is unavailable instead of failing the UI. The hook is
+	// installed here, not in an init(), so tests never start a real review.
+	if err := initAIReview(getSession().Config); err != nil {
+		AddTUILog("AI review unavailable: " + err.Error())
+	}
+	tuiReviewRequest = tuiStartReview
+
+	// The scanner runs in the background; every finding reaches the UI through
+	// publish(). StartTUI then blocks until the operator quits.
+	go runScanner()
+
+	if err := StartTUI(); err != nil {
+		// Preflight (tuiCanStart) makes this practically unreachable. Do not
+		// reset tuiScreenActive here: it is written once before the scanner
+		// goroutine starts, and writing it again would race with any in-flight
+		// lockPrintf call. The process is about to exit anyway, and the error
+		// goes straight to stderr rather than through the locked printer.
+		fmt.Fprintf(os.Stderr, "❌ Terminal UI error: %v\n", err)
+	}
+}
+
+// printStartupBlock emits the preset-aware banner plus the startup summary
+// as one atomic write, so background worker lines cannot land in the middle
+// of the banner while the scanner spins up.
+func printStartupBlock() {
+	var sb strings.Builder
+	// ── Banner (preset-aware) ──────────────────────────────────
+	switch getLogFormat() {
+	case LogFormatMinimal:
+		blogPrintf(&sb, "%s %s\n", minSearch("shhgit"), minDim(core.Author))
+
+	case LogFormatFancy:
+		blogPrintln(&sb, color.HiBlueString(core.Banner))
+		blogPrintln(&sb, "  "+color.HiCyanString(core.Author))
+
+	case LogFormatUltraFancy:
+		blogPrintln(&sb, color.HiBlueString(core.Banner))
+		blogPrintf(&sb, "  %s  %s\n",
+			ultraBadge(" ULTRA FANCY "),
+			ultraAccent(core.Author))
+
+	case LogFormatEvenMoreFancy:
+		blogCosmicBox(&sb, cosmicBorder, cosmicTitle, "✨  SHHGIT - EVEN MORE FANCY MODE  ✨")
+		blogPrintf(&sb, "  %s\n\n", cosmicAccent(core.Author))
+
+	case LogFormatNeon:
+		blogPrintln(&sb, color.HiMagentaString(core.Banner))
+		blogPrintf(&sb, "  %s %s\n",
+			neonEntropyLabel(" NEON MODE "),
+			neonValue(core.Author))
+	}
+
+	// ── Startup summary ───────────────────────────────────────
+	switch getLogFormat() {
+	case LogFormatMinimal:
+		blogPrintf(&sb, "%s sigs:%s  threads:%s  tmp:%s\n\n",
+			minDim("◆"),
+			minSearch(fmt.Sprintf("%d", len(getSession().Signatures))),
+			minSearch(fmt.Sprintf("%d", *getSession().Options.Threads)),
+			minDim(*getSession().Options.TempDirectory))
+	case LogFormatNeon:
+		blogPrintf(&sb, "%s sigs %s  threads %s  tmp %s  style %s\n\n",
+			neonDim("◆"),
+			neonStar(fmt.Sprintf("%d", len(getSession().Signatures))),
+			neonStar(fmt.Sprintf("%d", *getSession().Options.Threads)),
+			neonDim(*getSession().Options.TempDirectory),
+			neonSearchLabel(" "+strings.ToUpper(getLogFormat())+" "))
+	default:
+		blogPrintf(&sb, "[*] Loaded %s signatures  .  %s threads  .  tmp: %s  .  style: %s\n\n",
+			color.HiCyanString("%d", len(getSession().Signatures)),
+			color.HiCyanString("%d", *getSession().Options.Threads),
+			color.HiBlueString(*getSession().Options.TempDirectory),
+			color.HiGreenString(strings.ToUpper(getLogFormat())))
+	}
+	lockWrite(sb.String())
+}
+
 // runScanner executes the scanner with UI reporting
 func runScanner() {
 	// Original banner output suppressed if UI is active
 	if modeConfig.Mode == ModeScanner {
-		// ── Banner (preset-aware) ──────────────────────────────────
-		switch getLogFormat() {
-		case LogFormatMinimal:
-			lockPrintf("%s %s\n", minSearch("shhgit"), minDim(core.Author))
-
-		case LogFormatFancy:
-			lockPrintln(color.HiBlueString(core.Banner))
-			lockPrintln("  " + color.HiCyanString(core.Author))
-
-		case LogFormatUltraFancy:
-			lockPrintln(color.HiBlueString(core.Banner))
-			lockPrintf("  %s  %s\n",
-				ultraBadge(" ULTRA FANCY "),
-				ultraAccent(core.Author))
-
-		case LogFormatEvenMoreFancy:
-			cosmicBox(cosmicBorder, cosmicTitle, "✨  SHHGIT - EVEN MORE FANCY MODE  ✨")
-			lockPrintf("  %s\n\n", cosmicAccent(core.Author))
-
-		case LogFormatNeon:
-			lockPrintln(color.HiMagentaString(core.Banner))
-			lockPrintf("  %s %s\n",
-				neonEntropyLabel(" NEON MODE "),
-				neonValue(core.Author))
-		}
-
-		// ── Startup summary ───────────────────────────────────────
-		switch getLogFormat() {
-		case LogFormatMinimal:
-			lockPrintf("%s sigs:%s  threads:%s  tmp:%s\n\n",
-				minDim("◆"),
-				minSearch(fmt.Sprintf("%d", len(getSession().Signatures))),
-				minSearch(fmt.Sprintf("%d", *getSession().Options.Threads)),
-				minDim(*getSession().Options.TempDirectory))
-		case LogFormatNeon:
-			lockPrintf("%s sigs %s  threads %s  tmp %s  style %s\n\n",
-				neonDim("◆"),
-				neonStar(fmt.Sprintf("%d", len(getSession().Signatures))),
-				neonStar(fmt.Sprintf("%d", *getSession().Options.Threads)),
-				neonDim(*getSession().Options.TempDirectory),
-				neonSearchLabel(" "+strings.ToUpper(getLogFormat())+" "))
-		default:
-			lockPrintf("[*] Loaded %s signatures  .  %s threads  .  tmp: %s  .  style: %s\n\n",
-				color.HiCyanString("%d", len(getSession().Signatures)),
-				color.HiCyanString("%d", *getSession().Options.Threads),
-				color.HiBlueString(*getSession().Options.TempDirectory),
-				color.HiGreenString(strings.ToUpper(getLogFormat())))
-		}
+		printStartupBlock()
 	}
 
 	// Execute scanner logic
@@ -1439,55 +1890,18 @@ func runScanner() {
 
 // runScannerCLI runs scanner with full CLI output
 func runScannerCLI() {
+	// A classic Windows console does not interpret ANSI or OSC 8 escape sequences
+	// until virtual-terminal processing is switched on. Enable it before the first
+	// styled line and record the result, so colours and hyperlinks either render
+	// or degrade to plain text - never to raw escape sequences.
+	terminalVTSupported = enableVT()
+
+	// Funnel core.Logger through the shared console mutex before the session
+	// (and its background workers) can emit anything.
+	routeCoreLogger()
+
 	initLogFormat()
-	// ── Banner (preset-aware) ──────────────────────────────────
-	switch getLogFormat() {
-	case LogFormatMinimal:
-		lockPrintf("%s %s\n", minSearch("shhgit"), minDim(core.Author))
-
-	case LogFormatFancy:
-		lockPrintln(color.HiBlueString(core.Banner))
-		lockPrintln("  " + color.HiCyanString(core.Author))
-
-	case LogFormatUltraFancy:
-		lockPrintln(color.HiBlueString(core.Banner))
-		lockPrintf("  %s  %s\n",
-			ultraBadge(" ULTRA FANCY "),
-			ultraAccent(core.Author))
-
-	case LogFormatEvenMoreFancy:
-		cosmicBox(cosmicBorder, cosmicTitle, "✨  SHHGIT - EVEN MORE FANCY MODE  ✨")
-		lockPrintf("  %s\n\n", cosmicAccent(core.Author))
-
-	case LogFormatNeon:
-		lockPrintln(color.HiMagentaString(core.Banner))
-		lockPrintf("  %s %s\n",
-			neonEntropyLabel(" NEON MODE "),
-			neonValue(core.Author))
-	}
-
-	// ── Startup summary ───────────────────────────────────────
-	switch getLogFormat() {
-	case LogFormatMinimal:
-		lockPrintf("%s sigs:%s  threads:%s  tmp:%s\n\n",
-			minDim("◆"),
-			minSearch(fmt.Sprintf("%d", len(getSession().Signatures))),
-			minSearch(fmt.Sprintf("%d", *getSession().Options.Threads)),
-			minDim(*getSession().Options.TempDirectory))
-	case LogFormatNeon:
-		lockPrintf("%s sigs %s  threads %s  tmp %s  style %s\n\n",
-			neonDim("◆"),
-			neonStar(fmt.Sprintf("%d", len(getSession().Signatures))),
-			neonStar(fmt.Sprintf("%d", *getSession().Options.Threads)),
-			neonDim(*getSession().Options.TempDirectory),
-			neonSearchLabel(" "+strings.ToUpper(getLogFormat())+" "))
-	default:
-		lockPrintf("[*] Loaded %s signatures  .  %s threads  .  tmp: %s  .  style: %s\n\n",
-			color.HiCyanString("%d", len(getSession().Signatures)),
-			color.HiCyanString("%d", *getSession().Options.Threads),
-			color.HiBlueString(*getSession().Options.TempDirectory),
-			color.HiGreenString(strings.ToUpper(getLogFormat())))
-	}
+	printStartupBlock()
 
 	executeScanner()
 }

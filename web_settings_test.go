@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/trebor048/shhgot/aiproviders"
+	"github.com/trebor048/shhgot/core"
 )
 
 // settingsEnv installs a settings store for one test.
@@ -408,5 +409,76 @@ func TestGetStoredReportsACorruptedFile(t *testing.T) {
 		t.Fatalf("get: %v", err)
 	} else if got.Provider == "" {
 		t.Error("Get should still apply the default provider")
+	}
+}
+
+// The documented precedence is UI > config.yaml > environment. A config.yaml
+// that uses only the legacy DeepSeek keys (no provider/backend) must still seed
+// the store and win over the environment: before the provider was inferred, the
+// provider-less seed was rejected and the key silently dropped.
+func TestConfigSeedInfersProviderFromLegacyKeys(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(func() {
+		reviewStore = nil
+		aiSettingsStore = nil
+		reviewPrompt = defaultReviewSystemPrompt
+	})
+
+	t.Setenv("SHHGIT_AI_API_KEY", "sk-from-env")
+	t.Setenv("SHHGIT_AI_PROVIDER", "openai")
+
+	cfg := &core.Config{}
+	cfg.AIReview = core.AIReviewConfig{
+		DeepseekKey:   "sk-legacy-cfg",
+		DeepseekModel: "deepseek-chat",
+		ReviewDir:     filepath.Join(dir, "ai_review"),
+	}
+	if err := initAIReview(cfg); err != nil {
+		t.Fatalf("initAIReview: %v", err)
+	}
+
+	got, err := aiSettingsStore.Get()
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Provider != "deepseek" {
+		t.Errorf("provider = %q, want the config.yaml legacy key to imply deepseek over the environment", got.Provider)
+	}
+	if got.APIKey != "sk-legacy-cfg" {
+		t.Errorf("key = %q, want the config.yaml value to outrank the environment", got.APIKey)
+	}
+	if got.Model != "deepseek-chat" {
+		t.Errorf("model = %q, want the legacy config model", got.Model)
+	}
+}
+
+// The same inference for a provider-less legacy Ollama endpoint.
+func TestConfigSeedInfersOllamaFromLegacyURL(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(func() {
+		reviewStore = nil
+		aiSettingsStore = nil
+		reviewPrompt = defaultReviewSystemPrompt
+	})
+
+	cfg := &core.Config{}
+	cfg.AIReview = core.AIReviewConfig{
+		OllamaURL:   "http://127.0.0.1:11434",
+		OllamaModel: "llama3.1",
+		ReviewDir:   filepath.Join(dir, "ai_review"),
+	}
+	if err := initAIReview(cfg); err != nil {
+		t.Fatalf("initAIReview: %v", err)
+	}
+
+	got, err := aiSettingsStore.Get()
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Provider != "ollama" {
+		t.Errorf("provider = %q, want ollama inferred from the legacy URL", got.Provider)
+	}
+	if got.BaseURL != "http://127.0.0.1:11434" || got.Model != "llama3.1" {
+		t.Errorf("base_url/model = %q/%q, want the legacy Ollama values", got.BaseURL, got.Model)
 	}
 }

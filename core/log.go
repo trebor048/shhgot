@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/fatih/color"
+	"golang.org/x/term"
 )
 
 const (
@@ -135,6 +136,27 @@ type Logger struct {
 	config      *Config
 	RateLimited atomic.Int64
 	LogWriter   func(string) // Optional: redirect log output (e.g., to TUI)
+	// LogWriterIsTerminal reports whether LogWriter output ultimately reaches
+	// the live terminal. The main package sets it when its hook prints through
+	// the shared console mutex: the live "\r\033[K" prefix must then be kept,
+	// exactly as if LogWriter were unset.
+	LogWriterIsTerminal bool
+}
+
+// ConsoleWriter, when non-nil, receives all direct console diagnostics from
+// background workers (webhook queue, validators, session errors). The main
+// package sets it so those lines are serialized through the shared console
+// mutex instead of interleaving with styled match output. When nil everything
+// prints directly, exactly as before.
+var ConsoleWriter func(format string, args ...interface{})
+
+// Say prints a console diagnostic, funneled through ConsoleWriter when set.
+func Say(format string, args ...interface{}) {
+	if ConsoleWriter != nil {
+		ConsoleWriter(format, args...)
+		return
+	}
+	fmt.Printf(format, args...)
 }
 
 func (l *Logger) SetDebug(d bool) {
@@ -149,6 +171,18 @@ func (l *Logger) SetConfig(c *Config) {
 	l.config = c
 }
 
+// liveLinePrefix is the carriage-return plus erase-to-end-of-line pair that lets
+// each log line overwrite the previous one. That only makes sense when the scanner
+// is drawing live on a terminal, so it is emitted only then: a redirected log (a
+// pipe, a CI transcript, the web dashboard's log view, the TUI's Logs tab) would
+// otherwise carry a stray "\r" and erase sequence into the middle of the text.
+func liveLinePrefix(writingToLogWriter bool) string {
+	if writingToLogWriter || !term.IsTerminal(int(os.Stdout.Fd())) {
+		return ""
+	}
+	return "\r\033[K"
+}
+
 func (l *Logger) Log(level int, format string, args ...interface{}) {
 	l.Lock()
 	defer l.Unlock()
@@ -161,15 +195,16 @@ func (l *Logger) Log(level int, format string, args ...interface{}) {
 		return
 	}
 
+	prefix := liveLinePrefix(l.LogWriter != nil && !l.LogWriterIsTerminal)
 	if c, ok := LogColors[level]; ok {
-		line := c.Sprintf("\r\033[K"+format+"\n", args...)
+		line := c.Sprintf(prefix+format+"\n", args...)
 		if l.LogWriter != nil {
 			l.LogWriter(line)
 		} else {
 			fmt.Print(line)
 		}
 	} else {
-		line := fmt.Sprintf("\r\033[K"+format+"\n", args...)
+		line := fmt.Sprintf(prefix+format+"\n", args...)
 		if l.LogWriter != nil {
 			l.LogWriter(line)
 		} else {
@@ -194,7 +229,7 @@ func (l *Logger) LogWithColor(hexColor string, format string, args ...interface{
 	defer l.Unlock()
 
 	c := GetColorFromHex(hexColor)
-	line := c.Sprintf("\r\033[K"+format+"\n", args...)
+	line := c.Sprintf(liveLinePrefix(l.LogWriter != nil && !l.LogWriterIsTerminal)+format+"\n", args...)
 	if l.LogWriter != nil {
 		l.LogWriter(line)
 	} else {

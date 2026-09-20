@@ -1,9 +1,37 @@
 package core
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 )
+
+// placeholderRe matches values that are templates, code references or
+// environment lookups rather than credentials: "<password>", "${GH_TOKEN}",
+// "{{ api_key }}", "YOUR_API_KEY", "$($discovery.token)", "%TEMP%",
+// "REPLACE_WITH_...", "bp_dev_only", "os.environ['KEY']". Example configs, CI
+// workflow definitions, deploy scripts and documentation are full of these, and
+// none of them is a leaked secret. RE2 has no lookaround, so this is a plain
+// alternation tested against the matched text.
+var placeholderRe = regexp.MustCompile(
+	`(?i)<[a-z0-9_.\- ]+>` + // <password>, <host>, <your-api-key>
+		`|\$\{[^}]*\}` + // ${GH_TOKEN}
+		`|\$\(` + // $(command), $($var) - shell and PowerShell interpolation
+		`|\{\{[^}]*\}\}` + // {{ api_key }}
+		`|%[a-z_]{2,}%` + // %WINDOWS_VAR%
+		`|%[sdv]\b` + // printf-style templates
+		`|your[_-][a-z0-9]` + // YOUR_API_KEY / your-secret
+		`|replace[_-]?with` + // REPLACE_WITH_URL_SAFE_RANDOM_PASSWORD
+		`|(?:dev|ci|staging|local|qa|sandbox)[_-]?only` + // bp_dev_only, bp_ci_only
+		`|os\.environ|process\.env|getenv` + // language-level env lookups
+		`|x{4,}` + // xxxx
+		`|change[_-]?me|replace[_-]?me|placeholder|redacted`,
+)
+
+// isPlaceholderMatch reports whether a matched value is an obvious template.
+func isPlaceholderMatch(match string) bool {
+	return placeholderRe.MatchString(match)
+}
 
 const (
 	TypeSimple  = "simple"
@@ -40,6 +68,7 @@ type SimpleSignature struct {
 type PatternSignature struct {
 	part           string
 	match          *regexp.Regexp
+	notMatch       *regexp.Regexp
 	name           string
 	verifier       string
 	priority       int
@@ -127,7 +156,18 @@ func (s PatternSignature) Match(file MatchFile) (bool, string) {
 		return false, matchPart
 	}
 
-	return s.match.MatchString(*haystack), matchPart
+	if !s.match.MatchString(*haystack) {
+		return false, matchPart
+	}
+	// A not_regex guard discards path-like candidates that are known
+	// false positives (test fixtures, example paths). Contents rules are
+	// filtered per matched string in GetContentsMatches instead: rejecting
+	// on the whole file would drop real secrets sharing a file with an
+	// example.
+	if s.notMatch != nil && s.part != PartContents && s.notMatch.MatchString(*haystack) {
+		return false, matchPart
+	}
+	return true, matchPart
 }
 
 func (s PatternSignature) GetContentsMatches(file MatchFile) []string {
@@ -144,6 +184,22 @@ func (s PatternSignature) GetContentsMatches(file MatchFile) []string {
 			if strings.Contains(strings.ToLower(match), strings.ToLower(blacklistedString)) {
 				blacklistedMatch = true
 			}
+		}
+
+		// A not_regex guard discards individual matches that are known
+		// false positives (placeholder and example values). It is tested
+		// against the matched text, mirroring where a PCRE negative
+		// lookahead would have sat in the pattern.
+		if !blacklistedMatch && s.notMatch != nil && s.notMatch.MatchString(match) {
+			continue
+		}
+
+		// A value that is a template - "<password>", "${GH_TOKEN}",
+		// "{{ api_key }}", "YOUR_API_KEY" - is documentation, not a leak.
+		// This catches the placeholders in .env.example files and CI
+		// workflows regardless of which signature matched them.
+		if !blacklistedMatch && isPlaceholderMatch(match) {
+			continue
 		}
 
 		if !blacklistedMatch {
@@ -231,8 +287,11 @@ func (s PatternSignature) applyVerifier(match string, file MatchFile) bool {
 
 func GetSignatures(s *Session) []Signature {
 	var signatures []Signature
+	var unusable []string
+	regexCount, matchCount := 0, 0
 	for _, signature := range s.Config.Signatures {
 		if signature.Match != "" {
+			matchCount++
 			signatures = append(signatures, SimpleSignature{
 				name:           signature.Name,
 				part:           signature.Part,
@@ -247,18 +306,51 @@ func GetSignatures(s *Session) []Signature {
 			// using (?i), (?:...), lazy quantifiers, etc. are accepted. The
 			// old syntax.Parse(..., syntax.FoldCase) check ran in POSIX mode
 			// and silently dropped every such pattern.
-			if re, err := regexp.Compile(signature.Regex); err == nil {
-				signatures = append(signatures, PatternSignature{
-					name:           signature.Name,
-					part:           signature.Part,
-					match:          re,
-					verifier:       signature.Verifier,
-					priority:       signature.Priority,
-					color:          signature.Color,
-					excludeInModes: signature.ExcludeInModes,
-				})
+			//
+			// What it still cannot accept is PCRE-only syntax, most commonly a
+			// lookaround ((?=), (?!), (?<=)) or a backreference (\1); Go's engine
+			// is RE2 and has neither. Such a signature can never fire, so dropping
+			// it without a word leaves the operator believing a detection rule is
+			// active when it is not - six rules in the shipped example config were
+			// dead this way, including the Ethereum private-key and sk- key rules.
+			re, err := regexp.Compile(signature.Regex)
+			if err != nil {
+				unusable = append(unusable, fmt.Sprintf("%s: %v", signature.Name, err))
+				continue
 			}
+			var notRe *regexp.Regexp
+			if signature.NotRegex != "" {
+				notRe, err = regexp.Compile(signature.NotRegex)
+				if err != nil {
+					unusable = append(unusable, fmt.Sprintf("%s (not_regex): %v", signature.Name, err))
+					continue
+				}
+			}
+			regexCount++
+			signatures = append(signatures, PatternSignature{
+				name:           signature.Name,
+				part:           signature.Part,
+				match:          re,
+				notMatch:       notRe,
+				verifier:       signature.Verifier,
+				priority:       signature.Priority,
+				color:          signature.Color,
+				excludeInModes: signature.ExcludeInModes,
+			})
 		}
+	}
+
+	if len(unusable) > 0 && s.Log != nil {
+		s.Log.Warn("%d configured signature(s) can never fire and were skipped: Go's regexp "+
+			"engine is RE2, which supports neither lookaround nor backreferences.",
+			len(unusable))
+		for _, u := range unusable {
+			s.Log.Warn("  - %s", u)
+		}
+	}
+	if s.Log != nil && len(signatures) > 0 {
+		s.Log.Info("Loaded %d signatures (%d regex, %d file/path)",
+			len(signatures), regexCount, matchCount)
 	}
 
 	return signatures

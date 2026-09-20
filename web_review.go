@@ -227,15 +227,28 @@ func configSettings(ai core.AIReviewConfig) aiproviders.Settings {
 	if s.Provider == "" {
 		s.Provider = strings.ToLower(strings.TrimSpace(ai.Backend))
 	}
+	// The legacy keys do not name a provider. When the config names none either,
+	// infer it from which legacy fields are present: a bare deepseek_api_key used
+	// to produce a provider-less seed that the settings store rejected, so the
+	// key was dropped and the environment or built-in default took over - exactly
+	// the precedence the config was meant to win.
+	if s.Provider == "" {
+		switch {
+		case strings.TrimSpace(ai.OllamaURL) != "" || strings.TrimSpace(ai.OllamaModel) != "":
+			s.Provider = aiproviders.ProviderOllama
+		case strings.TrimSpace(ai.DeepseekKey) != "" || strings.TrimSpace(ai.DeepseekModel) != "":
+			s.Provider = aiproviders.ProviderDeepSeek
+		}
+	}
 	switch s.Provider {
-	case "ollama":
+	case aiproviders.ProviderOllama:
 		if s.BaseURL == "" {
 			s.BaseURL = strings.TrimSpace(ai.OllamaURL)
 		}
 		if s.Model == "" {
 			s.Model = strings.TrimSpace(ai.OllamaModel)
 		}
-	case "deepseek", "":
+	case aiproviders.ProviderDeepSeek:
 		if s.APIKey == "" {
 			s.APIKey = strings.TrimSpace(ai.DeepseekKey)
 		}
@@ -552,10 +565,24 @@ func startReview(rev *reviewstore.Review, client aiproviders.Client) {
 		status := reviewstore.StatusDone
 		assessment := job.full()
 		errMsg := ""
-		if err != nil {
+		switch {
+		case err != nil:
 			status = reviewstore.StatusFailed
-			assessment = ""
-			errMsg = err.Error()
+			// Keep whatever the model produced before it stopped. Discarding it threw
+			// away the only copy of text the operator had already paid for, and left a
+			// failed review with nothing to read. The message says it is partial so
+			// nobody mistakes a half-written assessment for a finished one.
+			if errors.Is(err, aiproviders.ErrStreamTruncated) {
+				errMsg = "the answer was cut off before the model finished, so the text below is incomplete: " + err.Error()
+			} else {
+				errMsg = err.Error()
+			}
+		case strings.TrimSpace(assessment) == "":
+			// A 200 response carrying no completion at all (a proxy error page, an error
+			// object sent with a 200 status, an empty body) used to be stored as a
+			// finished review with an empty assessment and no error to explain it.
+			status = reviewstore.StatusFailed
+			errMsg = aiproviders.ErrEmptyResponse.Error()
 		}
 		job.finish(status, errMsg)
 
@@ -660,11 +687,22 @@ func reviewStreamHandler(w http.ResponseWriter, r *http.Request, id string) {
 	if job == nil {
 		// No in-flight job: either it finished (or the server restarted) and the
 		// result is already persisted, or it never started.
+		//
+		// Re-read the review: it may have finished in the moment between the Get
+		// above and this lookup, and the earlier copy would still say "running",
+		// which used to be answered with "review is not running" even though the
+		// finished result was sitting on disk.
+		if fresh, ok := reviewStore.Get(id); ok {
+			rev = fresh
+		}
 		switch rev.Status {
 		case reviewstore.StatusDone:
 			_ = sseSend(w, flusher, map[string]any{"type": "done", "assessment": rev.Assessment})
 		case reviewstore.StatusFailed:
-			_ = sseSend(w, flusher, map[string]any{"type": "error", "error": rev.Error})
+			// Carry the partial assessment. A truncated or interrupted review keeps
+			// whatever text the model produced, and a client that connected late (or
+			// missed deltas) needs it alongside the error to show the operator.
+			_ = sseSend(w, flusher, map[string]any{"type": "error", "error": rev.Error, "assessment": rev.Assessment})
 		default:
 			_ = sseSend(w, flusher, map[string]any{"type": "error", "error": "review is not running"})
 		}
@@ -699,7 +737,10 @@ func reviewStreamHandler(w http.ResponseWriter, r *http.Request, id string) {
 			if !open {
 				text, status, errMsg := job.result()
 				if status == reviewstore.StatusFailed {
-					_ = sseSend(w, flusher, map[string]any{"type": "error", "error": errMsg})
+					// Include the partial text: a failure after the model had
+					// already produced output (a truncated stream, say) is exactly
+					// when the operator needs to read what did arrive.
+					_ = sseSend(w, flusher, map[string]any{"type": "error", "error": errMsg, "assessment": text})
 				} else {
 					_ = sseSend(w, flusher, map[string]any{"type": "done", "assessment": text})
 				}
@@ -770,7 +811,16 @@ func reviewChatHandler(w http.ResponseWriter, r *http.Request, id string) {
 		return sseSend(w, flusher, map[string]any{"type": "delta", "text": delta})
 	})
 	if err != nil {
-		_ = sseSend(w, flusher, map[string]any{"type": "error", "error": err.Error()})
+		// Keep whatever the model produced before the stream broke. A follow-up
+		// reply that was cut off is still worth reading, and without this it lived
+		// only in the browser and vanished on reload.
+		if partial := reply.String(); strings.TrimSpace(partial) != "" {
+			marked := partial + "\n\n_(the reply was cut off before it finished)_"
+			if aerr := reviewStore.AppendMessage(id, reviewstore.Message{Role: "assistant", Content: marked, CreatedAt: time.Now().UTC()}); aerr != nil {
+				log.Printf("[ai-review] could not save the partial reply for review %s: %v", id, aerr)
+			}
+		}
+		_ = sseSend(w, flusher, map[string]any{"type": "error", "error": err.Error(), "assessment": reply.String()})
 		return
 	}
 
