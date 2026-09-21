@@ -181,6 +181,12 @@ func (s PatternSignature) GetContentsMatches(file MatchFile) []string {
 		blacklistedMatch := false
 
 		for _, blacklistedString := range session.Config.BlacklistedStrings {
+			// An empty entry would make strings.Contains true for every match
+			// and silently disable the signature, so it is skipped rather than
+			// honoured.
+			if blacklistedString == "" {
+				continue
+			}
 			if strings.Contains(strings.ToLower(match), strings.ToLower(blacklistedString)) {
 				blacklistedMatch = true
 			}

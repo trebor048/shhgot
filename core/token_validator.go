@@ -760,6 +760,11 @@ func (tv *TokenValidator) DetectProvider(token string) string {
 		return ProviderOpenAI
 	case strings.HasPrefix(token, "sk-svcacct-"):
 		return ProviderOpenAI
+	case strings.HasPrefix(token, "sk-or-v1-"):
+		// Must precede the generic "sk-" case below: OpenRouter keys start with
+		// "sk-" and are 64+ chars, so the generic case swallowed them and they
+		// were validated against OpenAI endpoints (and always reported invalid).
+		return ProviderOpenRouter
 	case strings.HasPrefix(token, "sk-") && len(token) > 20:
 		// Could be OpenAI, DeepSeek, Together, Stability, etc.
 		if FastMatch("deepseek_key", token) {
@@ -770,8 +775,6 @@ func (tv *TokenValidator) DetectProvider(token string) string {
 		return ProviderGoogle
 	case strings.HasPrefix(token, "xai-"):
 		return ProviderXAI
-	case strings.HasPrefix(token, "sk-or-v1-"):
-		return ProviderOpenRouter
 	case strings.HasPrefix(token, "hf_"):
 		return ProviderHuggingFace
 	case strings.HasPrefix(token, "gsk_"):

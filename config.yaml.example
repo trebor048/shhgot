@@ -23,7 +23,25 @@ performance:
   api_sleep_seconds: 15
   worker_pool_size: 3
   queue_buffer_size: 2
-  max_file_count: 10000            # files processed per repository before skipping
+  # max_file_count now lives under "scanning" below. The legacy location here is
+  # still read when "scanning" leaves max_file_count unset.
+
+# ---------------------------------------------------------------------------
+# Scanning gates
+# ---------------------------------------------------------------------------
+# Every key is honored by the scanner (core/config.go). Absent keys keep the
+# compiled-in default, or the value passed on the command line. These are what
+# stop a spam repository of thousands of junk files from being walked in full:
+# max_file_count is a hard per-repository cap checked before any file is read.
+scanning:
+  max_file_count: 250              # skip a repo with more files than this (default 10000)
+  max_file_size_mb: 10             # skip individual files larger than this (CLI default 256 KB)
+  max_repo_size_mb: 1000           # skip repositories larger than this (CLI default 5120 KB)
+  clone_depth: 1                   # git clone depth; 1 = shallow (default)
+  clone_timeout_seconds: 60        # abort a clone after this long (CLI default 30)
+  scan_timeout_seconds: 120        # abort a repo's scan after this long; 0 = no limit (default)
+  skip_forks: false                # skip forked repositories
+  skip_archived: false             # skip archived repositories
 
 logFormat: "fancy"                 # minimal | fancy | ultra fancy | even more fancy | neon
                                    # minimal prints exactly one line per finding (for CI); the rest add styling.
@@ -304,7 +322,20 @@ webhook_payload: |
 #   file_output_enabled: false
 #   output_file_path: ''
 
-blacklisted_strings: ["AKIAIOSFODNN7EXAMPLE", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef1234", "username:password", "user:pass", "sshpass -p $SSH_PASS"]
+blacklisted_strings: [
+  "AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "your-api-key-here", "your_api_key", "your_secret_key",
+  "replace-me", "replace_me", "changeme", "change_me", "TODO", "FIXME", "PLACEHOLDER", "example.com", "example.org",
+  "username:password", "user:pass", "admin:admin", "password123", "admin123", "test123", "demo123", "localhost",
+  "127.0.0.1", "0.0.0.0", "fonts.googleapis.com", "maps.googleapis.com", "youtube.com", "fake", "demo",
+  "example", "placeholder", "sample", "mock", "dummy", "tutorial", "docs",
+  "letmein", "qwerty", "123456", "passwd", "pwd", "sshpass -p $SSH_PASS",
+  "0000000000000000", "1111111111111111", "2222222222222222", "3333333333333333",
+  "aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc", "dddddddddddddddd",
+  "eeeeeeeeeeeeeeee", "ffffffffffffffff", "0123456789abcdef", "deadbeefdeadbeef",
+  "test test test", "abandon abandon abandon", "zoo zoo zoo",
+  "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi",
+  "5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ"
+]
 blacklisted_extensions: [".exe", ".jpg", ".jpeg", ".png", ".gif", ".zip", ".tar.gz"]
 blacklisted_paths: ["node_modules{sep}", "vendor{sep}"]
 blacklisted_entropy_extensions: [".pem", "id_rsa", ".asc", ".ovpn", ".sqlite", ".log"]
@@ -312,14 +343,24 @@ blacklisted_entropy_extensions: [".pem", "id_rsa", ".asc", ".ovpn", ".sqlite", "
 # ═══════════════════════════════════════════════════════════════════════════
 # SIGNATURES - focused set
 #
-# Scope: database connection strings, AI/LLM API keys, environment files,
-# Hugging Face keys, finance/payment API keys, crypto wallets and seeds,
-# credential/auth files, and the config files that routinely carry secrets.
+# Scope: private keys, AI/LLM API keys, cloud & version-control tokens,
+# database connection strings, finance/payment keys, crypto wallets and
+# seeds, environment/credential files, and the config files that routinely
+# carry secrets.
 #
-# Broad, context-free catch-alls were removed on purpose: they matched code
-# and prose ("ApiKey = GetRequiredEnvironmentVariable", DB_PASSWORD="$VAR",
-# doc-example DSNs) far more often than they matched a real secret. Each rule
-# is anchored on the credential's own format or on the config key that names it.
+# How these rules are built:
+#   * Every contents rule is anchored either on the credential's own format
+#     (AKIA..., sk_live_..., hf_...) or on the config key that names it.
+#     Context-free catch-alls match code and prose far more often than they
+#     match a real secret.
+#   * A trailing \b is deliberately omitted after a character class that
+#     contains '-' or '_'. \b is a word/non-word boundary, so a key ending
+#     in '-' or '_' followed by a quote or a space could never match.
+#   * not_regex carries the false-positive guard. Go's engine is RE2 and has
+#     no lookaround ((?!...)), so the broad pattern lives in regex and the
+#     exclusion lives in not_regex.
+#   * Values that are one repeated character ("0000...", "aaaa...") are
+#     covered once, in blacklisted_strings, instead of in every rule.
 #
 # COLOR LEGEND (severity):
 #   priority 3 = #FF0000  Critical
@@ -328,58 +369,19 @@ blacklisted_entropy_extensions: [".pem", "id_rsa", ".asc", ".ovpn", ".sqlite", "
 #   priority 0 = #808080  Info
 # ═══════════════════════════════════════════════════════════════════════════
 signatures:
-  # ═══════════════════════════════════════════════════════════════════════
-  # PRIVATE KEYS
-  # ═══════════════════════════════════════════════════════════════════════
-
-  - part: 'contents'
-    regex: '-----BEGIN (RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----'
-    name: 'Private Key (PEM/OpenSSH)'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: '-----BEGIN PGP PRIVATE KEY BLOCK-----'
-    name: 'PGP Private Key'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: '-----BEGIN ENCRYPTED PRIVATE KEY-----'
-    name: 'Encrypted Private Key'
-    priority: 2
-    color: '#FFA500'
-
-  - part: 'filename'
-    regex: '^.*_rsa$'
-    name: 'Private SSH Key (RSA, by filename)'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'filename'
-    regex: '^.*_ed25519$'
-    name: 'Private SSH Key (Ed25519, by filename)'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: 'AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}'
-    name: 'Age Encryption Secret Key'
-    priority: 3
-    color: '#FF0000'
 
   # ═══════════════════════════════════════════════════════════════════════
-  # AI / LLM API KEYS
+  # 1. AI / ML / LLM
   # ═══════════════════════════════════════════════════════════════════════
 
   - part: 'contents'
-    regex: '\bsk-proj-[a-zA-Z0-9_-]{20,}\b'
+    regex: '\bsk-proj-[a-zA-Z0-9_-]{20,}'
     name: 'OpenAI Project API Key'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: '\bsk-svcacct-[a-zA-Z0-9_-]{48,}\b'
+    regex: '\bsk-svcacct-[a-zA-Z0-9_-]{48,}'
     name: 'OpenAI Service Account Key'
     priority: 3
     color: '#FF0000'
@@ -391,68 +393,20 @@ signatures:
     color: '#FF0000'
 
   - part: 'contents'
-    regex: '\bsk-ant-(?:api03-)?[a-zA-Z0-9_-]{90,}\b'
+    regex: '\bsk-ant-(?:api03-)?[a-zA-Z0-9_-]{90,}'
     name: 'Anthropic Claude API Key'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: '\bxai-[a-zA-Z0-9]{75,}\b'
-    name: 'xAI Grok API Key'
+    regex: '\bAIza[0-9A-Za-z_-]{35}'
+    name: 'Google AI Studio / Gemini API Key'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: '\bhf_[A-Za-z0-9]{34}\b'
-    name: 'Hugging Face API Token'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: '\bgsk_[A-Za-z0-9]{20,}\b'
-    name: 'Groq API Key'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: '\bpplx-[a-zA-Z0-9]{32,}\b'
-    name: 'Perplexity API Key'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: '\br8_[A-Za-z0-9]{20,}\b'
-    name: 'Replicate API Token'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: '\bsk-or-v1-[a-zA-Z0-9]{40,}\b'
-    name: 'OpenRouter API Key'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: '\bnvapi-[A-Za-z0-9_-]{32,}\b'
-    name: 'NVIDIA NIM API Key'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: '\bAIza[0-9A-Za-z_-]{35}\b'
-    name: 'Google AI / Gemini API Key'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: "(?i)\\btogether[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{64}\\b"
-    name: 'Together AI API Key'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: "(?i)\\bstability[\\w.-]{0,20}\\s*[:=]\\s*[\"']?sk-[A-Za-z0-9]{20,60}\\b"
-    name: 'Stability AI API Key'
+    regex: "(?i)\\bvertex[\\w.-]{0,20}\\s*[:=]\\s*[\"']?AIza[0-9A-Za-z_-]{35}"
+    name: 'Google Vertex AI API Key'
     priority: 3
     color: '#FF0000'
 
@@ -463,14 +417,20 @@ signatures:
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)\\bfireworks[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9]{32,}\\b"
-    name: 'Fireworks AI API Key'
+    regex: "(?i)\\bcohere[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{40}\\b"
+    name: 'Cohere API Key'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)\\b(?:elevenlabs|xi-api-key)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\\b"
-    name: 'ElevenLabs API Key'
+    regex: '\bgsk_[A-Za-z0-9]{20,}\b'
+    name: 'Groq / GroqCloud API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bxai-[a-zA-Z0-9]{75,}\b'
+    name: 'xAI Grok API Key'
     priority: 3
     color: '#FF0000'
 
@@ -481,26 +441,152 @@ signatures:
     color: '#FF0000'
 
   - part: 'contents'
+    regex: '\bpplx-[a-zA-Z0-9]{32,}\b'
+    name: 'Perplexity API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bsk-or-v1-[a-zA-Z0-9]{40,}\b'
+    name: 'OpenRouter API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btogether(?:[\\w.-]{0,20})?\\s*[:=]\\s*[\"']?[a-f0-9]{64}\\b"
+    name: 'Together AI / Together Inference API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bfireworks[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9]{32,}\\b"
+    name: 'Fireworks AI API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\br8_[A-Za-z0-9]{20,}\b'
+    name: 'Replicate API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bhf_[A-Za-z0-9]{34}\b'
+    name: 'Hugging Face API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bstability[\\w.-]{0,20}\\s*[:=]\\s*[\"']?sk-[A-Za-z0-9]{20,60}\\b"
+    name: 'Stability AI API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bai21[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{32,}\\b"
+    name: 'AI21 Labs API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\baleph[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{32,}\\b"
+    name: 'Aleph Alpha API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bcsk-[A-Za-z0-9_-]{20,}'
+    name: 'Cerebras / Cerebras Cloud API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsambanova[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{32,}\\b"
+    name: 'SambaNova / SambaNova Cloud API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bfriendli[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'FriendliAI API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\banyscale[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Anyscale API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmodal(?:[\\w.-]{0,20})?\\s*[:=]\\s*[\"']?(?:ak|as)-[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Modal / Modal Labs API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbaseten[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9._-]{20,}\\b"
+    name: 'Baseten API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\brpa_[A-Za-z0-9]{20,}'
+    name: 'RunPod API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\blambda[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Lambda Labs API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bvast[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Vast.ai API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\blepton[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Lepton AI API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bpredibase[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Predibase API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\boctoai[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'OctoAI API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bnvapi-[A-Za-z0-9_-]{32,}'
+    name: 'NVIDIA NGC / AI Enterprise API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bpa-[A-Za-z0-9_-]{20,}\b'
+    name: 'Voyage AI API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bjina_[A-Za-z0-9]{20,}\b'
+    name: 'Jina AI API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
     regex: "(?i)\\bassemblyai[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\\b"
     name: 'AssemblyAI API Key'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: "(?i)\\bazure[_-]?openai[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\\b"
-    name: 'Azure OpenAI API Key'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: "(?i)\\bcerebras[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{32,}\\b"
-    name: 'Cerebras API Key'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: "(?i)\\bcohere[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{40}\\b"
-    name: 'Cohere API Key'
     priority: 3
     color: '#FF0000'
 
@@ -511,50 +597,517 @@ signatures:
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)\\bsambanova[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{32,}\\b"
-    name: 'SambaNova API Key'
+    regex: "(?i)\\b(?:elevenlabs|xi-api-key)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\\b"
+    name: 'ElevenLabs API Key'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)\\b(?:zhipu|glm|bigmodel)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9._-]{32,}\\b"
-    name: 'Zhipu / GLM API Key'
+    regex: "(?i)\\bplay\\.?ht[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'PlayHT API Key'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)\\b(?:moonshot|kimi)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?sk-[a-zA-Z0-9]{32,}\\b"
-    name: 'Moonshot / Kimi API Key'
+    regex: '\bsk_car_[A-Za-z0-9_-]{20,}'
+    name: 'Cartesia API Key'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)\\bminimax[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9._-]{32,}\\b"
-    name: 'MiniMax API Key'
+    regex: "(?i)\\bmurf[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Murf AI API Key'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)\\bbaseten[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9._-]{20,}\\b"
-    name: 'Baseten API Key'
+    regex: "(?i)\\bresemble[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Resemble AI API Key'
     priority: 3
     color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bspeechify[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Speechify API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\brev\\.?ai[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Rev AI API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsoniox[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Soniox API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgladia[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Gladia API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bpcsk_[A-Za-z0-9_-]{20,}'
+    name: 'Pinecone API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bweaviate[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Weaviate API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bqdrant[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Qdrant API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:zilliz|milvus)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Milvus / Zilliz API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bck-[A-Za-z0-9]{20,}\b'
+    name: 'Chroma API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\blancedb[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'LanceDB API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\btpuf_[A-Za-z0-9]{20,}'
+    name: 'Turbopuffer API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bvectara[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Vectara API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bdeeplake[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Deep Lake API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmarqo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Marqo API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btypesense[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Typesense API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\balgolia[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9]{32}\\b"
+    name: 'Algolia API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:elasticsearch|elastic)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Elasticsearch API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bopensearch[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'OpenSearch API Key'
+    priority: 2
+    color: '#FFA500'
 
   # ═══════════════════════════════════════════════════════════════════════
-  # CLOUD & VERSION-CONTROL AUTH TOKENS
+  # 2. MAJOR CLOUD PROVIDERS - AWS
   # ═══════════════════════════════════════════════════════════════════════
 
   - part: 'contents'
     regex: '\b(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}\b'
-    name: 'AWS Access Key ID'
+    name: 'AWS Access Key ID / IAM Credentials / IAM Role Credentials'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)\\baws[_-]?secret[_-]?(?:access[_-]?)?key\\s*[:=]\\s*[\"']?[A-Za-z0-9/+=]{40}\\b"
+    regex: "(?i)\\baws[_-]?secret[_-]?(?:access[_-]?)?key\\s*[:=]\\s*[\"']?[A-Za-z0-9/+=]{40}"
     name: 'AWS Secret Access Key'
     priority: 3
     color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\baws[_-]?session[_-]?token\\s*[:=]\\s*[\"']?[A-Za-z0-9/+=]{100,}"
+    name: 'AWS Session Token / AWS STS Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:aws_)?security_token\\s*[:=]\\s*[\"']?[A-Za-z0-9/+=]{100,}"
+    name: 'AWS Security Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcognito[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-z]{2}-[a-z]+-\\d:[0-9a-f-]{36}\\b"
+    name: 'AWS Cognito Identity Pool Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\baws[_-]?codeartifact[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9/+=]{20,}"
+    name: 'AWS CodeArtifact Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\baws[_-]?code(?:commit|build|deploy|pipeline)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9/+=]{20,}"
+    name: 'AWS CodeCommit / CodeBuild / CodeDeploy / CodePipeline Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bAWS:[A-Za-z0-9+/=]{20,}'
+    name: 'AWS ECR Authorization Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: 'X-Amz-(?:Credential|Signature|Security-Token)=[A-Za-z0-9%&=/_+.-]{16,}'
+    name: 'AWS S3 Presigned URL Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\baws[_-]?(?:bedrock|sagemaker|kms|secrets[_-]?manager|parameter[_-]?store|lightsail|amplify|appsync|api[_-]?gateway|iot|ses|sns|sqs|eventbridge)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9/+=]{20,}"
+    name: 'AWS Service Credential (Bedrock/SageMaker/KMS/Secrets/ParameterStore/Lightsail/Amplify/AppSync/APIGateway/IoT/SES/SNS/SQS/EventBridge)'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 2. MAJOR CLOUD PROVIDERS - MICROSOFT AZURE
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bazure[_-]?client[_-]?secret\\s*[:=]\\s*[\"']?[A-Za-z0-9~._-]{32,}"
+    name: 'Azure Client Secret / Service Principal Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bazure[_-]?client[_-]?id\\s*[:=]\\s*[\"']?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b"
+    name: 'Azure Client ID'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bazure[_-]?tenant[_-]?id\\s*[:=]\\s*[\"']?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b"
+    name: 'Azure Tenant ID'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bazure[_-]?subscription[_-]?id\\s*[:=]\\s*[\"']?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b"
+    name: 'Azure Subscription Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:azure[_-]?)?(?:access|bearer)[_-]?token\\s*[:=]\\s*[\"']?eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"
+    name: 'Azure Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b[a-z0-9]{52}\b'
+    not_regex: "(?i)^(?:[a-f0-9]{52})$"
+    name: 'Azure DevOps Personal Access Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bazure[_-]?(?:storage[_-]?)?(?:account[_-]?)?key\\s*[:=]\\s*[\"']?[A-Za-z0-9+/]{86}=="
+    name: 'Azure Storage Account Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '[?&](?:sv|sig)=[A-Za-z0-9%&=/_+.-]{16,}'
+    name: 'Azure SAS Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcosmos[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9+/]{86}=="
+    name: 'Azure Cosmos DB Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bazure[_-]?openai[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\\b"
+    name: 'Azure OpenAI API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bazure[_-]?(?:cognitive|maps|communication|signalr)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{32,}\\b"
+    name: 'Azure Cognitive Services / Maps / Communication / SignalR Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:microsoft[_-]?graph|entra[_-]?id|microsoft[_-]?fabric)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9._-]{20,}\\b"
+    name: 'Microsoft Graph / Entra ID / Fabric Credential'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 2. MAJOR CLOUD PROVIDERS - GOOGLE
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: '\bAIza[0-9A-Za-z_-]{35}'
+    name: 'Google API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b\d{10,}-[a-z0-9]{20,}\.apps\.googleusercontent\.com\b'
+    name: 'Google OAuth Client ID'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '\bGOCSPX-[A-Za-z0-9_-]{28,}'
+    name: 'Google OAuth Client Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '"type"\s*:\s*"service_account"'
+    name: 'Google Service Account JSON'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bya29\.[0-9A-Za-z_-]{20,}'
+    name: 'Google Cloud Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b1//0[0-9A-Za-z_-]{20,}'
+    name: 'Google Cloud Refresh Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bfirebase[\\w.-]{0,20}\\s*[:=]\\s*[\"']?AIza[0-9A-Za-z_-]{35}"
+    name: 'Firebase API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bfirebase[\\w.-]{0,20}(?:admin|service[_-]?account)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Firebase Service Account / Admin SDK Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bAAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}'
+    name: 'Firebase Cloud Messaging Server Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:google[_-]?maps|google[_-]?places|geocod(?:e|ing))[\\w.-]{0,20}\\s*[:=]\\s*[\"']?AIza[0-9A-Za-z_-]{35}"
+    name: 'Google Maps / Places / Geocoding API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:google[_-]?(?:drive|sheets|youtube|ads|translate|vision|speech|natural[_-]?language)|youtube[_-]?(?:data|analytics)|search[_-]?console)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:AIza[0-9A-Za-z_-]{35}|ya29\\.[0-9A-Za-z_-]{20,})"
+    name: 'Google Drive / Sheets / YouTube / Ads / Translate / Vision / Speech / NL API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:gcs|google[_-]?cloud[_-]?storage|bigquery|pub/?sub|cloud[_-]?sql|artifact[_-]?registry)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9._/-]{20,}\\b"
+    name: 'Google Cloud Storage / BigQuery / PubSub / Cloud SQL / Artifact Registry Credential'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 2. MAJOR CLOUD PROVIDERS - OTHER CLOUDS
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:cloudflare|cf)[_-]?(?:api[_-]?)?(?:token|key)\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{37,}\\b"
+    name: 'Cloudflare API Token / Global API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b(?:dop|doo|dor)_v1_[a-f0-9]{64}\b'
+    name: 'DigitalOcean Personal Access Token / OAuth Token / Refresh Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\blinode[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{64}\\b"
+    name: 'Linode API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bakamai[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Akamai API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bvultr[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Z0-9]{20,}\\b"
+    name: 'Vultr API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bhetzner[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Hetzner API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bovh[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'OVH API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '\bSCW[A-Z0-9]{17}\b'
+    name: 'Scaleway Secret Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bocid1\.[a-z0-9.]{20,}'
+    name: 'Oracle Cloud OCID Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bibm[_-]?cloud[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'IBM Cloud API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bLTAI[A-Za-z0-9]{12,}\b'
+    name: 'Alibaba Cloud Access Key ID'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bAKID[A-Za-z0-9]{13,}\b'
+    name: 'Tencent Cloud Secret ID'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bhuawei[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Huawei Cloud Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\brackspace[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Rackspace API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bequinix[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Equinix Metal API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bleaseweb[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Leaseweb API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bupcloud[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'UpCloud API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bkamatera[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Kamatera API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcontabo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Contabo API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bionos[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'IONOS API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bdreamhost[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'DreamHost API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bliquid[_-]?web[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Liquid Web API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bhostinger[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Hostinger API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bgo[_-]?daddy[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'GoDaddy API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bnavisite[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Navisite API Credential'
+    priority: 1
+    color: '#FFFF00'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 3. DEV PLATFORMS
+  # ═══════════════════════════════════════════════════════════════════════
 
   - part: 'contents'
     regex: '\bghp_[a-zA-Z0-9]{36}\b'
@@ -563,7 +1116,7 @@ signatures:
     color: '#FF0000'
 
   - part: 'contents'
-    regex: '\bgithub_pat_[0-9a-zA-Z_]{80,}\b'
+    regex: '\bgithub_pat_[0-9a-zA-Z_]{80,}'
     name: 'GitHub Fine-Grained PAT'
     priority: 3
     color: '#FF0000'
@@ -582,7 +1135,7 @@ signatures:
 
   - part: 'contents'
     regex: '\bghs_[a-zA-Z0-9]{36}\b'
-    name: 'GitHub Server-to-Server Token'
+    name: 'GitHub App / Server-to-Server Token'
     priority: 3
     color: '#FF0000'
 
@@ -593,22 +1146,98 @@ signatures:
     color: '#FF0000'
 
   - part: 'contents'
-    regex: '\bglpat-[a-zA-Z0-9_-]{20,}\b'
+    regex: "(?i)\\bgithub[_-]?(?:actions|app)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:gh[pousr]_[a-zA-Z0-9]{36}|github_pat_[0-9a-zA-Z_]{80,})"
+    name: 'GitHub Actions / GitHub Apps Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bglpat-[a-zA-Z0-9_-]{20,}'
     name: 'GitLab Personal Access Token'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: '\bglrt-[a-zA-Z0-9_-]{20}\b'
+    regex: '\bglrt-[a-zA-Z0-9_-]{20}'
     name: 'GitLab Runner Token'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: '\bdop_v1_[a-f0-9]{64}\b'
-    name: 'DigitalOcean Personal Access Token'
+    regex: '\b(?:glsoat|gldt|glcbt|glft|glimt|glagent)-[a-zA-Z0-9_-]{20,}'
+    name: 'GitLab CI / Deploy / Feature / Agent Token'
     priority: 3
     color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bATBB[a-zA-Z0-9]{28,}\b'
+    name: 'Bitbucket App Password / Pipelines Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbitbucket[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_=-]{20,}\\b"
+    name: 'Bitbucket API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bsourceforge[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'SourceForge API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bgitea[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{40}\\b"
+    name: 'Gitea API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bforgejo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{40}\\b"
+    name: 'Forgejo API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcodeberg[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{40}\\b"
+    name: 'Codeberg API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgerrit[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_=-]{20,}\\b"
+    name: 'Gerrit HTTP Password'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bapi-[a-z0-9]{28}\b'
+    name: 'Phabricator API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\blaunchpad[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Launchpad API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bperforce[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Perforce Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bplastic[_-]?scm[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Plastic SCM Credential'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 4. PACKAGE REGISTRIES
+  # ═══════════════════════════════════════════════════════════════════════
 
   - part: 'contents'
     regex: '\bnpm_[a-zA-Z0-9]{36}\b'
@@ -617,91 +1246,731 @@ signatures:
     color: '#FF0000'
 
   - part: 'contents'
-    regex: '\bpypi-AgEIcHlwaS5vcmc[a-zA-Z0-9_-]{50,}\b'
+    regex: '\bpypi-AgEIcHlwaS5vcmc[a-zA-Z0-9_-]{50,}'
     name: 'PyPI API Token'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: '\bdckr_pat_[a-zA-Z0-9_-]{20,}\b'
+    regex: '\brubygems_[a-f0-9]{48}\b'
+    name: 'RubyGems API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmaven[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Maven Central Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bgradle[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Gradle Plugin Portal Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '\boy2[a-zA-Z0-9+/=]{40,}'
+    name: 'NuGet API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bpackagist[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Packagist API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcargo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Cargo Registry Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bgo[_-]?modules?[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Go Modules Proxy Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bhex\\.?pm[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Hex.pm API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bhackage[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Hackage API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcocoapods[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\\b"
+    name: 'CocoaPods Trunk Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bswift[_-]?package[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Swift Package Registry Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bhomebrew[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Homebrew API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bchocolatey[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Chocolatey API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bscoop[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Scoop Bucket Credential'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: "(?i)\\bconan[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Conan API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bvcpkg[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'vcpkg Registry Credential'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: "(?i)\\bcrates?\\.?io[\\w.-]{0,20}\\s*[:=]\\s*[\"']?cio[a-zA-Z0-9]{20,}\\b"
+    name: 'Crates.io API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bdckr_pat_[a-zA-Z0-9_-]{20,}'
     name: 'Docker Hub Personal Access Token'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: '\bHRKU-AA[0-9a-zA-Z_-]{58}\b'
+    regex: "(?i)\\bgithub[_-]?packages[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:ghp_[a-zA-Z0-9]{36}|github_pat_[0-9a-zA-Z_]{80,})"
+    name: 'GitHub Packages Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgitlab[_-]?(?:package|registry)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?glpat-[a-zA-Z0-9_-]{20,}"
+    name: 'GitLab Package Registry Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bazure[_-]?artifacts[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_=-]{20,}\\b"
+    name: 'Azure Artifacts Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '\bAKCp[A-Za-z0-9]{60,}'
+    name: 'JFrog Artifactory API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:sonatype|nexus)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Sonatype Nexus Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcloudsmith[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Cloudsmith API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bmyget[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'MyGet API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bpackagecloud[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Packagecloud API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bgemfury[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Gemfury API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\brepology[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Repology API Credential'
+    priority: 1
+    color: '#FFFF00'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 5. CI / CD
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bgithub[_-]?actions[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:ghp_[a-zA-Z0-9]{36}|github_pat_[0-9a-zA-Z_]{80,})"
+    name: 'GitHub Actions Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgitlab[_-]?ci[\\w.-]{0,20}\\s*[:=]\\s*[\"']?gl(?:pat|rt)-[a-zA-Z0-9_-]{20,}"
+    name: 'GitLab CI Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcircleci[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{40}\\b"
+    name: 'CircleCI API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btravis[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Travis CI API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bjenkins[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32,}\\b"
+    name: 'Jenkins API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bbkua_[a-f0-9]{40}\b'
+    name: 'Buildkite API Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bteamcity[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'TeamCity Access Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bbamboo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Bamboo API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bdrone[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Drone CI Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '\bpat\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}'
+    name: 'Harness Personal Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcodefresh[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Codefresh API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bsemaphore(?:[\\w.-]{0,20})?\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Semaphore / Semaphore CI Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bbuddy[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Buddy Works API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bbitrise[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Bitrise API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bappcenter[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'AppCenter API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcodemagic[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Codemagic API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:spinnaker|argo[_-]?cd|argo[_-]?workflows|flux|tekton|concourse|woodpecker|gocd|wercker|screwdriver)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'GitOps / CI Engine Credential (Spinnaker/Argo/Flux/Tekton/Concourse/Woodpecker/GoCD/Wercker/Screwdriver)'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:aws[_-]?codebuild|azure[_-]?pipelines|google[_-]?cloud[_-]?(?:build|deploy))[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_/+=.-]{20,}\\b"
+    name: 'Cloud CI Credential (AWS CodeBuild / Azure Pipelines / Google Cloud Build & Deploy)'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 6. HOSTING / DEPLOYMENT
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bvercel[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9]{24}\\b"
+    name: 'Vercel API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bnfp_[a-zA-Z0-9]{40}\b'
+    name: 'Netlify Personal Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\brnd_[A-Za-z0-9]{20,}\b'
+    name: 'Render API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\brailway[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9-]{32,}\\b"
+    name: 'Railway API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bFlyV1 [A-Za-z0-9_=.-]{20,}'
+    name: 'Fly.io API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bHRKU-AA[0-9a-zA-Z_-]{58}'
     name: 'Heroku API Key'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: '\bya29\.[0-9A-Za-z_-]{20,}\b'
-    name: 'Google OAuth Access Token'
+    regex: "(?i)\\bcloudflare[_-]?(?:pages|workers|r2)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{37,}\\b"
+    name: 'Cloudflare Pages / Workers / R2 Token'
     priority: 3
     color: '#FF0000'
-
-  # ═══════════════════════════════════════════════════════════════════════
-  # DATABASE CONNECTION STRINGS (credentials embedded in the URL)
-  # ═══════════════════════════════════════════════════════════════════════
 
   - part: 'contents'
-    regex: "(?i)mongodb(?:\\+srv)?://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
-    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|example|test|demo|user:pass)|:(?:password|changeme|postgres|root|admin)@"
-    name: 'MongoDB Connection String with Credentials'
+    regex: "(?i)\\bdeno[_-]?deploy[\\w.-]{0,20}\\s*[:=]\\s*[\"']?d(?:dp|do)_[a-zA-Z0-9]{20,}\\b"
+    name: 'Deno Deploy Access Token'
     priority: 3
     color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bkoyeb[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Koyeb API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bnorthflank[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Northflank API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bqovery[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Qovery API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bzeabur[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Zeabur API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\badaptable[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Adaptable API Token'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: "(?i)\\bcyclic[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Cyclic API Token'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: "(?i)\\bglitch[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Glitch API Token'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: "(?i)\\breplit[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Replit API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcodesandbox[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'CodeSandbox API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bstackblitz[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'StackBlitz API Token'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: "(?i)\\bgitpod[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Gitpod API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcodespaces[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:ghp_[a-zA-Z0-9]{36}|github_pat_[0-9a-zA-Z_]{80,})"
+    name: 'GitHub Codespaces Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bsgp_[a-zA-Z0-9]{40,}\b'
+    name: 'Sourcegraph Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bpythonanywhere[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'PythonAnywhere API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bdigitalocean[_-]?app[\\w.-]{0,20}\\s*[:=]\\s*[\"']?dop_v1_[a-f0-9]{64}\b"
+    name: 'DigitalOcean App Platform Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\baws[_-]?amplify[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:AKIA|ASIA)[A-Z0-9]{16}\b"
+    name: 'AWS Amplify Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bazure[_-]?static[_-]?web[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\b"
+    name: 'Azure Static Web Apps Deployment Token'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 7. DATABASES - SQL
+  # ═══════════════════════════════════════════════════════════════════════
 
   - part: 'contents'
     regex: "(?i)postgres(?:ql)?://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
-    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|example|test|demo|user:pass)|:(?:password|changeme|postgres|root|admin)@"
+    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@"
     name: 'PostgreSQL Connection String with Credentials'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
     regex: "(?i)mysql://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
-    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|example|test|demo|user:pass)|:(?:password|changeme|postgres|root|admin)@"
+    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@"
     name: 'MySQL Connection String with Credentials'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
     regex: "(?i)mariadb://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
-    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|example|test|demo|user:pass)|:(?:password|changeme|postgres|root|admin)@"
+    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@"
     name: 'MariaDB Connection String with Credentials'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)redis://[^:\\s\"']*:[^@\\s\"']+@[^\\s\"']+"
-    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|example|test|demo)|:(?:password|changeme|redis)@"
-    name: 'Redis Connection String with Credentials'
+    regex: "(?i)(?:mssql|sqlserver)://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@"
+    name: 'MSSQL / SQL Server Connection String with Credentials'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)(?:mssql|sqlserver)://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
-    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|example|test|demo|user:pass)|:(?:password|changeme|sa|root|admin)@"
-    name: 'SQL Server Connection String with Credentials'
+    regex: "(?i)oracle://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@"
+    name: 'Oracle Database Connection String with Credentials'
     priority: 3
     color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)sqlite://[^\\s\"']+"
+    name: 'SQLite Connection String'
+    priority: 1
+    color: '#FFFF00'
 
   - part: 'contents'
     regex: "(?i)cockroach(?:db)?://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
-    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|example|test|demo|user:pass)|:(?:password|changeme|root|admin)@"
+    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@"
     name: 'CockroachDB Connection String with Credentials'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)amqps?://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
-    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|example|test|demo|user:pass)|:(?:password|changeme|guest|admin)@"
-    name: 'AMQP / RabbitMQ Connection String with Credentials'
+    regex: "(?i)yugabyte(?:db)?://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@"
+    name: 'YugabyteDB Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)tidb://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@"
+    name: 'TiDB Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bpscale_(?:tkn|pw|oauth)_[a-zA-Z0-9_-]{20,}'
+    name: 'PlanetScale Service Token / Password'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bnapi_[a-zA-Z0-9_-]{20,}'
+    name: 'Neon API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bsbp_[a-f0-9]{40}\b'
+    name: 'Supabase Personal Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:alloydb|amazon[_-]?aurora|amazon[_-]?rds|azure[_-]?sql|google[_-]?cloud[_-]?sql)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[^\\s\"']{20,}\\b"
+    name: 'Managed SQL Service Credential (AlloyDB / Aurora / RDS / Azure SQL / Cloud SQL)'
     priority: 3
     color: '#FF0000'
 
   # ═══════════════════════════════════════════════════════════════════════
-  # FINANCE / PAYMENT API KEYS
+  # 7. DATABASES - NOSQL
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)mongodb(?:\\+srv)?://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@"
+    name: 'MongoDB / MongoDB Atlas Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)redis://[^:\\s\"']*:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@"
+    name: 'Redis / Redis Cloud Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:dynamodb|dynamo)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:AKIA|ASIA)[A-Z0-9]{16}\\b"
+    name: 'DynamoDB Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)cassandra://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@"
+    name: 'Cassandra Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)scylla(?:db)?://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@"
+    name: 'ScyllaDB Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)https?://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']*(?:couchdb|5984)[^\\s\"']*"
+    name: 'CouchDB Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)couchbase://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@"
+    name: 'Couchbase Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bfirestore[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:AIza[0-9A-Za-z_-]{35}|\"type\"\\s*:\\s*\"service_account\")"
+    name: 'Firestore Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\brealtime[_-]?database[\\w.-]{0,20}\\s*[:=]\\s*[\"']?https://[a-z0-9-]+\\.firebaseio\\.com"
+    name: 'Firebase Realtime Database URL'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '\bfnA[A-Za-z0-9_-]{20,}\b'
+    name: 'FaunaDB Secret Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcosmos[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9+/]{86}=="
+    name: 'Cosmos DB Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\braven(db)?[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'RavenDB Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\barangodb[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'ArangoDB Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bneo4j://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: "(?i)://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@"
+    name: 'Neo4j Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\borientdb[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'OrientDB Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\brethinkdb[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'RethinkDB Credential'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 7. DATABASES - HOSTED DB PLATFORMS
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bsupabase[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:eyJ[A-Za-z0-9_-]{10,}|sbp_[a-f0-9]{40})"
+    name: 'Supabase Service Key / JWT'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bneon[\\w.-]{0,20}\\s*[:=]\\s*[\"']?napi_[a-zA-Z0-9_-]{20,}"
+    name: 'Neon Platform Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bplanetscale[\\w.-]{0,20}\\s*[:=]\\s*[\"']?pscale_(?:tkn|pw|oauth)_[a-zA-Z0-9_-]{20,}"
+    name: 'PlanetScale Platform Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\baiven[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Aiven API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:crunchy[_-]?bridge|tembo)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Crunchy Bridge / Tembo Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bturso[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_.-]{20,}\\b"
+    name: 'Turso Platform Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcockroach[_-]?cloud[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'CockroachDB Cloud API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmongo(?:db)?[_-]?atlas[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'MongoDB Atlas API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bupstash[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_=-]{20,}\\b"
+    name: 'Upstash API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bxau_[a-zA-Z0-9]{20,}\b'
+    name: 'Xata API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bconvex[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:prod|dev):[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Convex Deploy Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:railway|render)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:rnd_|railway_)[a-zA-Z0-9_-]{20,}"
+    name: 'Railway / Render Database Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bheroku[_-]?postgres[\\w.-]{0,20}\\s*[:=]\\s*[\"']?postgres://[^\\s\"']+"
+    name: 'Heroku Postgres Connection String'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bfirebase[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Firebase Database Credential'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 8. PAYMENT / FINANCIAL APIS
   # ═══════════════════════════════════════════════════════════════════════
 
   - part: 'contents'
@@ -717,10 +1986,16 @@ signatures:
     color: '#FF0000'
 
   - part: 'contents'
-    regex: '\bwhsec_[0-9a-zA-Z_-]{32,}\b'
+    regex: '\bwhsec_[0-9a-zA-Z_-]{32,}'
     name: 'Stripe Webhook Secret'
     priority: 3
     color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bpk_live_[0-9a-zA-Z]{24,}\b'
+    name: 'Stripe Live Publishable Key'
+    priority: 1
+    color: '#FFFF00'
 
   - part: 'contents'
     regex: '\bsk_test_[0-9a-zA-Z]{24,}\b'
@@ -729,14 +2004,8 @@ signatures:
     color: '#FFA500'
 
   - part: 'contents'
-    regex: '\bsq0atp-[0-9A-Za-z_-]{22}\b'
-    name: 'Square Access Token'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: '\bsq0csp-[0-9A-Za-z_-]{43}\b'
-    name: 'Square OAuth Secret'
+    regex: "(?i)\\bstripe[\\w.-]{0,20}(?:connect|terminal)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:sk_live_|rk_live_|whsec_)[0-9a-zA-Z_-]{24,}"
+    name: 'Stripe Connect / Terminal Credential'
     priority: 3
     color: '#FF0000'
 
@@ -747,32 +2016,26 @@ signatures:
     color: '#FF0000'
 
   - part: 'contents'
-    regex: '\brzp_(?:live|test)_[a-zA-Z0-9]{14,}\b'
-    name: 'Razorpay Key'
+    regex: '\bA21AA[A-Za-z0-9_-]{40,}\b'
+    name: 'PayPal REST Access Token'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: '\bFLWSECK(?:_TEST)?-[0-9a-f]{32}-X\b'
-    name: 'Flutterwave Secret Key'
+    regex: '\bsq0atp-[0-9A-Za-z_-]{22}'
+    name: 'Square Access Token'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)\\bcoinbase[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
-    name: 'Coinbase API Key'
-    priority: 2
-    color: '#FFA500'
-
-  - part: 'contents'
-    regex: "(?i)\\bbinance[_-]?(?:api[_-]?)?(?:key|secret)\\s*[:=]\\s*[\"']?[A-Za-z0-9]{64}\\b"
-    name: 'Binance API Key / Secret'
+    regex: '\bsq0csp-[0-9A-Za-z_-]{43}'
+    name: 'Square OAuth Secret'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)\\bplaid[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{24,}\\b"
-    name: 'Plaid API Key'
+    regex: '\bEAAA[A-Za-z0-9_-]{60,}\b'
+    name: 'Square Application Secret'
     priority: 3
     color: '#FF0000'
 
@@ -783,8 +2046,152 @@ signatures:
     color: '#FFA500'
 
   - part: 'contents'
-    regex: "(?i)\\bklarna[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{32,}\\b"
-    name: 'Klarna API Key'
+    regex: "(?i)\\bcheckout\\.?com[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:sk|pk)_[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Checkout.com API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmollie[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:live|test)_[a-zA-Z0-9]{20,}\\b"
+    name: 'Mollie API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bpaddle[\\w.-]{0,20}\\s*[:=]\\s*[\"']?pdl_[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Paddle API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bchargebee[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Chargebee API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\brecurly[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Recurly API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bzuora[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Zuora API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bfastspring[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'FastSpring API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\blemon[_-]?squeezy[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Lemon Squeezy API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgumroad[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Gumroad Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bshpat_[a-f0-9]{32}\b'
+    name: 'Shopify Admin API Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bshpss_[a-f0-9]{32}\b'
+    name: 'Shopify Shared Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bshpca_[a-f0-9]{32}\b'
+    name: 'Shopify Custom App Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bshppa_[a-f0-9]{32}\b'
+    name: 'Shopify Private App Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bshptka_[a-f0-9]{32}\b'
+    name: 'Shopify Theme Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bauthorize\\.?net[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Authorize.Net API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bworldpay[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Worldpay API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bgocardless[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:live|sandbox)_[a-zA-Z0-9_-]{20,}\\b"
+    name: 'GoCardless API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bwise[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Wise API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bplaid[_-]?(?:secret|api[_-]?key|client[_-]?id)\\s*[:=]\\s*[\"']?[a-zA-Z0-9]{24,}\\b"
+    name: 'Plaid API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bdwolla[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Dwolla API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bmarqeta[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Marqeta API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmodern[_-]?treasury[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Modern Treasury API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bairwallex[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Airwallex API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\brapyd[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Rapyd API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bpayoneer[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Payoneer API Credential'
     priority: 2
     color: '#FFA500'
 
@@ -794,212 +2201,3861 @@ signatures:
     priority: 3
     color: '#FF0000'
 
-  # ═══════════════════════════════════════════════════════════════════════
-  # CRYPTO WALLETS & SEEDS
-  # ═══════════════════════════════════════════════════════════════════════
-
   - part: 'contents'
-    regex: "(?i)\\b(?:eth|ethereum)[_-]?(?:private[_-]?key|secret)\\s*[:=]\\s*[\"']?0x[a-fA-F0-9]{64}\\b"
-    name: 'Ethereum Private Key (labeled)'
+    regex: '\bFLWSECK(?:_TEST)?-[0-9a-f]{32}-X\b'
+    name: 'Flutterwave Secret Key'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)\\b(?:btc|bitcoin)[_-]?(?:private[_-]?key|wif|secret)\\s*[:=]\\s*[\"']?[5KL][1-9A-HJ-NP-Za-km-z]{50,51}\\b"
-    name: 'Bitcoin WIF Private Key (labeled)'
+    regex: '\brzp_(?:live|test)_[a-zA-Z0-9]{14,}\b'
+    name: 'Razorpay Key'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)\\b(?:sol|solana)[_-]?(?:private[_-]?key|secret)\\s*[:=]\\s*[\"']?[1-9A-HJ-NP-Za-km-z]{87,88}\\b"
-    name: 'Solana Private Key (labeled)'
+    regex: "(?i)\\bcashfree[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:cfsk_|cfpk_)[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Cashfree API Key'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?i)\\b(?:secretKey|privateKey|keypair)\\s*[:=]\\s*\\[(?:\\s*\\d{1,3}\\s*,){63}\\s*\\d{1,3}\\s*\\]"
-    name: 'Solana Keypair Array'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: "(?i)\\b(?:wallet|crypto)[_-]?(?:private[_-]?key|priv[_-]?key|secret[_-]?key)\\s*[:=]\\s*[\"'][a-zA-Z0-9]{40,}[\"']"
-    not_regex: "(?i)[\"'](?:aws|paste|from|crypto|generated)\\b"
-    name: 'Crypto Private Key (labeled)'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: "(?i)\\b(?:mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\\s*[:=]\\s*[\"'][a-z]+(?:\\s+[a-z]+){10,23}[\"']"
-    not_regex: "(?i)[\"'](?:paste|your|enter)\\b"
-    name: 'Crypto Mnemonic / Seed Phrase (labeled)'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: "(?i)[\"'](?:privateKey|secretKey|mnemonic|seedPhrase|recoveryPhrase)[\"']\\s*:\\s*[\"'][^\"']{40,}[\"']"
-    name: 'Crypto Secret JSON Field'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'contents'
-    regex: '\b(?:xprv|yprv|zprv|tprv)[1-9A-HJ-NP-Za-km-z]{70,120}\b'
-    name: 'Extended Private Key (xprv)'
-    priority: 3
-    color: '#FF0000'
-
-  # ═══════════════════════════════════════════════════════════════════════
-  # ENVIRONMENT FILES
-  # ═══════════════════════════════════════════════════════════════════════
-
-  - part: 'filename'
-    match: '.env'
-    name: 'Environment File'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'filename'
-    regex: '^\.[a-z]*env\.(?:local|production|prod|development|dev|staging|stage|test)$'
-    name: 'Environment File Variant'
+    regex: "(?i)\\bphonepe[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'PhonePe API Credential'
     priority: 2
     color: '#FFA500'
 
-  # ═══════════════════════════════════════════════════════════════════════
-  # AUTH & CREDENTIAL FILES
-  # ═══════════════════════════════════════════════════════════════════════
-
-  - part: 'path'
-    regex: "(?i)\\.?aws/credentials$"
-    name: 'AWS Credentials File'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'filename'
-    regex: '^\.[a-z]*git-credentials$'
-    name: 'Git Credentials File'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'filename'
-    match: '.dockercfg'
-    name: 'Docker Config File (legacy)'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'path'
-    regex: "\\.docker/config\\.json$"
-    name: 'Docker Auth Config'
+  - part: 'contents'
+    regex: '\b(?:APP_USR|TEST)-[0-9a-f-]{36}\b'
+    name: 'Mercado Pago Access Token'
     priority: 3
     color: '#FF0000'
 
   - part: 'contents'
-    regex: "(?im)^\\s*(?://[^\\s=]+:)?_authToken\\s*=\\s*[A-Za-z0-9_\\-+/=]{20,}\\s*$"
-    name: 'NPM Registry Auth Token'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'filename'
-    match: '.htpasswd'
-    name: 'Apache htpasswd File'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'filename'
-    regex: '^\.[a-z]*netrc$'
-    name: 'Netrc Credentials File'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'filename'
-    regex: '^\.?pgpass$'
-    name: 'PostgreSQL Password File'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'filename'
-    regex: '^\.?my\.cnf$'
-    name: 'MySQL Client Config File'
-    priority: 3
-    color: '#FF0000'
+    regex: "(?i)\\bpagseguro[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'PagSeguro API Credential'
+    priority: 2
+    color: '#FFA500'
 
   - part: 'contents'
-    regex: '"type"\s*:\s*"service_account"'
-    name: 'GCP Service Account Key'
-    priority: 3
-    color: '#FF0000'
-
-  - part: 'extension'
-    match: '.kdbx'
-    name: 'KeePass Password Manager Database'
+    regex: "(?i)\\bdlocal[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'dLocal API Credential'
     priority: 2
     color: '#FFA500'
 
-  - part: 'extension'
-    match: '.agilekeychain'
-    name: '1Password Database'
+  - part: 'contents'
+    regex: "(?i)\\bpayu[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'PayU API Credential'
     priority: 2
     color: '#FFA500'
 
-  - part: 'extension'
-    match: '.jks'
-    name: 'Java Keystore File'
+  - part: 'contents'
+    regex: "(?i)\\b2checkout[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: '2Checkout API Credential'
     priority: 2
     color: '#FFA500'
 
-  - part: 'extension'
-    match: '.p12'
-    name: 'PKCS12 Certificate Bundle'
+  - part: 'contents'
+    regex: "(?i)\\bklarna[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{32,}\\b"
+    name: 'Klarna API Key'
     priority: 2
     color: '#FFA500'
 
-  - part: 'extension'
-    match: '.pfx'
-    name: 'PFX Certificate Bundle'
+  - part: 'contents'
+    regex: "(?i)\\baffirm[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Affirm API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bafterpay[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Afterpay API Credential'
     priority: 2
     color: '#FFA500'
 
   # ═══════════════════════════════════════════════════════════════════════
-  # CONFIGURATION FILES THAT ROUTINELY CARRY SECRETS
+  # 9. CRYPTO / BLOCKCHAIN INFRASTRUCTURE
   # ═══════════════════════════════════════════════════════════════════════
 
-  - part: 'filename'
-    match: 'database.yml'
-    name: 'Rails Database Configuration'
+  - part: 'contents'
+    regex: "(?i)\\bcoinbase[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Coinbase API Key'
     priority: 2
     color: '#FFA500'
 
-  - part: 'filename'
-    regex: '^(?:wp-config|config(?:\.inc)?)\.php$'
-    name: 'PHP Configuration File'
+  - part: 'contents'
+    regex: "(?i)\\bcoinbase[_-]?commerce[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Coinbase Commerce API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcoinbase[_-]?(?:developer|cdp)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_/-]{20,}\\b"
+    name: 'Coinbase Developer Platform API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbinance[_-]?(?:api[_-]?)?(?:secret[_-]?)?(?:key|secret)\\s*[:=]\\s*[\"']?[A-Za-z0-9]{64}\\b"
+    name: 'Binance API Key / Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bkraken[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9/+=_-]{40,}\\b"
+    name: 'Kraken API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbitfinex[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Bitfinex API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbitstamp[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Bitstamp API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgemini[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Gemini API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bokx[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9-]{36}\\b"
+    name: 'OKX API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbybit[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9]{18,}\\b"
+    name: 'Bybit API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bkucoin[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9-]{24}\\b"
+    name: 'KuCoin API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcrypto\\.?com[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Crypto.com API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgate\\.?io[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Gate.io API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\balchemy[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{32}\\b"
+    name: 'Alchemy API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\binfura[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\\b"
+    name: 'Infura Project ID'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bquicknode[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'QuickNode API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmoralis[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{40,}\\b"
+    name: 'Moralis API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bankr[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Ankr API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bchainstack[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Chainstack API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bblockdaemon[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Blockdaemon API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgetblock[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'GetBlock API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bblast[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Blast API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bnownodes[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'NOWNodes API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btatum[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Tatum API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcovalent[\\w.-]{0,20}\\s*[:=]\\s*[\"']?cqt_[A-Za-z0-9_-]{20,}"
+    name: 'Covalent API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bCG-[A-Za-z0-9]{20,}\b'
+    name: 'CoinGecko API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcoinmarketcap[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9-]{32,}\\b"
+    name: 'CoinMarketCap API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\betherscan[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9]{34}\\b"
+    name: 'Etherscan API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bblockchair[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Blockchair API Key'
     priority: 2
     color: '#FFA500'
 
-  - part: 'filename'
-    match: 'LocalSettings.php'
-    name: 'MediaWiki Configuration'
+  - part: 'contents'
+    regex: "(?i)\\bblockcypher[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\\b"
+    name: 'BlockCypher API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bthegraph[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'The Graph API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bchainlink[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Chainlink API Credential'
     priority: 2
     color: '#FFA500'
 
-  - part: 'filename'
-    match: 'terraform.tfvars'
-    name: 'Terraform Variables File'
+  - part: 'contents'
+    regex: "(?i)\\bthirdweb[\\w.-]{0,20}\\s*[:=]\\s*[\"']?sk_[A-Za-z0-9_-]{20,}\\b"
+    name: 'Thirdweb Secret Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\breservoir[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Reservoir API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsimplehash[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'SimpleHash API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bhelius[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9-]{36}\\b"
+    name: 'Helius API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btriton[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Triton API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bshyft[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Shyft API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)https?://[a-z0-9.-]*solana[^\\s\"']*[?&](?:api[-_]?key|apikey)=[A-Za-z0-9_-]{20,}"
+    name: 'Solana RPC Endpoint with API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:avalanche|polygon|arbitrum|optimism)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Avalanche / Polygon / Arbitrum / Optimism API Key'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 10. EMAIL
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: '\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b'
+    name: 'SendGrid API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bkey-[a-f0-9]{32}\b'
+    name: 'Mailgun API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bpostmark[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b"
+    name: 'Postmark Server Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bre_[A-Za-z0-9_-]{20,}\b'
+    name: 'Resend API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b[0-9a-f]{32}-us\d{1,2}\b'
+    name: 'Mailchimp API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:amazon[_-]?ses|aws[_-]?ses)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:AKIA|ASIA)[A-Z0-9]{16}\b"
+    name: 'Amazon SES Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bxkeysib-[a-f0-9]{64}-[A-Za-z0-9]{16}\b'
+    name: 'Brevo / Sendinblue API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsparkpost[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{40}\\b"
+    name: 'SparkPost API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmandrill[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{22}\\b"
+    name: 'Mandrill API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmailjet[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\\b"
+    name: 'Mailjet API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\belastic[_-]?email[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Elastic Email API Key'
     priority: 2
     color: '#FFA500'
 
-  - part: 'filename'
-    match: 'application.properties'
-    name: 'Spring Configuration File'
+  - part: 'contents'
+    regex: '\bapi-[A-Za-z0-9]{20,}\b'
+    name: 'SMTP2GO API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsocketlabs[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'SocketLabs API Key'
     priority: 2
     color: '#FFA500'
 
-  - part: 'filename'
-    match: 'web.config'
-    name: 'ASP.NET Configuration File'
+  - part: 'contents'
+    regex: '\bmlsn\.[a-f0-9]{40}\b'
+    name: 'MailerSend API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmailtrap[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\\b"
+    name: 'Mailtrap API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bemailoctopus[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'EmailOctopus API Key'
     priority: 2
     color: '#FFA500'
 
-  - part: 'filename'
-    regex: '^\.?gitconfig$'
-    name: 'Git Configuration File'
+  - part: 'contents'
+    regex: "(?i)\\bcampaign[_-]?monitor[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Campaign Monitor API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bconstant[_-]?contact[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Constant Contact API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bconvertkit[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'ConvertKit API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcustomer\\.?io[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Customer.io API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bpk_[a-f0-9]{34}\b'
+    name: 'Klaviyo Private API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsendpulse[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'SendPulse API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bpepipost[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Pepipost API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bsendlayer[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'SendLayer API Key'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 11. SMS / TELEPHONY
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: '\bSK[0-9a-f]{32}\b'
+    name: 'Twilio API Key SID'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bAC[0-9a-f]{32}\b'
+    name: 'Twilio Account SID'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\btwilio[\\w.-]{0,20}(?:auth[_-]?token|api[_-]?secret)\\s*[:=]\\s*[\"']?[0-9a-f]{32}\b"
+    name: 'Twilio Auth Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bvonage[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\\b"
+    name: 'Vonage API Key / Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bKEY[a-zA-Z0-9]{20,}\b'
+    name: 'Telnyx API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bplivo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Plivo Auth Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsinch[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Sinch API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bmessagebird[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:live|test)_[A-Za-z0-9_-]{20,}\\b"
+    name: 'MessageBird API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbird[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Bird API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bbandwidth[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Bandwidth API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\binfobip[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Infobip API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bclicksend[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'ClickSend API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\btextmagic[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'TextMagic API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bsignalwire[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'SignalWire API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\b46elks[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: '46elks API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bmessagemedia[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'MessageMedia API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcm\\.?com[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'CM.com API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\broutee[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Routee API Credential'
     priority: 1
     color: '#FFFF00'
+
+  - part: 'contents'
+    regex: "(?i)\\btelesign[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Telesign API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bverifykit[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'VerifyKit API Credential'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: "(?i)\\bbulksms[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'BulkSMS API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bsmsglobal[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'SMSGlobal API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 12. CHAT / MESSAGING
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: '\bxox[baprs]-[0-9A-Za-z-]{10,}'
+    name: 'Slack Bot / User / App / Refresh / Workspace Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bxapp-[0-9A-Za-z-]{10,}'
+    name: 'Slack App-Level Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: 'https://hooks\.slack\.com/services/[A-Z0-9]{9,}/[A-Z0-9]{9,}/[A-Za-z0-9]{20,}'
+    name: 'Slack Incoming Webhook URL'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bslack[\\w.-]{0,20}(?:signing[_-]?secret|client[_-]?secret)\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Slack Signing Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b[MNO][A-Za-z0-9_-]{23,25}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,38}\b'
+    name: 'Discord Bot Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: 'https://(?:discord|discordapp)\.com/api/webhooks/[0-9]{15,}/[A-Za-z0-9_-]{60,}'
+    name: 'Discord Webhook URL'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b\d{8,10}:[A-Za-z0-9_-]{35}\b'
+    name: 'Telegram Bot Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: 'https://[a-z0-9-]+\.webhook\.office\.com/webhookb2/[A-Za-z0-9@/.-]{40,}'
+    name: 'Microsoft Teams Webhook URL'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmattermost[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9]{26}\\b"
+    name: 'Mattermost Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\brocket\\.?chat[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Rocket.Chat API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bzulip[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9]{32}\\b"
+    name: 'Zulip API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bsyt_[A-Za-z0-9_-]{20,}'
+    name: 'Matrix Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bpusher[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{20,}\\b"
+    name: 'Pusher App Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b(?:pub|sub)-c-[0-9a-f-]{36}\b'
+    name: 'PubNub Publish / Subscribe Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bably[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\\b"
+    name: 'Ably API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgetstream[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Stream (GetStream) API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsendbird[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Sendbird API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcometchat[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'CometChat API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bintercom[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Intercom Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcrisp[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\\b"
+    name: 'Crisp API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bfront[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Front API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bhelp[_-]?scout[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Help Scout API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bzendesk[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Zendesk API Token'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 13. MONITORING / LOGGING
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: 'https://[a-f0-9]{32}@o[0-9]+\.ingest\.sentry\.io/[0-9]+'
+    name: 'Sentry DSN'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bsntrys_[A-Za-z0-9_-]{20,}'
+    name: 'Sentry Auth Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bdatadog[\\w.-]{0,20}(?:api[_-]?key|app[_-]?key)\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Datadog API / Application Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bNRAK-[A-Z0-9]{27}\b'
+    name: 'New Relic User API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bNRAA-[A-Za-z0-9]{27}\b'
+    name: 'New Relic Ingest API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bglc_[A-Za-z0-9+/=_-]{20,}\b'
+    name: 'Grafana Cloud Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\beyJrIjoi[A-Za-z0-9+/=_-]{20,}'
+    name: 'Grafana Service Account Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bprometheus[\\w.-]{0,20}(?:remote[_-]?write|basic[_-]?auth)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9+/=_-]{20,}\\b"
+    name: 'Prometheus Remote-Write Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bhoneycomb[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9]{22}\b"
+    name: 'Honeycomb API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\brollbar[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Rollbar Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\blogrocket[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'LogRocket API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\blogtail[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Logtail Source Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bbetter[_-]?stack[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Better Stack API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bpapertrail[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Papertrail API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bloggly[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9-]{36}\b"
+    name: 'Loggly Customer Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsplunk[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Splunk API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsumo[_-]?logic[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9+/=_-]{20,}\\b"
+    name: 'Sumo Logic Access Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcoralogix[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Coralogix API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmezmo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{40}\b"
+    name: 'Mezmo API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bx(?:aat|ait)-[A-Za-z0-9_-]{20,}'
+    name: 'Axiom API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\belastic[_-]?cloud[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Elastic Cloud API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\blogz\\.?io[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Logz.io API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsematext[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Sematext API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bappdynamics[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'AppDynamics API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '\bdt0c01\.[A-Z0-9]{24}\.[A-Z0-9]{64}\b'
+    name: 'Dynatrace API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\binstana[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Instana API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\braygun[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Raygun API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bbugsnag[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Bugsnag API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bairbrake[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Airbrake API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bhighlight[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Highlight.io API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bglitchtip[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'GlitchTip DSN Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsignoz[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'SigNoz API Key'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 14. SECURITY
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bsnyk[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b"
+    name: 'Snyk API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bsq[pu]_[a-f0-9]{40}\b'
+    name: 'SonarQube / SonarCloud Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsemgrep[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{40}\b"
+    name: 'Semgrep App Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcheckmarx[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Checkmarx API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bveracode[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Veracode API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmend[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Mend API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bblack[_-]?duck[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Black Duck API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bwiz[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\\b"
+    name: 'Wiz API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\blacework[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\\b"
+    name: 'Lacework API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcrowdstrike[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'CrowdStrike API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsentinelone[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\\b"
+    name: 'SentinelOne API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bpalo[_-]?alto[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\\b"
+    name: 'Palo Alto API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\brapid7[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Rapid7 API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btenable[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Tenable API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bqualys[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Qualys API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgitguardian[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'GitGuardian API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btrufflehog[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'TruffleHog API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bgitleaks[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Gitleaks API Credential'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: '\bops_[A-Za-z0-9+/=_-]{40,}'
+    name: '1Password Service Account Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbitwarden[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\\b"
+    name: 'Bitwarden API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bhv[bs]\.[A-Za-z0-9_-]{20,}'
+    name: 'HashiCorp Vault / Vault Enterprise Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bs\.[A-Za-z0-9]{24}\b'
+    name: 'HashiCorp Vault Legacy Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bdp\.(?:pt|st)\.[A-Za-z0-9_-]{40,}'
+    name: 'Doppler Personal / Service Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\binfisical[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\\b"
+    name: 'Infisical Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcyberark[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\\b"
+    name: 'CyberArk API Credential'
+    priority: 3
+    color: '#FF0000'
+
+
+  - part: 'contents'
+    regex: "(?i)\\bauth0[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\\b"
+    name: 'Auth0 Client Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bsk_(?:live|test)_[A-Za-z0-9]{20,}'
+    name: 'Clerk Secret Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bworkos[\\w.-]{0,20}\\s*[:=]\\s*[\"']?sk_[A-Za-z0-9_]{20,}\b"
+    name: 'WorkOS Secret Key'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 15. ANALYTICS
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: '\b(?:G|UA|AW)-[A-Z0-9]{6,}\b'
+    name: 'Google Analytics Measurement / Ads ID'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: '\bGTM-[A-Z0-9]{6,}\b'
+    name: 'Google Tag Manager Container ID'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: "(?i)\\bmixpanel[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Mixpanel API Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bamplitude[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Amplitude API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bheap[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Heap Analytics API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '\bph[csx]_[A-Za-z0-9_-]{20,}'
+    name: 'PostHog API / Project Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bplausible[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Plausible API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bmatomo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Matomo API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bhotjar[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Hotjar Site Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bfullstory[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'FullStory API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bpendo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Pendo API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\brudderstack[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'RudderStack Write Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bsnowplow[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Snowplow API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bjune[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'June Analytics API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcountly[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Countly API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bfathom[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Fathom Analytics API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bsimple[_-]?analytics[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Simple Analytics API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bumami[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Umami API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bmouseflow[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Mouseflow API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bsmartlook[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Smartlook API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcontentsquare[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Contentsquare API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 16. SEARCH / SCRAPING
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\balgolia[\\w.-]{0,20}(?:admin|search|api)[_-]?key\\s*[:=]\\s*[\"']?[a-zA-Z0-9]{32}\b"
+    name: 'Algolia Admin / Search API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmeilisearch[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Meilisearch API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsearchspring[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Searchspring API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bswiftype[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Swiftype API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcoveo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Coveo API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bazure[_-]?cognitive[_-]?search[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Azure Cognitive Search Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgoogle[_-]?(?:programmable|pse|custom)[_-]?search[\\w.-]{0,20}\\s*[:=]\\s*[\"']?AIza[0-9A-Za-z_-]{35}"
+    name: 'Google Programmable Search API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bserpapi[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{64}\b"
+    name: 'SerpAPI Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bserper[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{40,}\b"
+    name: 'Serper API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bzenserp[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9-]{36}\b"
+    name: 'Zenserp API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bscraperapi[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'ScraperAPI Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bscrapingbee[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{40,}\b"
+    name: 'ScrapingBee API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bscrapingant[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'ScrapingAnt API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bscraperbox[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'ScraperBox API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bzyte[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Zyte API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbright[_-]?data[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Bright Data API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\boxylabs[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Oxylabs API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bapify_api_[A-Za-z0-9]{20,}'
+    name: 'Apify API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbrowserless[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Browserless API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bbb_live_[A-Za-z0-9]{20,}'
+    name: 'Browserbase API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bscrapingfish[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'ScrapingFish API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bproxycurl[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Proxycurl API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcrawlbase[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Crawlbase API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '\bfc-[A-Za-z0-9]{20,}\b'
+    name: 'Firecrawl API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\btvly-[A-Za-z0-9]{20,}\b'
+    name: 'Tavily API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bexa[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9-]{36}\b"
+    name: 'Exa API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bBSA[A-Za-z0-9_-]{20,}\b'
+    name: 'Brave Search API Key'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 17. MAPS / GEOLOCATION
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: '\b(?:pk|sk)\.eyJ[A-Za-z0-9_-]{20,}'
+    name: 'Mapbox Public / Secret Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bhere[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{40,}\b"
+    name: 'HERE API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btomtom[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9]{32}\b"
+    name: 'TomTom API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bopencage[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'OpenCage API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bpk\.[a-f0-9]{32}\b'
+    name: 'LocationIQ API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgeoapify[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Geoapify API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmaptiler[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'MapTiler API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bprj_(?:live|test)_[A-Za-z0-9]{20,}'
+    name: 'Radar API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bpositionstack[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Positionstack API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bipinfo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{14}\b"
+    name: 'IPinfo API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bmaxmind[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9]{16}\b"
+    name: 'MaxMind License Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bip2location[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9]{10}\b"
+    name: 'IP2Location API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\babstract[_-]?api[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Abstract API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgeojs[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'GeoJS API Credential'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: "(?i)\\bbigdatacloud[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'BigDataCloud API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bgeocode\\.?xyz[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Geocode.xyz API Credential'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: "(?i)\\bgeonames[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9]{10,}\b"
+    name: 'GeoNames API Username'
+    priority: 1
+    color: '#FFFF00'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 18. MEDIA / IMAGES / VIDEO
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: 'cloudinary://[0-9]{10,}:[A-Za-z0-9_-]{20,}@[a-z0-9-]+'
+    name: 'Cloudinary API Credential URL'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bimgix[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Imgix API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\buploadcare[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{20,}\b"
+    name: 'Uploadcare API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bfilestack[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\\b"
+    name: 'Filestack API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bimgbb[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'ImgBB API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '\bmux_[A-Za-z0-9]{20,}\b'
+    name: 'Mux API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bvimeo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Vimeo Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\byoutube[\\w.-]{0,20}\\s*[:=]\\s*[\"']?AIza[0-9A-Za-z_-]{35}"
+    name: 'YouTube Data API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btwitch[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-z0-9]{30}\b"
+    name: 'Twitch Client Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bdailymotion[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Dailymotion API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bwistia[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Wistia API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bbunny[_-]?stream[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9-]{20,}\b"
+    name: 'Bunny Stream API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcloudflare[_-]?stream[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{37,}\b"
+    name: 'Cloudflare Stream API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bfastly[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Fastly API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbunny[_-]?cdn[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9-]{20,}\b"
+    name: 'Bunny CDN API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\buploadthing[\\w.-]{0,20}\\s*[:=]\\s*[\"']?sk_live_[A-Za-z0-9]{20,}\b"
+    name: 'UploadThing API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bs3[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:AKIA|ASIA)[A-Z0-9]{16}\b"
+    name: 'Amazon S3 Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bK00[A-Za-z0-9]{22,}\b'
+    name: 'Backblaze B2 Application Key ID'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bwasabi[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9/+=]{20,}\b"
+    name: 'Wasabi Access Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bstorj[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Storj Access Grant'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 19. CMS / CONTENT
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bwordpress[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9 _.-]{20,}\b"
+    name: 'WordPress API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bwordpress\\.com[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'WordPress.com API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '\bghost-admin-api-key[:\s]+[a-f0-9]{24}:[a-f0-9]{64}\b'
+    name: 'Ghost Admin API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bCFPAT-[A-Za-z0-9_-]{40,}'
+    name: 'Contentful Personal Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsanity[\\w.-]{0,20}\\s*[:=]\\s*[\"']?sk[A-Za-z0-9_-]{20,}\b"
+    name: 'Sanity API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bstrapi[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Strapi API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bdirectus[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Directus API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bpayload[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Payload CMS API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bprismic[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Prismic API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bstoryblok[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\b"
+    name: 'Storyblok API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bdatocms[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'DatoCMS API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bhygraph[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Hygraph API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbuttercms[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'ButterCMS API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbuilder\\.?io[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Builder.io API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bwebflow[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{64}\b"
+    name: 'Webflow API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bwix[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Wix API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bsquarespace[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Squarespace API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcontentstack[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:cs|blt)[a-f0-9]{20,}\b"
+    name: 'Contentstack API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bkontent[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Kontent.ai API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bagility[_-]?cms[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Agility CMS API Key'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 20. E-COMMERCE
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bshopify[\\w.-]{0,20}\\s*[:=]\\s*[\"']?shp(?:at|ss|ca|pa|tka)_[a-f0-9]{32}\b"
+    name: 'Shopify Admin / Storefront / Payments Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b(?:ck|cs)_[a-f0-9]{40}\b'
+    name: 'WooCommerce Consumer / Secret Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbigcommerce[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'BigCommerce API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:magento|adobe[_-]?commerce)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Magento / Adobe Commerce Integration Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsaleor[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Saleor API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmedusa[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Medusa API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcommercetools[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'commercetools API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\belastic[_-]?path[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Elastic Path API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bprestashop[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'PrestaShop API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bopencart[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'OpenCart API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\becwid[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Ecwid API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bvtex[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'VTEX API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsalesforce[_-]?commerce[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Salesforce Commerce Cloud Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsquarespace[_-]?commerce[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Squarespace Commerce Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bwix[_-]?stores[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Wix Stores Credential'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 21. CRM / BUSINESS
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bsalesforce[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9._!-]{20,}\b"
+    name: 'Salesforce API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bpat-[a-z0-9-]{30,}\b'
+    name: 'HubSpot Private App Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bhubspot[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:pat-[a-z0-9-]{30,}|[a-f0-9-]{36})\b"
+    name: 'HubSpot API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bpipedrive[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{40}\b"
+    name: 'Pipedrive API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bzoho[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'Zoho API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bfreshsales[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Freshsales API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bclose[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Close CRM API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcopper[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Copper CRM API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\binsightly[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Insightly API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcapsule[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Capsule CRM API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bkeap[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Keap API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bactivecampaign[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{40,}\b"
+    name: 'ActiveCampaign API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bfreshdesk[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Freshdesk API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bservicenow[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'ServiceNow API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsap[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'SAP API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\boracle[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Oracle Cloud Application Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bdynamics[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'Microsoft Dynamics Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmonday[\\w.-]{0,20}\\s*[:=]\\s*[\"']?eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"
+    name: 'Monday.com API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\battio[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Attio API Key'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 22. PRODUCTIVITY
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: '\b(?:secret_|ntn_)[A-Za-z0-9]{40,}'
+    name: 'Notion Integration Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bpat[a-zA-Z0-9]{14}\.[a-f0-9]{64}\b'
+    name: 'Airtable Personal Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\blin_api_[A-Za-z0-9]{40,}'
+    name: 'Linear API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bjira[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Jira API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bconfluence[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Confluence API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btrello[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Trello API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\basana[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[0-9]/[0-9]{16}/[0-9]{16}:[a-f0-9]{32}\b"
+    name: 'Asana Personal Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bpk_[0-9]{6,}_[A-Z0-9]{20,}\b'
+    name: 'ClickUp API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbasecamp[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Basecamp API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btodoist[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{40}\b"
+    name: 'Todoist API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bevernote[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_=-]{20,}\b"
+    name: 'Evernote API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '\bsl\.[A-Za-z0-9_-]{80,}'
+    name: 'Dropbox Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbox[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Box API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bonedrive[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'OneDrive API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bsharepoint[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'SharePoint API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\begnyte[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Egnyte API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bsmartsheet[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Smartsheet API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcoda[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Coda API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bslite[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Slite API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bnuclino[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Nuclino API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 23. DEVELOPER UTILITIES
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: '\bPMAK-[a-f0-9]{24}-[a-f0-9]{34}\b'
+    name: 'Postman API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\binsomnia[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Insomnia API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bhoppscotch[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Hoppscotch API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bngrok[\\w.-]{0,20}\\s*[:=]\\s*[\"']?2[A-Za-z0-9_]{40,}\b"
+    name: 'ngrok Authtoken'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\blocaltunnel[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'LocalTunnel API Credential'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: '\btskey-[A-Za-z0-9_-]{20,}'
+    name: 'Tailscale Auth Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bzerotier[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'ZeroTier API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\brenovate[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:ghp_[a-zA-Z0-9]{36}|github_pat_[0-9a-zA-Z_]{80,})"
+    name: 'Renovate / Renovatebot Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bdependabot[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:ghp_[a-zA-Z0-9]{36}|github_pat_[0-9a-zA-Z_]{80,})"
+    name: 'Dependabot Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbrowserstack[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'BrowserStack Access Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsauce[_-]?labs[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9-]{36}\b"
+    name: 'Sauce Labs Access Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\blambdatest[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'LambdaTest Access Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bpercy[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Percy API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bchromatic[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Chromatic Project Token'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 24. FEATURE FLAGS / EXPERIMENTATION
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: '\b(?:api|sdk)-[a-f0-9-]{36}\b'
+    name: 'LaunchDarkly API / SDK Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsplit[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Split.io API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bflagsmith[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'Flagsmith API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bunleash[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_:.-]{20,}\b"
+    name: 'Unleash API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bconfigcat[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'ConfigCat SDK Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b(?:sdk|key)_[A-Za-z0-9]{20,}\b'
+    name: 'GrowthBook SDK / API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bsecret-[A-Za-z0-9]{40,}\b'
+    name: 'Statsig Server Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\boptimizely[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Optimizely API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\beppo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Eppo API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bharness[\\w.-]{0,20}(?:feature|flag)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?pat\\.[A-Za-z0-9_.-]{20,}"
+    name: 'Harness Feature Flags Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bdevcycle[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'DevCycle SDK Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bflipt[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'Flipt API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bfirebase[\\w.-]{0,20}remote[_-]?config[\\w.-]{0,20}\\s*[:=]\\s*[\"']?AIza[0-9A-Za-z_-]{35}"
+    name: 'Firebase Remote Config Credential'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 25. SECRETS / IDENTITY
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bazure[_-]?key[_-]?vault[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_~.-]{20,}\b"
+    name: 'Azure Key Vault Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bkeeper[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9+/=_-]{20,}\b"
+    name: 'Keeper API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bstrongdm[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'StrongDM API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bakeyless[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Akeyless Access Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bconjur[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Conjur API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bdescope[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Descope API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bfusionauth[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'FusionAuth API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bkeycloak[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'Keycloak Client Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bzitadel[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'Zitadel API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsupertokens[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'SuperTokens API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bory_[A-Za-z0-9_-]{20,}'
+    name: 'Ory API Key'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 26. IAC / INFRASTRUCTURE AUTOMATION
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: '\b[A-Za-z0-9]{14}\.atlasv1\.[A-Za-z0-9_-]{60,}'
+    name: 'Terraform Cloud / Enterprise / HashiCorp Cloud Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bpul-[a-f0-9]{40}\b'
+    name: 'Pulumi Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcrossplane[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Crossplane Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bspacelift[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Spacelift API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\benv0[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'env0 API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bscalr[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Scalr API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\batlantis[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Atlantis Webhook Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\baws[_-]?cdk[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:AKIA|ASIA)[A-Z0-9]{16}\b"
+    name: 'AWS CDK Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bserverless[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Serverless Framework Access Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsst[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'SST Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bopentofu[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'OpenTofu Registry Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bansible[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Ansible Automation Platform Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bpuppet[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Puppet Enterprise Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bchef[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Chef API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsaltstack[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'SaltStack Credential'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 27. KUBERNETES
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: 'client-key-data:\s*[A-Za-z0-9+/=]{20,}'
+    name: 'Kubernetes kubeconfig client key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: 'certificate-authority-data:\s*[A-Za-z0-9+/=]{20,}'
+    name: 'Kubernetes kubeconfig CA data'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '-----BEGIN CERTIFICATE-----'
+    name: 'Kubernetes Client Certificate'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bservice[_-]?account[_-]?token\\s*[:=]\\s*[\"']?eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"
+    name: 'Kubernetes Service Account Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '"\.dockerconfigjson"\s*:\s*"[A-Za-z0-9+/=]{40,}"'
+    name: 'Kubernetes Registry Credential (dockerconfigjson)'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:cluster[_-]?token|kube[_-]?token)\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'Kubernetes Cluster Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:cloud[_-]?provider|oidc)[_-]?token\\s*[:=]\\s*[\"']?eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"
+    name: 'Kubernetes Cloud-Provider / OIDC Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\btoken-[a-z0-9]{5}:[A-Za-z0-9]{20,}\b'
+    name: 'Rancher API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bopenshift[\\w.-]{0,20}\\s*[:=]\\s*[\"']?sha256~[A-Za-z0-9_-]{40,}"
+    name: 'OpenShift API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:eks|gke|aks)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:AKIA|ASIA)[A-Z0-9]{16}\b"
+    name: 'EKS / GKE / AKS Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:digitalocean|linode|vultr)[_-]?kubernetes[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\b"
+    name: 'DigitalOcean / Linode / Vultr Kubernetes Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcivo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_-]{20,}\b"
+    name: 'Civo API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:platform9|mirantis|loft|lens|portainer)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_.-]{20,}\b"
+    name: 'Kubernetes Platform Credential (Platform9/Mirantis/Loft/Lens/Portainer)'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bargo[_-]?cd[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9_.-]{20,}\b"
+    name: 'Argo CD API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bflux[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:ghp_[a-zA-Z0-9]{36}|glpat-[a-zA-Z0-9_-]{20,})"
+    name: 'Flux Git Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bhelm[\\w.-]{0,20}(?:repo|registry)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'Helm Repository Credential'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 28. DNS / DOMAINS
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\broute53[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:AKIA|ASIA)[A-Z0-9]{16}\b"
+    name: 'AWS Route53 Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bnamecheap[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Namecheap API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bname\\.com[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Name.com API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b(?:pk1|sk1)_[a-f0-9]{20,}'
+    name: 'Porkbun API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgandi[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Gandi API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bhover[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Hover API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bdynadot[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Dynadot API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bgoogle[_-]?domains[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'Google Domains Legacy Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bsquarespace[_-]?domains[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Squarespace Domains Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bdnsimple[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'DNSimple API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bns1[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'NS1 API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcloudns[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'ClouDNS API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bhurricane[_-]?electric[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Hurricane Electric Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bdigitalocean[\\w.-]{0,20}dns[\\w.-]{0,20}\\s*[:=]\\s*[\"']?dop_v1_[a-f0-9]{64}\b"
+    name: 'DigitalOcean DNS Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bazure[\\w.-]{0,20}dns[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_~.-]{20,}\b"
+    name: 'Azure DNS Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgoogle[_-]?cloud[\\w.-]{0,20}dns[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'Google Cloud DNS Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bakamai[\\w.-]{0,20}dns[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Akamai DNS Credential'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 29. SOCIAL APIS
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: '\bAAAAAAAAAAAAAAAAAAAAA[A-Za-z0-9%_-]{20,}'
+    name: 'X / Twitter Bearer Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:twitter|x)[\\w.-]{0,20}(?:api[_-]?key|consumer[_-]?key|access[_-]?token)\\s*[:=]\\s*[\"']?[A-Za-z0-9]{25,50}\b"
+    name: 'X / Twitter API Key / Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bEAA[A-Za-z0-9]{60,}\b'
+    name: 'Facebook Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bIGQV[A-Za-z0-9_-]{40,}\b'
+    name: 'Instagram Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bthreads[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Threads API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\blinkedin[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'LinkedIn API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\breddit[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Reddit API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btiktok[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'TikTok API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsnapchat[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Snapchat API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bp(?:ina|int)_[A-Za-z0-9_-]{20,}'
+    name: 'Pinterest API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmastodon[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Mastodon Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbluesky[\\w.-]{0,20}\\s*[:=]\\s*[\"']?bsky_[A-Za-z0-9_-]{20,}\b"
+    name: 'Bluesky App Password'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btumblr[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Tumblr API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmedium[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{40,}\b"
+    name: 'Medium Integration Token'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 30. GAMING
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bsteam[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Steam / Steam Web API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bepic[_-]?games[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Epic Games API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bRGAPI-[a-f0-9-]{36}\b'
+    name: 'Riot Games API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbattle\\.?net[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Battle.net API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bxbox[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Xbox API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bplaystation[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'PlayStation API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bnintendo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Nintendo API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\broblox[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Roblox API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bunity[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Unity / Unity Cloud / Gaming Services Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:unreal|epic[_-]?online)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Unreal / Epic Online Services Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bplayfab[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'PlayFab Developer Secret Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgamesparks[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'GameSparks API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:gamelift|aws[_-]?gamelift)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:AKIA|ASIA)[A-Z0-9]{16}\b"
+    name: 'Amazon GameLift Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bphoton[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Photon Engine Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\blootlocker[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'LootLocker API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbeamable[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Beamable API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bnakama[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Nakama Server Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bheroic[_-]?labs[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Heroic Labs Credential'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 31. WEATHER / SCIENCE / PUBLIC DATA
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bopenweather[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'OpenWeather API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bweatherapi[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9]{32}\b"
+    name: 'WeatherAPI Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bweatherbit[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Weatherbit API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btomorrow\\.?io[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Tomorrow.io API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\baccuweather[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9]{32}\b"
+    name: 'AccuWeather API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bvisual[_-]?crossing[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-zA-Z0-9]{20,}\b"
+    name: 'Visual Crossing API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmeteomatics[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Meteomatics API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bstormglass[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9-]{36}\b"
+    name: 'Stormglass API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\baeris[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'AerisWeather API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bweatherstack[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Weatherstack API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bopen[_-]?meteo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Open-Meteo API Credential'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: "(?i)\\bnasa[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:DEMO_KEY|[A-Za-z0-9]{40})\b"
+    name: 'NASA API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bnoaa[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'NOAA API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\busgs[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'USGS API Credential'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: "(?i)\\bcensus[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'US Census API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bdata\\.?gov[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Data.gov API Key'
+    priority: 1
+    color: '#FFFF00'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:esa|european[_-]?space)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'European Space Agency API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 32. TRAVEL
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bamadeus[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Amadeus API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsabre[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Sabre API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btravelport[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Travelport API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bduffel_(?:test|live)_[A-Za-z0-9_-]{20,}'
+    name: 'Duffel API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bkiwi[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Kiwi.com API Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\baviationstack[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Aviationstack API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bflightaware[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'FlightAware API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bflightlabs[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'FlightLabs API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\baerodatabox[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'AeroDataBox API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bopensky[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'OpenSky Network Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcirium[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Cirium API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btripadvisor[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'TripAdvisor API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbooking\\.?com[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Booking.com API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bexpedia[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Expedia API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bhotelbeds[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Hotelbeds API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bskyscanner[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Skyscanner API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\brome2rio[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Rome2Rio API Key'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 33. LEGAL / BUSINESS DATA
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bopencorporates[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'OpenCorporates API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bclearbit[\\w.-]{0,20}\\s*[:=]\\s*[\"']?sk_[A-Za-z0-9_-]{20,}\b"
+    name: 'Clearbit API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bpeople[_-]?data[_-]?labs[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'People Data Labs API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcrunchbase[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Crunchbase API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bhunter[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{40}\b"
+    name: 'Hunter.io API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bapollo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Apollo.io API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bzoominfo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'ZoomInfo API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\brocketreach[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'RocketReach API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bfullcontact[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'FullContact API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bwhoisxml[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9-]{36}\b"
+    name: 'WhoisXML API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsecuritytrails[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'SecurityTrails API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bvirustotal[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{64}\b"
+    name: 'VirusTotal API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bshodan[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9]{32}\b"
+    name: 'Shodan API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcensys[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Censys API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgreynoise[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9]{32}\b"
+    name: 'GreyNoise API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:haveibeenpwned|have[_-]?i[_-]?been[_-]?pwned|hibp)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{32}\b"
+    name: 'Have I Been Pwned API Key'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 34. AUTOMATION
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bzapier[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Zapier API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bmake[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Make API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bpipedream[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Pipedream API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bn8n_api_[A-Za-z0-9_-]{20,}'
+    name: 'n8n API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bworkato[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Workato API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btray\\.?io[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Tray.io API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bifttt[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'IFTTT Webhooks Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bactivepieces[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Activepieces API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bwindmill[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Windmill API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btemporal[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Temporal Cloud API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\btr_(?:dev|prod)_[A-Za-z0-9]{20,}'
+    name: 'Trigger.dev API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b(?:signkey|evtkey)-(?:prod|test)-[A-Za-z0-9]{20,}'
+    name: 'Inngest Signing / Event Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btriggermesh[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'TriggerMesh Credential'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 35. TESTING
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bapplitools[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Applitools API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcypress[\\w.-]{0,20}(?:cloud|record)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9-]{36}\b"
+    name: 'Cypress Cloud Record Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bplaywright[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Playwright Service Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btestrail[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'TestRail API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btestmo[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Testmo API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btestiny[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Testiny API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbrowserling[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Browserling API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bcrossbrowsertesting[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'CrossBrowserTesting API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bkobiton[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Kobiton API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bperfecto[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Perfecto API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btestingbot[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'TestingBot API Key'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 36. FORMS / SURVEYS
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: '\btfp_[A-Za-z0-9_-]{20,}'
+    name: 'Typeform Personal Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsurveymonkey[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'SurveyMonkey API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bjotform[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Jotform API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btally[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Tally API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bformspree[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Formspree API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bformspark[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Formspark API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bbasin[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Basin API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bformcarry[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Formcarry API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bgetform[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Getform API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bpaperform[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Paperform API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bfillout[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Fillout API Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bgoogle[_-]?forms[\\w.-]{0,20}\\s*[:=]\\s*[\"']?AIza[0-9A-Za-z_-]{35}"
+    name: 'Google Forms API Key'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 37. ACCOUNTING / INVOICING
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bquickbooks[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'QuickBooks API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bxero[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Xero API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bfreshbooks[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'FreshBooks API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bwave[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Wave API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bstripe[\\w.-]{0,20}billing[\\w.-]{0,20}\\s*[:=]\\s*[\"']?sk_live_[0-9a-zA-Z]{24,}"
+    name: 'Stripe Billing Secret Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsage[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Sage API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bzoho[_-]?books[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'Zoho Books Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\btaxjar[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'TaxJar API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bavalara[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Avalara API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 38. SHIPPING
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: '\bshippo_(?:live|test)_[A-Za-z0-9_-]{20,}'
+    name: 'Shippo API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bEZAK[a-zA-Z0-9]{40,}\b'
+    name: 'EasyPost API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bshipengine[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'ShipEngine API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bshipstation[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'ShipStation API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\baftership[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'AfterShip API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bdhl[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'DHL API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bfedex[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'FedEx API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bups[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'UPS API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\busps[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'USPS API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bcanada[_-]?post[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Canada Post API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\broyal[_-]?mail[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Royal Mail API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsendcloud[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Sendcloud API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bshipbob[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'ShipBob API Token'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 39. HR / RECRUITING
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bgreenhouse[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Greenhouse API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\blever[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Lever API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bworkable[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Workable API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bashby[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Ashby API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bbamboohr[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'BambooHR API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\brippling[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Rippling API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgusto[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Gusto API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bdeel[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Deel API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bremote[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Remote API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bpersonio[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Personio API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bhibob[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'HiBob API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bworkday[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'Workday API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bsap[_-]?successfactors[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'SAP SuccessFactors Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\badp[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'ADP API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bukg[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'UKG API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 40. AGRICULTURE / IOT / INDUSTRIAL
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bparticle[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[a-f0-9]{40}\b"
+    name: 'Particle Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\barduino[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'Arduino Cloud API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\baio_[A-Za-z0-9]{20,}\b'
+    name: 'Adafruit IO Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bthingsboard[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'ThingsBoard Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\blosant[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Losant API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bblynk[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Blynk Auth Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\baws[_-]?iot[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:AKIA|ASIA)[A-Z0-9]{16}\b"
+    name: 'AWS IoT Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bazure[_-]?iot[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_~.-]{20,}\b"
+    name: 'Azure IoT Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bgoogle[_-]?cloud[\\w.-]{0,20}iot[\\w.-]{0,20}\\s*[:=]\\s*[\"']?AIza[0-9A-Za-z_-]{35}"
+    name: 'Google Cloud IoT Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bBBFF-[A-Za-z0-9_-]{20,}'
+    name: 'Ubidots API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bdatacake[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Datacake API Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\bbalena[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_-]{20,}\b"
+    name: 'Balena API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bemqx[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'EMQX API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bhivemq[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'HiveMQ API Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bthingspeak[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Z0-9]{16}\b"
+    name: 'ThingSpeak API Key'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # GENERIC CREDENTIAL CORPUS - GENERIC API FORMATS
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:api[_-]?key|apikey|api-key|apiToken|api[_-]?token|api-token)\\s*[:=]\\s*[\"']?[A-Za-z0-9_\\-]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|change_me|replace|xxxx|dummy|sample|test|demo|foo|bar)"
+    name: 'Generic API Key / Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:access[_-]?key|accessKey|access[_-]?token|accessToken|auth[_-]?token|authToken)\\s*[:=]\\s*[\"']?[A-Za-z0-9_.\\-]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|change_me|replace|xxxx|dummy|sample|test|demo|foo|bar)"
+    name: 'Generic Access Key / Access Token / Auth Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:client[_-]?key|clientKey|client[_-]?secret|clientSecret|consumer[_-]?key|consumerKey|consumer[_-]?secret|consumerSecret)\\s*[:=]\\s*[\"']?[A-Za-z0-9_.\\-]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|change_me|replace|xxxx|dummy|sample|test|demo|foo|bar)"
+    name: 'Generic Client / Consumer Key or Secret'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:developer[_-]?key|developerKey|developer[_-]?token|dev[_-]?token|integration[_-]?key|integration[_-]?token)\\s*[:=]\\s*[\"']?[A-Za-z0-9_.\\-]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|change_me|replace|xxxx|dummy|sample|test|demo|foo|bar)"
+    name: 'Generic Developer / Integration Key or Token'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:private[_-]?key|public[_-]?key|secret|secret[_-]?key|secretKey|secret[_-]?token|service[_-]?key|service[_-]?token)\\s*[:=]\\s*[\"']?[A-Za-z0-9_+/=.\\-]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|change_me|replace|xxxx|dummy|sample|test|demo|foo|bar)"
+    name: 'Generic Private / Public / Secret / Service Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:signing[_-]?key|signing[_-]?secret|webhook[_-]?secret|webhook[_-]?token|application[_-]?key|application[_-]?secret)\\s*[:=]\\s*[\"']?[A-Za-z0-9_+/=.\\-]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|change_me|replace|xxxx|dummy|sample|test|demo|foo|bar)"
+    name: 'Generic Signing / Webhook / Application Key or Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:project[_-]?key|project[_-]?token|organization[_-]?key|organization[_-]?token|account[_-]?key|account[_-]?token)\\s*[:=]\\s*[\"']?[A-Za-z0-9_+/=.\\-]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|change_me|replace|xxxx|dummy|sample|test|demo|foo|bar)"
+    name: 'Generic Project / Organization / Account Key or Token'
+    priority: 2
+    color: '#FFA500'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # GENERIC CREDENTIAL CORPUS - HTTP AUTHENTICATION HEADERS
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)Authorization:\\s*Bearer\\s+[A-Za-z0-9_\\-.=]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|replace|xxxx|dummy|sample|test|demo)"
+    name: 'HTTP Authorization: Bearer Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)Authorization:\\s*Basic\\s+[A-Za-z0-9+/=]{20,}"
+    not_regex: "(?i)(?:dXNlcjpwYXNz|dXNlcm5hbWU6cGFzc3dvcmQ=)"
+    name: 'HTTP Authorization: Basic Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)Authorization:\\s*Token\\s+[A-Za-z0-9_\\-.=]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|replace|xxxx|dummy|sample|test|demo)"
+    name: 'HTTP Authorization: Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)Authorization:\\s*OAuth\\s+[A-Za-z0-9_\\-.=]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|replace|xxxx|dummy|sample|test|demo)"
+    name: 'HTTP Authorization: OAuth Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)X-(?:API|Api|Auth|Access|Client|Secret)-(?:Key|Token|Secret):\\s*[A-Za-z0-9_\\-.=]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|replace|xxxx|dummy|sample|test|demo)"
+    name: 'HTTP X-API-Key / X-Auth-Token / X-Client-Secret Header'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # GENERIC CREDENTIAL CORPUS - ENVIRONMENT VARIABLES
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:API_KEY|API_SECRET|API_TOKEN|AUTH_TOKEN|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_ID|CLIENT_SECRET|SECRET_KEY|PRIVATE_KEY|PUBLIC_KEY|SIGNING_KEY|SIGNING_SECRET|WEBHOOK_SECRET)\\s*[:=]\\s*[\"']?[A-Za-z0-9_+/=.\\-]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|change_me|replace|xxxx|dummy|sample|test|demo|foo|bar)"
+    name: 'Environment Variable: Generic API / Auth / Signing Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:DATABASE_URL|DATABASE_URI|DB_PASSWORD|DB_USER|DB_HOST|DB_TOKEN|REDIS_URL|MONGO_URI|MONGODB_URI|POSTGRES_URL|MYSQL_URL)\\s*[:=]\\s*[\"']?[^\\s\"']{12,}"
+    not_regex: "(?i)(?:localhost|127\\.0\\.0\\.1|example|user:pass|password@|changeme)"
+    name: 'Environment Variable: Database Connection / Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)\\s*[:=]\\s*[\"']?[A-Za-z0-9/+=]{20,}"
+    not_regex: "(?i)(?:EXAMPLE|your|placeholder|xxxx)"
+    name: 'Environment Variable: AWS Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:AZURE_CLIENT_ID|AZURE_CLIENT_SECRET|AZURE_TENANT_ID|GOOGLE_APPLICATION_CREDENTIALS|GOOGLE_API_KEY)\\s*[:=]\\s*[\"']?[A-Za-z0-9_./=+\\-]{16,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|replace|xxxx|dummy|sample|test|demo)"
+    name: 'Environment Variable: Azure / Google Cloud Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:GITHUB_TOKEN|GITLAB_TOKEN|NPM_TOKEN|PYPI_TOKEN|DOCKER_PASSWORD|DOCKER_AUTH_CONFIG)\\s*[:=]\\s*[\"']?[A-Za-z0-9_+/=.\\-]{16,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|change_me|replace|xxxx|dummy|sample|test|demo)"
+    name: 'Environment Variable: Registry / VCS Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\b(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|GROQ_API_KEY|GEMINI_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|STRIPE_SECRET_KEY|STRIPE_PUBLISHABLE_KEY|TWILIO_ACCOUNT_SID|TWILIO_AUTH_TOKEN|SENDGRID_API_KEY|DISCORD_TOKEN|SLACK_TOKEN|SLACK_SIGNING_SECRET)\\s*[:=]\\s*[\"']?[A-Za-z0-9_+/=.\\-]{16,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|change_me|replace|xxxx|dummy|sample|test|demo)"
+    name: 'Environment Variable: AI / Payment / Messaging Provider Key'
+    priority: 3
+    color: '#FF0000'
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # ADDITIONAL COVERAGE
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - part: 'contents'
+    regex: "(?i)\\bgoogle[_-]?cloud[\\w.-]{0,20}source[\\w.-]{0,20}(?:repo|repository)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?[A-Za-z0-9_.-]{20,}\b"
+    name: 'Google Cloud Source Repositories Credential'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)\\bdigitalocean[\\w.-]{0,20}managed[\\w.-]{0,20}(?:database|db)[\\w.-]{0,20}\\s*[:=]\\s*[\"']?(?:dop_v1_[a-f0-9]{64}|postgres://[^\\s\"']+)"
+    name: 'DigitalOcean Managed Databases Credential'
+    priority: 3
+    color: '#FF0000'

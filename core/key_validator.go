@@ -77,6 +77,11 @@ func (kv *KeyValidator) ValidateKey(key string) *ValidatedKey {
 		return kv.validateAnthropic(key)
 	} else if strings.HasPrefix(key, "sk-proj-") {
 		return kv.validateOpenAI(key)
+	} else if strings.HasPrefix(key, "sk-or-v1-") {
+		// Must precede the generic "sk-" case below: OpenRouter keys start with
+		// "sk-", are 64+ chars and contain no underscore, so the generic case
+		// swallowed them and validated them against OpenAI (always invalid).
+		return kv.validateOpenRouter(key)
 	} else if strings.HasPrefix(key, "sk-") && len(key) > 48 && !strings.Contains(key, "_") {
 		return kv.validateOpenAI(key)
 	} else if strings.HasPrefix(key, "sk_live_") || strings.HasPrefix(key, "sk_test_") {
@@ -91,8 +96,6 @@ func (kv *KeyValidator) ValidateKey(key string) *ValidatedKey {
 		return kv.validateGoogleAPI(key)
 	} else if strings.HasPrefix(key, "xai-") {
 		return kv.validateXAI(key)
-	} else if strings.HasPrefix(key, "sk-or-v1-") {
-		return kv.validateOpenRouter(key)
 	} else if strings.HasPrefix(key, "hf_") {
 		return kv.validateHuggingFace(key)
 	}

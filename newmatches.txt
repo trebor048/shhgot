@@ -1,0 +1,1444 @@
+SYSTEMATICALLY REWRITE EACH SERVICE AS ITS API KEY / SECRET VERSION.
+THE END RESULT SHOULD BE LIKE THIS:
+
+  - part: 'contents'
+    regex: '\bsk-proj-[a-zA-Z0-9_-]{20,}\b'
+    name: 'OpenAI Project API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bsk-[a-zA-Z0-9]{48}\b'
+    name: 'OpenAI API Key (Legacy)'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bhf_[A-Za-z0-9]{34}\b'
+    name: 'Hugging Face API Token'
+    priority: 3
+    color: '#FF0000'
+
+
+DO THAT FOR EVERY SINGLE ONE BELOW, THEN WRITE THEM TO CONFIG3.YAML:
+
+## 1. AI / ML / LLM
+
+* OpenAI
+* Anthropic
+* Google AI Studio
+* Google Vertex AI
+* Gemini
+* Mistral AI
+* Cohere
+* Groq
+* xAI
+* DeepSeek
+* Perplexity
+* OpenRouter
+* Together AI
+* Fireworks AI
+* Replicate
+* Hugging Face
+* Stability AI
+* AI21
+* Aleph Alpha
+* Cerebras
+* SambaNova
+* Together
+* FriendliAI
+* Anyscale
+* Modal
+* Baseten
+* RunPod
+* Lambda Labs
+* Vast.ai
+* Lepton AI
+* Predibase
+* OctoAI
+* NVIDIA NGC
+* NVIDIA AI Enterprise
+* Voyage AI
+* Jina AI
+* Voyage
+* AssemblyAI
+* Deepgram
+* ElevenLabs
+* PlayHT
+* Cartesia
+* Murf
+* Resemble AI
+* Speechify
+* Rev AI
+* Soniox
+* Gladia
+* GroqCloud
+* Fireworks
+* Cerebras Cloud
+* SambaNova Cloud
+* Together Inference
+* Modal Labs
+* Pinecone
+* Weaviate
+* Qdrant
+* Milvus/Zilliz
+* Chroma
+* LanceDB
+* Turbopuffer
+* Vectara
+* Deep Lake
+* Marqo
+* Typesense
+* Algolia
+* Elasticsearch
+* OpenSearch
+
+---
+
+# 2. Major cloud providers
+
+### AWS
+
+Don't treat AWS as one credential type.
+
+Include:
+
+* AWS Access Key ID
+* AWS Secret Access Key
+* AWS Session Token
+* AWS STS token
+* AWS IAM credentials
+* AWS IAM role credentials
+* AWS Cognito
+* AWS CodeArtifact
+* AWS CodeCommit
+* AWS CodeBuild
+* AWS CodeDeploy
+* AWS CodePipeline
+* AWS ECR
+* AWS S3 presigned credentials
+* AWS Bedrock
+* AWS SageMaker
+* AWS KMS
+* AWS Secrets Manager
+* AWS Parameter Store
+* AWS Lightsail
+* AWS Amplify
+* AWS AppSync
+* AWS API Gateway
+* AWS IoT
+* AWS SES
+* AWS SNS
+* AWS SQS
+* AWS EventBridge
+
+### Microsoft
+
+* Azure subscription credentials
+* Azure client ID
+* Azure client secret
+* Azure tenant ID
+* Azure service principal
+* Azure access token
+* Azure DevOps PAT
+* Azure Storage Account Key
+* Azure SAS token
+* Azure Cosmos DB key
+* Azure OpenAI
+* Azure Cognitive Services
+* Azure Maps
+* Azure Communication Services
+* Azure SignalR
+* Microsoft Graph
+* Microsoft Entra ID
+* Microsoft Fabric
+
+### Google
+
+* Google API key
+* Google OAuth client
+* Google OAuth secret
+* Google service-account JSON
+* Google Cloud access token
+* Google Cloud refresh token
+* Firebase API key
+* Firebase service account
+* Firebase Admin SDK
+* Firebase Cloud Messaging
+* Google Maps
+* Google Places
+* Google Geocoding
+* Google Drive API
+* Google Sheets API
+* YouTube API
+* YouTube Data API
+* YouTube Analytics
+* Google Ads
+* Google Search Console
+* Google Translate
+* Google Vision
+* Google Speech
+* Google Natural Language
+* Google Cloud Storage
+* BigQuery
+* Pub/Sub
+* Cloud SQL
+* Artifact Registry
+
+### Other clouds
+
+* Cloudflare
+* DigitalOcean
+* Linode
+* Akamai
+* Vultr
+* Hetzner
+* OVH
+* Scaleway
+* Oracle Cloud
+* IBM Cloud
+* Alibaba Cloud
+* Tencent Cloud
+* Huawei Cloud
+* Rackspace
+* Equinix
+* Leaseweb
+* UpCloud
+* Kamatera
+* Contabo
+* IONOS
+* DreamHost
+* Liquid Web
+* Hostinger
+* GoDaddy Cloud
+* Navisite
+
+---
+
+# 3. Dev platforms
+
+* GitHub
+* GitHub Actions
+* GitHub Apps
+* GitHub OAuth
+* GitHub PAT
+* GitLab
+* GitLab CI
+* GitLab Runner
+* Bitbucket
+* Bitbucket Pipelines
+* Azure DevOps
+* SourceForge
+* Gitea
+* Forgejo
+* Codeberg
+* Gerrit
+* Phabricator
+* Launchpad
+* AWS CodeCommit
+* Google Cloud Source Repositories
+* Perforce
+* Plastic SCM
+
+---
+
+# 4. Package registries
+
+* npm
+* PyPI
+* RubyGems
+* Maven Central
+* Gradle Plugin Portal
+* NuGet
+* Packagist
+* Cargo
+* Go modules
+* Hex.pm
+* Hackage
+* CocoaPods
+* Swift Package Registry
+* Homebrew
+* Chocolatey
+* Scoop
+* Conan
+* vcpkg
+* Crates.io
+* Docker Hub
+* GitHub Packages
+* GitLab Package Registry
+* Azure Artifacts
+* AWS CodeArtifact
+* Google Artifact Registry
+* JFrog Artifactory
+* Sonatype Nexus
+* Cloudsmith
+* MyGet
+* Packagecloud
+* Gemfury
+* Repology
+
+---
+
+# 5. CI/CD
+
+* GitHub Actions
+* GitLab CI
+* CircleCI
+* Travis CI
+* Jenkins
+* Buildkite
+* TeamCity
+* Bamboo
+* Drone
+* Harness
+* Codefresh
+* Semaphore
+* Buddy
+* Bitrise
+* AppCenter
+* Codemagic
+* Semaphore CI
+* Spinnaker
+* Argo CD
+* Argo Workflows
+* Flux
+* Tekton
+* Concourse
+* Woodpecker CI
+* GoCD
+* Wercker
+* Screwdriver
+* AWS CodeBuild
+* Azure Pipelines
+* Google Cloud Build
+* Google Cloud Deploy
+
+---
+
+# 6. Hosting / deployment
+
+* Vercel
+* Netlify
+* Render
+* Railway
+* Fly.io
+* Heroku
+* Firebase
+* Cloudflare Pages
+* Cloudflare Workers
+* Cloudflare R2
+* Deno Deploy
+* Bun
+* Koyeb
+* Northflank
+* Qovery
+* Zeabur
+* Adaptable
+* Cyclic
+* Glitch
+* Replit
+* CodeSandbox
+* StackBlitz
+* Gitpod
+* Codespaces
+* Sourcegraph
+* Modal
+* PythonAnywhere
+* PythonAnywhere API
+* DigitalOcean App Platform
+* AWS Amplify
+* Azure Static Web Apps
+
+---
+
+# 7. Databases
+
+### SQL
+
+* PostgreSQL
+* MySQL
+* MariaDB
+* MSSQL
+* Oracle Database
+* SQLite
+* CockroachDB
+* YugabyteDB
+* TiDB
+* PlanetScale
+* Neon
+* Supabase
+* AlloyDB
+* Amazon Aurora
+* Amazon RDS
+* Azure SQL
+* Google Cloud SQL
+
+### NoSQL
+
+* MongoDB
+* MongoDB Atlas
+* Redis
+* Redis Cloud
+* DynamoDB
+* Cassandra
+* ScyllaDB
+* CouchDB
+* Couchbase
+* Firebase
+* Firestore
+* Realtime Database
+* Fauna
+* Cosmos DB
+* RavenDB
+* ArangoDB
+* Neo4j
+* OrientDB
+* RethinkDB
+
+### Hosted DB platforms
+
+* Supabase
+* Neon
+* PlanetScale
+* Railway
+* Render
+* Aiven
+* DigitalOcean Managed Databases
+* Heroku Postgres
+* Crunchy Bridge
+* Tembo
+* Turso
+* Cockroach Cloud
+* MongoDB Atlas
+* Redis Cloud
+* Upstash
+* Xata
+* Convex
+* Firebase
+
+---
+
+# 8. Payment / financial APIs
+
+* Stripe
+* Stripe Connect
+* Stripe Terminal
+* PayPal
+* PayPal REST
+* Braintree
+* Square
+* Adyen
+* Checkout.com
+* Mollie
+* Paddle
+* Chargebee
+* Recurly
+* Zuora
+* FastSpring
+* Lemon Squeezy
+* Gumroad
+* Shopify Payments
+* Authorize.Net
+* Worldpay
+* GoCardless
+* Wise
+* Plaid
+* Dwolla
+* Marqeta
+* Modern Treasury
+* Airwallex
+* Rapyd
+* Payoneer
+* Paystack
+* Flutterwave
+* Razorpay
+* Cashfree
+* PhonePe
+* Mercado Pago
+* PagSeguro
+* dLocal
+* PayU
+* 2Checkout
+* Klarna
+* Affirm
+* Afterpay
+
+---
+
+# 9. Crypto / blockchain infrastructure
+
+* Coinbase
+* Coinbase Commerce
+* Coinbase Developer Platform
+* Binance
+* Kraken
+* Bitfinex
+* Bitstamp
+* Gemini
+* OKX
+* Bybit
+* KuCoin
+* Crypto.com
+* Gate.io
+* Alchemy
+* Infura
+* QuickNode
+* Moralis
+* Ankr
+* Chainstack
+* Blockdaemon
+* GetBlock
+* Blast API
+* NOWNodes
+* Tatum
+* Covalent
+* CoinGecko
+* CoinMarketCap
+* Etherscan
+* Blockchair
+* BlockCypher
+* The Graph
+* Chainlink
+* Thirdweb
+* Reservoir
+* SimpleHash
+* Helius
+* QuickNode
+* Triton
+* Shyft
+* Solana RPC
+* Avalanche APIs
+* Polygon APIs
+* Arbitrum APIs
+* Optimism APIs
+
+---
+
+# 10. Email
+
+* SendGrid
+* Mailgun
+* Postmark
+* Resend
+* Mailchimp
+* Amazon SES
+* Brevo
+* SparkPost
+* Mandrill
+* Sendinblue
+* Mailjet
+* Elastic Email
+* SMTP2GO
+* SocketLabs
+* MailerSend
+* Mailtrap
+* EmailOctopus
+* Campaign Monitor
+* Constant Contact
+* ConvertKit
+* Customer.io
+* Klaviyo
+* SendPulse
+* Pepipost
+* SendLayer
+
+---
+
+# 11. SMS / telephony
+
+* Twilio
+* Vonage
+* Telnyx
+* Plivo
+* Sinch
+* MessageBird
+* Bird
+* Bandwidth
+* Infobip
+* ClickSend
+* TextMagic
+* Telnyx
+* SignalWire
+* 46elks
+* MessageMedia
+* CM.com
+* Routee
+* Telesign
+* VerifyKit
+* BulkSMS
+* SMSGlobal
+
+---
+
+# 12. Chat / messaging
+
+* Slack
+* Discord
+* Telegram
+* Microsoft Teams
+* Mattermost
+* Rocket.Chat
+* Zulip
+* Matrix
+* Element
+* Pusher
+* PubNub
+* Ably
+* Stream
+* Sendbird
+* CometChat
+* Intercom
+* Crisp
+* Drift
+* Front
+* Help Scout
+* Zendesk
+
+Credential families include:
+
+```text
+bot tokens
+webhook URLs
+webhook secrets
+application tokens
+OAuth tokens
+user tokens
+workspace tokens
+signing secrets
+client secrets
+integration tokens
+```
+
+---
+
+# 13. Monitoring / logging
+
+* Sentry
+* Datadog
+* New Relic
+* Grafana Cloud
+* Grafana
+* Prometheus remote-write
+* Honeycomb
+* Rollbar
+* LogRocket
+* Logtail
+* Better Stack
+* Papertrail
+* Loggly
+* Splunk
+* Sumo Logic
+* Coralogix
+* Mezmo
+* Axiom
+* Elastic Cloud
+* Logz.io
+* Sematext
+* AppDynamics
+* Dynatrace
+* Instana
+* Raygun
+* Bugsnag
+* Airbrake
+* Highlight
+* GlitchTip
+* SigNoz
+
+---
+
+# 14. Security
+
+* Snyk
+* SonarQube
+* SonarCloud
+* Semgrep
+* Checkmarx
+* Veracode
+* Mend
+* Black Duck
+* Wiz
+* Lacework
+* CrowdStrike
+* SentinelOne
+* Palo Alto
+* Rapid7
+* Tenable
+* Qualys
+* GitGuardian
+* TruffleHog
+* Gitleaks
+* 1Password
+* Bitwarden
+* HashiCorp Vault
+* Doppler
+* Infisical
+* CyberArk
+* Okta
+* Auth0
+* Clerk
+* WorkOS
+* Stytch
+
+---
+
+# 15. Analytics
+
+* Google Analytics
+* Google Tag Manager
+* Segment
+* Mixpanel
+* Amplitude
+* Heap
+* PostHog
+* Plausible
+* Matomo
+* Hotjar
+* FullStory
+* Pendo
+* RudderStack
+* Snowplow
+* June
+* Countly
+* Fathom
+* Simple Analytics
+* Umami
+* Mouseflow
+* Smartlook
+* Contentsquare
+
+---
+
+# 16. Search / scraping
+
+* Algolia
+* Elastic
+* Elasticsearch
+* OpenSearch
+* Meilisearch
+* Typesense
+* Searchspring
+* Swiftype
+* Coveo
+* Azure Cognitive Search
+* Google Programmable Search
+* SerpAPI
+* Serper
+* Zenserp
+* ScraperAPI
+* ScrapingBee
+* ScrapingAnt
+* ScraperBox
+* Zyte
+* Bright Data
+* Oxylabs
+* Apify
+* Browserless
+* Browserbase
+* ScrapingFish
+* Proxycurl
+* Crawlbase
+* Firecrawl
+* Tavily
+* Exa
+* Brave Search API
+
+---
+
+# 17. Maps / geolocation
+
+* Google Maps
+* Google Places
+* Mapbox
+* HERE
+* TomTom
+* OpenCage
+* LocationIQ
+* Geoapify
+* MapTiler
+* Radar
+* Positionstack
+* IPinfo
+* MaxMind
+* IP2Location
+* Abstract API
+* GeoJS
+* BigDataCloud
+* Geocode.xyz
+* GeoNames
+
+---
+
+# 18. Media / images / video
+
+* Cloudinary
+* Imgix
+* ImageKit
+* Uploadcare
+* Filestack
+* ImgBB
+* Mux
+* Vimeo
+* YouTube
+* Twitch
+* Dailymotion
+* Wistia
+* Bunny Stream
+* Cloudflare Stream
+* Fastly
+* Bunny CDN
+* UploadThing
+* S3
+* Backblaze B2
+* Wasabi
+* Storj
+
+---
+
+# 19. CMS / content
+
+* WordPress
+* WordPress.com
+* Ghost
+* Contentful
+* Sanity
+* Strapi
+* Directus
+* Payload
+* Prismic
+* Storyblok
+* DatoCMS
+* Hygraph
+* ButterCMS
+* Builder.io
+* Webflow
+* Wix
+* Squarespace
+* Contentstack
+* Kontent.ai
+* Agility CMS
+
+---
+
+# 20. E-commerce
+
+* Shopify
+* Shopify Admin API
+* Shopify Storefront API
+* WooCommerce
+* BigCommerce
+* Magento
+* Adobe Commerce
+* Saleor
+* Medusa
+* commercetools
+* Elastic Path
+* PrestaShop
+* OpenCart
+* Ecwid
+* VTEX
+* Salesforce Commerce Cloud
+* Squarespace Commerce
+* Wix Stores
+
+---
+
+# 21. CRM / business
+
+* Salesforce
+* HubSpot
+* Pipedrive
+* Zoho
+* Freshsales
+* Close
+* Copper
+* Insightly
+* Capsule
+* Keap
+* ActiveCampaign
+* Intercom
+* Zendesk
+* Freshdesk
+* ServiceNow
+* SAP
+* Oracle
+* Microsoft Dynamics
+* Monday
+* Attio
+
+---
+
+# 22. Productivity
+
+* Notion
+* Airtable
+* Linear
+* Jira
+* Confluence
+* Trello
+* Asana
+* ClickUp
+* Monday
+* Basecamp
+* Todoist
+* Evernote
+* Dropbox
+* Box
+* Google Drive
+* OneDrive
+* SharePoint
+* Egnyte
+* Smartsheet
+* Coda
+* Slite
+* Nuclino
+
+---
+
+# 23. Developer utilities
+
+* Postman
+* Insomnia
+* Hoppscotch
+* ngrok
+* LocalTunnel
+* Tailscale
+* ZeroTier
+* Gitpod
+* Replit
+* CodeSandbox
+* StackBlitz
+* Sourcegraph
+* Sentry
+* Renovate
+* Dependabot
+* Renovatebot
+* BrowserStack
+* Sauce Labs
+* LambdaTest
+* Percy
+* Chromatic
+
+---
+
+# 24. Feature flags / experimentation
+
+* LaunchDarkly
+* Split
+* Flagsmith
+* Unleash
+* ConfigCat
+* GrowthBook
+* Statsig
+* Optimizely
+* Eppo
+* Harness Feature Flags
+* DevCycle
+* Flipt
+* PostHog
+* Firebase Remote Config
+
+---
+
+# 25. Secrets / identity
+
+* HashiCorp Vault
+* Vault Enterprise
+* AWS Secrets Manager
+* Azure Key Vault
+* Google Secret Manager
+* Doppler
+* Infisical
+* 1Password
+* Bitwarden
+* CyberArk
+* Keeper
+* StrongDM
+* Akeyless
+* Conjur
+* Okta
+* Auth0
+* Clerk
+* Stytch
+* WorkOS
+* Descope
+* FusionAuth
+* Keycloak
+* Zitadel
+* SuperTokens
+* Ory
+
+---
+
+# 26. IaC / infrastructure automation
+
+* Terraform Cloud
+* Terraform Enterprise
+* HashiCorp Cloud
+* Pulumi
+* Crossplane
+* Spacelift
+* env0
+* Scalr
+* Atlantis
+* AWS CDK
+* Serverless Framework
+* SST
+* OpenTofu
+* Ansible Automation Platform
+* Puppet
+* Chef
+* SaltStack
+
+---
+
+# 27. Kubernetes
+
+* Rancher
+* Red Hat OpenShift
+* Amazon EKS
+* Google GKE
+* Azure AKS
+* DigitalOcean Kubernetes
+* Linode Kubernetes
+* Vultr Kubernetes
+* Civo
+* Platform9
+* Mirantis
+* Loft
+* Lens
+* Portainer
+* Argo CD
+* Flux
+* Helm repositories
+
+Potential credential classes:
+
+```text
+kubeconfig
+client certificate
+client key
+service-account token
+registry credential
+cluster token
+cloud-provider token
+OIDC token
+```
+
+---
+
+# 28. DNS / domains
+
+* Cloudflare
+* Route53
+* GoDaddy
+* Namecheap
+* Name.com
+* Porkbun
+* Gandi
+* Hover
+* Dynadot
+* Google Domains legacy
+* Squarespace Domains
+* DNSimple
+* NS1
+* ClouDNS
+* Hurricane Electric
+* DigitalOcean DNS
+* Azure DNS
+* Google Cloud DNS
+* AWS Route53
+* Akamai DNS
+
+---
+
+# 29. Social APIs
+
+* X/Twitter
+* Facebook
+* Instagram
+* Threads
+* LinkedIn
+* Reddit
+* TikTok
+* Snapchat
+* Pinterest
+* Mastodon
+* Bluesky
+* Tumblr
+* Medium
+* Discord
+* Twitch
+* YouTube
+* GitHub
+
+Credential families:
+
+```text
+client_id
+client_secret
+access_token
+refresh_token
+bearer_token
+app_token
+bot_token
+webhook_token
+OAuth token
+developer token
+page token
+user token
+```
+
+---
+
+# 30. Gaming
+
+* Steam
+* Steam Web API
+* Epic Games
+* Riot Games
+* Battle.net
+* Xbox
+* PlayStation
+* Nintendo
+* Roblox
+* Unity
+* Unity Cloud
+* Unity Gaming Services
+* Unreal/Epic Online Services
+* PlayFab
+* GameSparks
+* GameLift
+* Photon
+* LootLocker
+* Beamable
+* Nakama
+* Heroic Labs
+
+---
+
+# 31. Weather / science / public data
+
+* OpenWeather
+* WeatherAPI
+* Weatherbit
+* Tomorrow.io
+* AccuWeather
+* Visual Crossing
+* Meteomatics
+* Stormglass
+* AerisWeather
+* Weatherstack
+* Open-Meteo
+* NASA APIs
+* NOAA APIs
+* USGS
+* Census API
+* Data.gov
+* European Space Agency APIs
+
+---
+
+# 32. Travel
+
+* Amadeus
+* Sabre
+* Travelport
+* Duffel
+* Kiwi
+* Aviationstack
+* FlightAware
+* FlightLabs
+* AeroDataBox
+* OpenSky
+* Cirium
+* TripAdvisor
+* Booking.com APIs
+* Expedia APIs
+* Hotelbeds
+* Skyscanner
+* Rome2Rio
+
+---
+
+# 33. Legal / business data
+
+* OpenCorporates
+* Clearbit
+* People Data Labs
+* Crunchbase
+* Hunter
+* Apollo
+* ZoomInfo
+* RocketReach
+* FullContact
+* Abstract API
+* WhoisXML
+* SecurityTrails
+* VirusTotal
+* Shodan
+* Censys
+* GreyNoise
+* Have I Been Pwned
+
+---
+
+# 34. Automation
+
+* Zapier
+* Make
+* Pipedream
+* n8n
+* Workato
+* Tray.io
+* IFTTT
+* Activepieces
+* Windmill
+* Temporal
+* Trigger.dev
+* Inngest
+* TriggerMesh
+
+---
+
+# 35. Testing
+
+* BrowserStack
+* Sauce Labs
+* LambdaTest
+* Percy
+* Applitools
+* Cypress Cloud
+* Playwright
+* TestRail
+* Testmo
+* Testiny
+* Browserling
+* CrossBrowserTesting
+* Kobiton
+* Perfecto
+* TestingBot
+
+---
+
+# 36. Forms / surveys
+
+* Typeform
+* SurveyMonkey
+* Jotform
+* Tally
+* Formspree
+* Formspark
+* Basin
+* Formcarry
+* Getform
+* Paperform
+* Fillout
+* Google Forms API
+
+---
+
+# 37. Accounting / invoicing
+
+* QuickBooks
+* Xero
+* FreshBooks
+* Wave
+* Stripe Billing
+* Chargebee
+* Recurly
+* Zuora
+* Paddle
+* GoCardless
+* Sage
+* Zoho Books
+* TaxJar
+* Avalara
+* Plaid
+
+---
+
+# 38. Shipping
+
+* Shippo
+* EasyPost
+* ShipEngine
+* ShipStation
+* AfterShip
+* DHL APIs
+* FedEx APIs
+* UPS APIs
+* USPS APIs
+* Canada Post APIs
+* Royal Mail APIs
+* Sendcloud
+* ShipBob
+
+---
+
+# 39. HR / recruiting
+
+* Greenhouse
+* Lever
+* Workable
+* Ashby
+* BambooHR
+* Rippling
+* Gusto
+* Deel
+* Remote
+* Personio
+* HiBob
+* Workday
+* SAP SuccessFactors
+* ADP
+* UKG
+
+---
+
+# 40. Agriculture / IoT / industrial
+
+* Particle
+* Arduino Cloud
+* Adafruit IO
+* ThingsBoard
+* Losant
+* Blynk
+* AWS IoT
+* Azure IoT
+* Google Cloud IoT ecosystem
+* Ubidots
+* Datacake
+* Balena
+* Losant
+* EMQX
+* HiveMQ
+* Thingspeak
+
+---
+
+## And then the **generic credential corpus**
+
+This is where the dataset can get much larger than the provider list.
+
+### Generic API formats
+
+```text
+api_key
+apikey
+api-key
+apiToken
+api_token
+api-token
+access_key
+accessKey
+access_token
+accessToken
+auth_token
+authToken
+client_key
+clientKey
+client_secret
+clientSecret
+consumer_key
+consumerKey
+consumer_secret
+consumerSecret
+developer_key
+developerKey
+developer_token
+dev_token
+integration_key
+integration_token
+private_key
+public_key
+secret
+secret_key
+secretKey
+secret_token
+service_key
+service_token
+signing_key
+signing_secret
+webhook_secret
+webhook_token
+application_key
+application_secret
+project_key
+project_token
+organization_key
+organization_token
+account_key
+account_token
+```
+
+### HTTP authentication
+
+```text
+Authorization: Bearer <TOKEN>
+Authorization: Basic <BASE64>
+Authorization: Token <TOKEN>
+Authorization: OAuth <TOKEN>
+X-API-Key: <KEY>
+X-Api-Key: <KEY>
+X-Auth-Token: <TOKEN>
+X-Access-Token: <TOKEN>
+X-Client-Key: <KEY>
+X-Client-Secret: <SECRET>
+X-Auth-Key: <KEY>
+X-Secret-Key: <SECRET>
+```
+
+### Environment variables
+API_KEY
+API_SECRET
+API_TOKEN
+AUTH_TOKEN
+ACCESS_TOKEN
+REFRESH_TOKEN
+CLIENT_ID
+CLIENT_SECRET
+SECRET_KEY
+PRIVATE_KEY
+PUBLIC_KEY
+SIGNING_KEY
+SIGNING_SECRET
+WEBHOOK_SECRET
+DATABASE_URL
+DATABASE_URI
+DB_PASSWORD
+DB_USER
+DB_HOST
+DB_TOKEN
+REDIS_URL
+MONGO_URI
+MONGODB_URI
+POSTGRES_URL
+MYSQL_URL
+AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY
+AWS_SESSION_TOKEN
+AZURE_CLIENT_ID
+AZURE_CLIENT_SECRET
+AZURE_TENANT_ID
+GOOGLE_APPLICATION_CREDENTIALS
+GOOGLE_API_KEY
+GITHUB_TOKEN
+GITLAB_TOKEN
+NPM_TOKEN
+PYPI_TOKEN
+DOCKER_PASSWORD
+DOCKER_AUTH_CONFIG
+OPENAI_API_KEY
+ANTHROPIC_API_KEY
+GROQ_API_KEY
+GEMINI_API_KEY
+HF_TOKEN
+HUGGINGFACE_TOKEN
+STRIPE_SECRET_KEY
+STRIPE_PUBLISHABLE_KEY
+TWILIO_ACCOUNT_SID
+TWILIO_AUTH_TOKEN
+SENDGRID_API_KEY
+DISCORD_TOKEN
+SLACK_TOKEN
+SLACK_SIGNING_SECRET

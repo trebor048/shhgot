@@ -41,8 +41,16 @@ func CloneRepository(session *Session, url string, ref string, dir string, progr
 	defer cancel()
 
 	session.Log.Debug("[%s] Cloning %s in to %s", url, ref, strings.Replace(dir, *session.Options.TempDirectory, "", -1))
+
+	// scanning.clone_depth defaults to a shallow 1; an explicit positive value
+	// overrides it. A full-history clone is never implied.
+	depth := 1
+	if session.Config != nil {
+		depth = session.Config.Scanning.Int(session.Config.Scanning.CloneDepth, depth)
+	}
+
 	opts := &git.CloneOptions{
-		Depth:             1,
+		Depth:             depth,
 		RecurseSubmodules: git.NoRecurseSubmodules,
 		URL:               url,
 		SingleBranch:      true,

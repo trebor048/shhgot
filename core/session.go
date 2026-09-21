@@ -356,12 +356,23 @@ func GetSession() *Session {
 			os.Exit(1)
 		}
 
+		// Fold the "scanning" section into the options the pipeline reads
+		// (file/repo size caps, clone timeout). Must happen before Start(), whose
+		// workers capture these values.
+		session.Config.ApplyScanningOverrides(session.Options)
+
 		// Recreate the queue channels at the configured buffer sizes now that
 		// the config is parsed (no consumer has touched them yet). Absent or
 		// <= 0 queue_buffer_size keeps the built-in 1000/100/1000 defaults.
 		if n := session.Config.Performance.Int(session.Config.Performance.QueueBufferSize, 0); n > 0 {
+			gistBuf := n / 10
+			if gistBuf < 1 {
+				// A small queue_buffer_size (e.g. 5) made this 0, turning the
+				// gist channel unbuffered while the other two stayed buffered.
+				gistBuf = 1
+			}
 			session.Repositories = make(chan GitResource, n)
-			session.Gists = make(chan string, n/10)
+			session.Gists = make(chan string, gistBuf)
 			session.Comments = make(chan Comment, n)
 		}
 

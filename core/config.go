@@ -27,6 +27,7 @@ type Config struct {
 	Signatures                   []ConfigSignature `yaml:"signatures"`
 	LogFormat                    string            `yaml:"logFormat,omitempty"`
 	Performance                  PerformanceConfig `yaml:"performance,omitempty"`
+	Scanning                     ScanningConfig    `yaml:"scanning,omitempty"`
 	Cleanup                      CleanupConfig     `yaml:"cleanup,omitempty"`
 	MatchLogDir                  string            `yaml:"match_log_dir,omitempty"`
 	MatchLogEnabled              *bool             `yaml:"match_log_enabled,omitempty"`
@@ -55,6 +56,82 @@ func (p PerformanceConfig) Int(v *int, def int) int {
 		return *v
 	}
 	return def
+}
+
+// ScanningConfig wires the "scanning" section of config.yaml into the scan
+// pipeline. yaml.Unmarshal silently drops keys with no matching field, so
+// before this struct existed the entire section was ignored: max_file_count
+// under "scanning" had no effect and repositories with thousands of files were
+// still walked in full.
+//
+// Every field is a pointer so an absent key keeps the compiled-in default (or
+// the value passed on the command line); an explicit positive value wins.
+// max_file_count is also still read from the legacy performance.max_file_count
+// key - see Config.MaxFileCount.
+type ScanningConfig struct {
+	MaxFileSizeMB    *int  `yaml:"max_file_size_mb,omitempty"`
+	MaxRepoSizeMB    *int  `yaml:"max_repo_size_mb,omitempty"`
+	MaxFileCount     *int  `yaml:"max_file_count,omitempty"`
+	CloneDepth       *int  `yaml:"clone_depth,omitempty"`
+	CloneTimeoutSecs *int  `yaml:"clone_timeout_seconds,omitempty"`
+	ScanTimeoutSecs  *int  `yaml:"scan_timeout_seconds,omitempty"`
+	SkipForks        *bool `yaml:"skip_forks,omitempty"`
+	SkipArchived     *bool `yaml:"skip_archived,omitempty"`
+}
+
+// Int returns the configured value, or def when the key is absent or <= 0.
+func (s ScanningConfig) Int(v *int, def int) int {
+	if v != nil && *v > 0 {
+		return *v
+	}
+	return def
+}
+
+// Bool returns the configured value, or def when the key is absent. Unlike Int
+// there is no "<= 0" case: an explicit false is a meaningful setting.
+func (s ScanningConfig) Bool(v *bool, def bool) bool {
+	if v != nil {
+		return *v
+	}
+	return def
+}
+
+// MaxFileCount resolves the per-repository file cap. A value in the "scanning"
+// section wins; the legacy performance.max_file_count key is still honoured so
+// an existing config keeps working; otherwise def is returned. The caller
+// supplies def so the compiled-in default lives in one place.
+func (c *Config) MaxFileCount(def int) int {
+	if c == nil {
+		return def
+	}
+	if n := c.Scanning.Int(c.Scanning.MaxFileCount, 0); n > 0 {
+		return n
+	}
+	return c.Performance.Int(c.Performance.MaxFileCount, def)
+}
+
+// ApplyScanningOverrides folds the "scanning" section into the CLI Options the
+// scan pipeline already reads. config.yaml is in MB and the options are in KB,
+// so the size keys are converted; only positive values override, leaving the
+// flag value alone when the key is absent.
+//
+// This runs once, right after ParseConfig, before any worker reads the options.
+func (c *Config) ApplyScanningOverrides(o *Options) {
+	if c == nil || o == nil {
+		return
+	}
+	if mb := c.Scanning.Int(c.Scanning.MaxFileSizeMB, 0); mb > 0 {
+		v := uint(mb) * 1024 // config is MB, the option is KB
+		o.MaximumFileSize = &v
+	}
+	if mb := c.Scanning.Int(c.Scanning.MaxRepoSizeMB, 0); mb > 0 {
+		v := uint(mb) * 1024
+		o.MaximumRepositorySize = &v
+	}
+	if secs := c.Scanning.Int(c.Scanning.CloneTimeoutSecs, 0); secs > 0 {
+		v := uint(secs)
+		o.CloneRepositoryTimeout = &v
+	}
 }
 
 // AIReviewConfig supplies the startup defaults for the AI security review.

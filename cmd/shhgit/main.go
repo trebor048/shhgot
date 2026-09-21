@@ -1091,6 +1091,19 @@ func processRepository(repository core.GitResource, workerID int) {
 		getSession().Log.Warn("Failed to retrieve repository %d: %s", repository.Id, err)
 		return
 	}
+
+	// scanning.skip_forks / skip_archived. Both default to false, so the
+	// compiled-in behaviour is unchanged unless the operator opts in.
+	scanCfg := getSession().Config.Scanning
+	if scanCfg.Bool(scanCfg.SkipForks, false) && repo.GetFork() {
+		getSession().Log.Debug("[%s] Skipping fork (scanning.skip_forks)", repository.Url)
+		return
+	}
+	if scanCfg.Bool(scanCfg.SkipArchived, false) && repo.GetArchived() {
+		getSession().Log.Debug("[%s] Skipping archived repository (scanning.skip_archived)", repository.Url)
+		return
+	}
+
 	if repo.GetPermissions()["pull"] &&
 		uint(repo.GetStargazersCount()) >= *getSession().Options.MinimumStars &&
 		uint(repo.GetSize()) < *getSession().Options.MaximumRepositorySize {
@@ -1154,7 +1167,12 @@ func ProcessComments() {
 }
 
 func processComment(comment core.Comment) {
-	dir := core.GetTempDir(core.GetHash(comment.Body))
+	// Key the temp dir on the comment's URL, not its body: two comments with
+	// identical bodies (the same leaked token pasted twice) would otherwise
+	// share one directory, scan it concurrently and publish duplicate findings,
+	// and one worker's RemoveAll could delete the directory mid-scan of the
+	// other. Comment URLs are unique.
+	dir := core.GetTempDir(core.GetHash(comment.Url))
 	// Checked: when this write failed, the scan below ran against a directory with
 	// no comment in it and the finding was silently lost.
 	if err := ioutil.WriteFile(filepath.Join(dir, "comment.ignore"), []byte(comment.Body), 0644); err != nil {
@@ -1294,8 +1312,22 @@ func hasCompletePemBlock(contents string) bool {
 }
 
 func checkSignatures(dir string, url string, ref string, stars int, source core.GitResourceType) (matchedAny bool) {
-	// Count files first and skip if too many (prevents slowdowns on huge repos)
-	maxFileCount := getSession().Config.Performance.Int(getSession().Config.Performance.MaxFileCount, 10000)
+	cfg := getSession().Config
+
+	// Per-repository file cap. scanning.max_file_count wins; the legacy
+	// performance.max_file_count key still works; 10000 is the compiled-in
+	// default. Repositories above the cap are skipped entirely — this is what
+	// keeps a spam repo of thousands of junk files from being walked in full.
+	maxFileCount := cfg.MaxFileCount(10000)
+
+	// Optional wall-clock cap on the scan phase (scanning.scan_timeout_seconds).
+	// Timed from here so it also bounds the file-count walk below on a huge repo.
+	var scanDeadline time.Time
+	scanTimeoutSecs := cfg.Scanning.Int(cfg.Scanning.ScanTimeoutSecs, 0)
+	if scanTimeoutSecs > 0 {
+		scanDeadline = time.Now().Add(time.Duration(scanTimeoutSecs) * time.Second)
+	}
+
 	scanner := core.NewDirectoryScanner(getSession().Log)
 	fileCount := scanner.GetFileCount(dir)
 
@@ -1324,7 +1356,13 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 	// is only a size guard and counts every file, including the blacklisted
 	// ones this slice drops.
 	core.GlobalScanProgress.SetTotalFiles(len(files))
-	for _, file := range files {
+	for i, file := range files {
+		// Checked per file so a runaway scan stops within one file rather than
+		// after the whole repository.
+		if !scanDeadline.IsZero() && time.Now().After(scanDeadline) {
+			lockPrintf("[SKIP] Scan timed out after %ds (%d/%d files): %s\n", scanTimeoutSecs, i, len(files), url)
+			return matchedAny
+		}
 		// The operator may have skipped this repository while the scan was running.
 		// Checking per file is what makes a skip land in a reasonable time on a
 		// large repository; the caller drops the directory afterwards.

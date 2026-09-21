@@ -45,7 +45,7 @@ something looks like a secret.
 
 | | |
 |---|---|
-| **309 built-in signatures** | API keys, tokens, private keys, connection strings and webhook URLs across AWS, OpenAI, Anthropic, Google, Stripe, Slack, Discord, GitHub, Telegram and many more. |
+| **104 built-in signatures** | API keys, tokens, private keys, connection strings and webhook URLs across AWS, OpenAI, Anthropic, Google, Stripe, Slack, Discord, GitHub, Telegram and many more. |
 | **Live GitHub monitoring** | Polls the public event firehose (commits, Gists, comments) with your token, at a rate you control. |
 | **Local scanning** | `--local ./some/dir` walks a directory tree. No GitHub token needed. |
 | **Terminal UI** | The default mode: a live, colour-coded match feed as findings arrive. |
@@ -351,8 +351,9 @@ reference, and this section as the map.
 | Key | Purpose |
 |---|---|
 | `github_access_tokens` | One or more GitHub tokens; revoked ones are pruned automatically. |
-| `signatures` | The detection rules — 309 in the example. |
+| `signatures` | The detection rules — 104 in the example. |
 | `performance` | Thread counts, API pacing, worker-pool and queue sizing. |
+| `scanning` | Per-repository size/file gates, clone depth and timeout, fork/archive filters. |
 | `webhook`, `webhook_ai_tokens`, `webhook_crypto` | Alert destinations ([details](#webhooks)). |
 | `webhook_payload` | Body template POSTed to the webhook. |
 | `logFormat` | Terminal UI style ([details](#log-styles)). |
@@ -402,7 +403,24 @@ skipped at startup with a warning, so check the log if a rule never fires.
 | `api_sleep_seconds` | `5` | Pause between polling cycles. |
 | `worker_pool_size` | `20` | Concurrent event processors. |
 | `queue_buffer_size` | `0` | Internal queue depth. Unset keeps the built-in `1000`/`100`/`1000` sizes. |
-| `max_file_count` | `10000` | Files processed per repository before skipping it. |
+| `max_file_count` | `10000` | Legacy location of the per-repository file cap. Prefer `scanning.max_file_count`; this key still works and is used when `scanning` leaves it unset. |
+
+### Scanning keys
+
+These gate which repositories and files are scanned at all — the first line of
+defence against a spam repository of thousands of junk files. Absent keys keep
+the compiled-in default (or the value passed on the command line).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `max_file_count` | `10000` | Skip a repository with more files than this (counted before the blacklist). Wins over `performance.max_file_count`. |
+| `max_file_size_mb` | CLI `--maximum-file-size` (`0.25` MB) | Skip individual files larger than this. |
+| `max_repo_size_mb` | CLI `--maximum-repository-size` (`5` MB) | Skip repositories larger than this. |
+| `clone_depth` | `1` | Git clone depth. `1` is a shallow clone; a full-history clone is never implied. |
+| `clone_timeout_seconds` | CLI `--clone-repository-timeout` (`30`) | Abort a clone after this long. |
+| `scan_timeout_seconds` | `0` (no limit) | Abort a repository's scan after this long, checked per file. |
+| `skip_forks` | `false` | Skip forked repositories. |
+| `skip_archived` | `false` | Skip archived repositories. |
 
 Disk usage is capped by `max_disk_usage_mb` (default 5120) plus
 `cleanup_threshold_mb` and `cleanup_interval_secs`, which evict stale clones so a
@@ -611,8 +629,11 @@ the GitHub API. Tune in this order.
    concurrency; raise them too far and you are only fighting the API limit.
 3. **Safety rails.** `--maximum-repository-size`, `--maximum-file-size`,
    `--clone-repository-timeout` and `--minimum-stars` stop pathological
-   repositories from eating bandwidth. On a fast link, lower
-   `--clone-repository-timeout` so a hung clone cannot stall a worker.
+   repositories from eating bandwidth — their `scanning.*_mb` /
+   `scanning.clone_timeout_seconds` equivalents live in `config.yaml`. On a fast
+   link, lower the clone timeout so a hung clone cannot stall a worker, and set
+   `scanning.max_file_count` to skip a spam repository of thousands of junk
+   files before it is walked at all.
 4. **`--entropy-threshold`.** Higher reduces false positives at the cost of
    missing weak-but-real secrets; `0` disables the check.
 5. **Trim the signature set.** Every rule is a regex pass over every candidate
