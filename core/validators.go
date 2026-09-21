@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -568,8 +569,11 @@ func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, m
 		filepath.Base(strings.ToLower(file)) == ".env")
 
 	if isEnvFile {
-		// Embed FULL file content for .env files (no truncation)
-		message += "\n**📄 .env File Content:**\n```env\n" + fileContent + "\n```"
+		// Embed the head of the .env content. The full file can be up to
+		// MaximumFileSize (256 KB), but a provider rejects an oversized body
+		// outright, which used to lose the entire alert for a large .env. The
+		// cap keeps the alert deliverable; truncateEnvContent marks any cut.
+		message += "\n**📄 .env File Content:**\n```env\n" + truncateEnvContent(fileContent, maxEnvEmbedChars) + "\n```"
 	}
 
 	if webhookPayload == "" {
@@ -632,21 +636,26 @@ func sendDiscordMatchWebhook(webhookURL string, url string, signature string, fi
 		filepath.Base(strings.ToLower(file)) == ".env")
 
 	if isEnvFile {
-		// Discord has a 6000 character limit per embed description
-		// and 1024 character limit per field value
-		// We'll split the content across multiple fields if needed
+		// Discord allows at most 25 fields and 6000 characters across an
+		// embed, and 1024 characters per field value, so the full file (up to
+		// MaximumFileSize) cannot be embedded: an oversized embed is rejected
+		// with a 400 and the alert is lost after the queue's retries. Embed the
+		// head of the content across a bounded number of fields instead.
 		const maxFieldLength = 900 // Leave room for code block markers
+		const maxEnvFields = 4     // Bounded so the whole embed stays under 6000 chars
 
-		if len(fileContent) <= maxFieldLength {
+		envContent := truncateEnvContent(fileContent, maxFieldLength*maxEnvFields)
+
+		if len(envContent) <= maxFieldLength {
 			// Single field if content is small enough
 			fields = append(fields, map[string]interface{}{
 				"name":   "📄 .env File Content",
-				"value":  "```env\n" + fileContent + "\n```",
+				"value":  "```env\n" + envContent + "\n```",
 				"inline": false,
 			})
 		} else {
 			// Split into multiple fields for large .env files
-			envChunks := chunkString(fileContent, maxFieldLength)
+			envChunks := chunkString(envContent, maxFieldLength)
 			for i, chunk := range envChunks {
 				fieldName := fmt.Sprintf("📄 .env File Content (Part %d/%d)", i+1, len(envChunks))
 				if i == 0 {
@@ -704,6 +713,26 @@ func sendDiscordMatchWebhook(webhookURL string, url string, signature string, fi
 	// Use webhook queue for rate limiting and retry logic
 	queue := GetWebhookQueue()
 	queue.Enqueue(webhookURL, string(jsonPayload))
+}
+
+// maxEnvEmbedChars bounds how much .env file content is embedded in a generic
+// (Slack/Mattermost) webhook alert. The full file can be up to MaximumFileSize
+// (256 KB), but Slack rejects text over 40000 characters, so embedding all of
+// it lost the entire alert for a large .env. A few KB holds the head of any
+// realistic .env; truncateEnvContent marks anything it had to cut.
+const maxEnvEmbedChars = 3500
+
+// truncateEnvContent caps s at max bytes without splitting a multi-byte UTF-8
+// rune, appending a marker when it had to cut. max <= 0 means no cap.
+func truncateEnvContent(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "\n... (truncated)"
 }
 
 // chunkString splits a string into chunks of max size

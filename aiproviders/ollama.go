@@ -205,7 +205,9 @@ func (c *ollamaClient) post(ctx context.Context, path string, body []byte, hc *h
 
 	resp, err := hc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s: request failed: %w", c.name, err)
+		// Never surface the API key, even if the transport echoed the request
+		// (a proxy in front of Ollama can do that). Matches openAICompatClient.
+		return nil, fmt.Errorf("%s: request failed: %w", c.name, redactError(err, c.apiKey))
 	}
 	return resp, nil
 }
