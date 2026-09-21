@@ -103,6 +103,10 @@ main{flex:1;display:flex;flex-direction:column;overflow:hidden}
 .mrow.open .mrow-body{grid-template-rows:1fr}
 .mrow.open .mrow-pad{opacity:1}
 @media (prefers-reduced-motion:reduce){.mrow-body,.mrow-pad{transition:none}}
+/* Fallback for engines that do not accept a 0fr grid track. Without it the
+   collapsed body can render at full height - or, worse, the opened one at zero -
+   so the card never visibly drops down. Toggling display always works. */
+@supports not (grid-template-rows:0fr){.mrow-body{display:none}.mrow.open .mrow-body{display:block}}
 .mrow.open .chev{transform:rotate(180deg)}
 .metarow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:10.5px;color:var(--muted);margin-bottom:5px}
 .metarow a{color:var(--cyan);text-decoration:underline;word-break:break-all}
@@ -429,8 +433,21 @@ var shown=matches.filter(matchFilter);
 document.getElementById('cnt-matches').textContent=shown.length;
 document.getElementById('showing').textContent=shown.length+' matches / '+matches.length+' total'+(shown.length>500?' (latest 500)':'');
 var el=document.getElementById('panel-matches');
-if(shown.length===0){if(!el.firstChild||el.firstChild.className!=='empty')el.innerHTML='<div class="empty">No matches yet - waiting for the scanner...</div>';}
+if(shown.length===0){
+/* Say WHY the list is empty. "No matches yet" was shown even when matches
+   existed but the active filter hid them, so a filter that matched nothing
+   looked like the whole scan had been wiped. The filtered case names the
+   problem and offers the one-click way back. */
+var filtered=matches.length>0;
+var kind=filtered?'filtered':'none';
+if(el.getAttribute('data-empty')!==kind){
+el.setAttribute('data-empty',kind);
+el.innerHTML='<div class="empty">'+(filtered?'No matches for the current filter. <a href="#" id="clear-filter">Clear filters</a>':'No matches yet - waiting for the scanner...')+'</div>';
+if(filtered){var cf=document.getElementById('clear-filter');if(cf)cf.onclick=function(e){e.preventDefault();state.sig='';state.source='';state.q='';var q=document.getElementById('search');if(q)q.value='';var sg=document.getElementById('sig');if(sg)sg.value='';var sr=document.getElementById('src');if(sr)sr.value='';render();};}
+}
+}
 else{
+el.removeAttribute('data-empty');
 if(el.firstChild&&el.firstChild.className==='empty')el.innerHTML='';
 /* Newest first, windowed to the most recent 500. Slicing from the front pinned
    the OLDEST 500, so once a scan passed 500 findings no new match could ever
@@ -501,7 +518,7 @@ var toks=(m.matches||[]).map(function(t){return '<div class="tok"><span class="v
 if(toks)pad.insertAdjacentHTML('beforeend','<div class="toks">'+toks+'</div>');
 inner.appendChild(pad);body.appendChild(inner);
 d.appendChild(head);d.appendChild(body);
-head.onclick=function(){d.classList.toggle('open');};
+head.onclick=function(e){if(e&&e.stopPropagation)e.stopPropagation();d.classList.toggle('open');};
 var ab=meta.querySelector('.aibtn');if(ab)ab.onclick=function(){createReview(m,ab);};
 strip.querySelector('.copy').onclick=function(){copyVal(this);};
 strip.querySelector('.hidebtn').onclick=function(){var v=strip.querySelector('.secval');var h=v.classList.toggle('hide');this.textContent=h?'show':'hide';};
@@ -819,7 +836,15 @@ var ss=document.getElementById('src');var sc=ss.value;
 var srcHtml='<option value="">All</option>'+Object.keys(srcs).sort().map(function(n){return '<option value="'+esc(n)+'">'+esc(n)+'</option>'}).join('');
 if(ss.getAttribute('data-html')!==srcHtml){ss.innerHTML=srcHtml;ss.setAttribute('data-html',srcHtml);}
 ss.value=sc;
-var top=(stats.top_signatures||[]);
+/* Only offer filters the loaded matches can satisfy. top_signatures and
+   matches_by_source are cumulative server counts, but the hub keeps only the
+   last maxMatches matches, so a signature or source whose matches have aged
+   out was still listed - clicking it filtered every card away and left an
+   empty panel that looked like the findings had been lost. Intersecting with
+   the client's own matches keeps every sidebar entry clickable to a non-empty
+   list. */
+var haveSig={};matches.forEach(function(m){haveSig[m.signature]=1});
+var top=(stats.top_signatures||[]).filter(function(s){return haveSig[s.name]});
 var sigsEl=document.getElementById('sigs');
 if(top.length===0){if(!sigsEl.firstChild||sigsEl.firstChild.className!=='live-empty')sigsEl.innerHTML='<div class="live-empty">none</div>';}
 else{if(sigsEl.firstChild&&sigsEl.firstChild.className==='live-empty')sigsEl.innerHTML='';
@@ -827,7 +852,8 @@ syncList(sigsEl,top,function(s){return s.name},function(s){var d=document.create
 /* Per-source breakdown from the server counters, so a source with no live
    match in the current page still shows its total. Clicking filters. */
 var srcMap=stats.matches_by_source||{};
-var srcNames=Object.keys(srcMap).sort(function(a,b){return srcMap[b]-srcMap[a]});
+var haveSrc={};matches.forEach(function(m){haveSrc[m.source]=1});
+var srcNames=Object.keys(srcMap).filter(function(n){return haveSrc[n]}).sort(function(a,b){return srcMap[b]-srcMap[a]});
 var srcEl=document.getElementById('sources');
 if(srcEl){
 if(srcNames.length===0){if(!srcEl.firstChild||srcEl.firstChild.className!=='live-empty')srcEl.innerHTML='<div class="live-empty">none</div>';}
