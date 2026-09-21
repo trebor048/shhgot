@@ -159,7 +159,7 @@ func GetRepositories(session *Session) {
 			noDataCount = 0
 
 			if opt.Page == 0 {
-				tokenMessage := fmt.Sprintf("[?] Token %s[..] has %d/%d calls remaining.", client.Token[:10], resp.Rate.Remaining, resp.Rate.Limit)
+				tokenMessage := fmt.Sprintf("[?] Token %s[..] has %d/%d calls remaining.", MaskToken(client.Token), resp.Rate.Remaining, resp.Rate.Limit)
 
 				if resp.Rate.Remaining < 50 {
 					session.Log.Warn("%s", tokenMessage)
@@ -288,17 +288,24 @@ func GetGists(session *Session) {
 				continue
 			}
 
+			// Both rate-limit cases fall through to the top of the loop, which
+			// returns this client to the pool and picks another token - the same
+			// rotation the events path uses. They used to break out of the loop
+			// entirely, so one rate-limited token stopped gist polling for the
+			// rest of the run. The client is deliberately NOT freed here: the top
+			// of the loop does that, and freeing twice would double-fill the pool.
 			if _, ok := err.(*github.RateLimitError); ok {
 				client.RateLimitedUntil = resp.Rate.Reset.Time
-				session.FreeClient(client)
 				session.Progress.IncrementRateLimited()
-				break
+				continue
 			}
 
 			if _, ok := err.(*github.AbuseRateLimitError); ok {
-				session.FreeClient(client)
+				// Park it briefly: FreeClient routes a future deadline to the
+				// exhausted set, so it is not handed straight back out.
+				client.RateLimitedUntil = time.Now().Add(5 * time.Second)
 				session.Progress.IncrementRateLimited()
-				break
+				continue
 			}
 
 			session.Log.Warn("Error getting GitHub Gists: %s ... trying again", err)

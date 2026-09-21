@@ -55,15 +55,17 @@ func (cm *CleanupManager) GetDiskUsage() (uint64, error) {
 // CleanupIfNeeded checks disk usage and cleans up old directories if needed
 func (cm *CleanupManager) CleanupIfNeeded() error {
 	cm.Lock()
-	defer cm.Unlock()
-
 	// Only check cleanup every N seconds to avoid excessive I/O
 	if time.Since(cm.lastCleanupTime).Seconds() < float64(cm.cleanupIntervalSecs) {
+		cm.Unlock()
 		return nil
 	}
-
 	cm.lastCleanupTime = time.Now()
+	cm.Unlock()
 
+	// Everything below is slow I/O - a full recursive walk, then more walks and
+	// removals. It runs without the lock so a scanner worker's MarkProcessed is
+	// not stuck behind it for the length of a disk sweep.
 	usage, err := cm.GetDiskUsage()
 	if err != nil {
 		return err
@@ -95,6 +97,15 @@ func (cm *CleanupManager) cleanupOldDirectories() error {
 		size    int64
 	}
 
+	// Snapshot the processed map under the lock; the per-directory walks below are
+	// slow and must not hold it.
+	cm.Lock()
+	processed := make(map[string]time.Time, len(cm.processedDirectories))
+	for k, v := range cm.processedDirectories {
+		processed[k] = v
+	}
+	cm.Unlock()
+
 	var dirs []dirInfo
 
 	for _, entry := range entries {
@@ -110,7 +121,7 @@ func (cm *CleanupManager) cleanupOldDirectories() error {
 
 		// Get the most recent modification time in the directory
 		modTime := info.ModTime()
-		if processedTime, exists := cm.processedDirectories[fullPath]; exists {
+		if processedTime, exists := processed[fullPath]; exists {
 			modTime = processedTime
 		}
 
@@ -139,7 +150,9 @@ func (cm *CleanupManager) cleanupOldDirectories() error {
 		err := os.RemoveAll(dir.path)
 		if err == nil {
 			GetSession().Log.Debug("Cleaned up directory: %s (freed %dMB)", dir.path, dir.size/(1024*1024))
+			cm.Lock()
 			delete(cm.processedDirectories, dir.path)
+			cm.Unlock()
 			currentUsage -= uint64(dir.size / (1024 * 1024))
 		}
 	}

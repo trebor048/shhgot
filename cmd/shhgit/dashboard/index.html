@@ -145,6 +145,9 @@ main{flex:1;display:flex;flex-direction:column;overflow:hidden}
 .live-item{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);padding:2px 0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .live-item .u{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .live-item .s{color:var(--dim);font-size:10px;flex-shrink:0}
+.live-item .skipbtn{background:transparent;border:none;color:var(--dim);font-size:11px;line-height:1;cursor:pointer;padding:1px 4px;border-radius:4px;flex-shrink:0;transition:color .15s,background .15s}
+.live-item .skipbtn:hover{color:var(--red);background:rgba(239,68,68,.12)}
+.live-item .skipbtn:disabled{opacity:.4;cursor:default}
 .live-empty{font-size:11px;color:var(--dim);font-style:italic;padding:2px 0}
 .live-dot{width:7px;height:7px;border-radius:50%;background:var(--cyan);animation:pulse 1.5s infinite;box-shadow:0 0 6px rgba(34,211,238,.7);flex-shrink:0}
 /* secret strip on match cards */
@@ -717,7 +720,25 @@ el.innerHTML=html;
 function liveBuild(i){
 var d=document.createElement('div');d.className='live-item';
 d.innerHTML='<span class="u" title="'+esc(i.url)+'">'+esc(shortRepo(i.url))+'</span><span class="s">'+i.since+'s</span>';
+var b=document.createElement('button');
+b.className='skipbtn';b.type='button';b.title='Skip this repository';b.innerHTML='&#10005;';
+b.onclick=function(){skipRepo(i.url,this);};
+d.appendChild(b);
 return d;
+}
+/* Ask the scanner to abandon this repository. The row is dropped here rather than
+   waiting for the next activity event so the click feels immediate; the server's
+   own snapshot follows within a moment either way. A clone already in flight
+   cannot be interrupted, so the work stops at the scanner's next checkpoint. */
+function skipRepo(url,btn){
+if(btn)btn.disabled=true;
+apiJson('/api/activity/skip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url})}).then(function(){
+var row=btn&&btn.parentNode;
+if(row&&row.parentNode)row.parentNode.removeChild(row);
+}).catch(function(e){
+if(btn)btn.disabled=false;
+toast('Could not skip that repository: '+((e&&e.message)?e.message:String(e)),'err');
+});
 }
 /* The elapsed seconds change on every activity snapshot, so a reused row has to be
    refreshed or it keeps showing the age it had when it was first built. */

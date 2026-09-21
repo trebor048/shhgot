@@ -15,12 +15,22 @@ type RepoActivity struct {
 	fetching map[string]time.Time // url -> when fetch (API/clone) started
 	scanning map[string]time.Time // url -> when scan started
 
+	// skipped holds repositories the operator abandoned from the dashboard. A
+	// worker checks it before cloning, again before scanning and periodically
+	// during a scan, so a skip takes effect at the next checkpoint rather than
+	// instantly - a clone already in flight cannot be interrupted.
+	skipped map[string]bool
+
 	TotalFetched int64
 	TotalCloned  int64
 	TotalScanned int64
 	TotalFailed  int64
 	RateLimited  int64
 }
+
+// maxSkippedRepos bounds the skip set so a scripted client cannot grow it
+// without limit. Manual skips never come close.
+const maxSkippedRepos = 10000
 
 var activity = newRepoActivity()
 
@@ -54,7 +64,40 @@ func newRepoActivity() *RepoActivity {
 	return &RepoActivity{
 		fetching: make(map[string]time.Time),
 		scanning: make(map[string]time.Time),
+		skipped:  make(map[string]bool),
 	}
+}
+
+// Skip abandons an in-flight repository. It leaves the activity lists at once so
+// the dashboard drops the row, and is recorded so whichever worker holds it stops
+// at its next checkpoint. Skipping a URL that is not in flight still records it,
+// which covers the race where a worker is between checkpoints.
+func (a *RepoActivity) Skip(url string) {
+	a.mu.Lock()
+	delete(a.fetching, url)
+	delete(a.scanning, url)
+	if len(a.skipped) < maxSkippedRepos {
+		a.skipped[url] = true
+	}
+	a.mu.Unlock()
+	a.afterChange()
+}
+
+// IsSkipped reports whether the operator abandoned this URL.
+func (a *RepoActivity) IsSkipped(url string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.skipped[url]
+}
+
+// IncRateLimited bumps the rate-limited counter that the dashboard's Activity
+// tab and the TUI status line both read. core's ProgressManager counts rate
+// limits too, but nothing reads its counter; this is the one on screen.
+func (a *RepoActivity) IncRateLimited() {
+	a.mu.Lock()
+	a.RateLimited++
+	a.mu.Unlock()
+	a.afterChange()
 }
 
 // StartFetch records that a repository retrieval (API metadata + clone) began.

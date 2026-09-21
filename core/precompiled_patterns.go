@@ -68,9 +68,10 @@ func (pc *PatternCache) Match(patternName string, text string) bool {
 
 // FastMatch is a convenience function for one-off matches
 func FastMatch(patternName string, text string) bool {
-	// Lazy init on first use
-	if len(PrecompiledPatterns.patterns) == 0 {
-		PrecompiledPatterns.Init()
-	}
+	// Init is idempotent (sync.Once), so calling it unconditionally is the
+	// race-free way to guarantee the map exists. The old len(patterns)==0 guard
+	// read the map without the lock while another goroutine's Init was writing
+	// it - FastMatch is reached from concurrent token-validator workers.
+	PrecompiledPatterns.Init()
 	return PrecompiledPatterns.Match(patternName, text)
 }

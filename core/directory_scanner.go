@@ -31,8 +31,32 @@ func FastWalk(root string, walkFn func(path string, info os.FileInfo, err error)
 
 	// Buffered channel for discovered items
 	items := make(chan walkItem, 1000)
+	// done is closed as soon as any worker reports an error. The producer
+	// selects on it, so it can never block forever on a full items channel after
+	// every worker has returned - which is exactly what the old producer did,
+	// leaking a goroutine and hanging the walk.
+	done := make(chan struct{})
 	var wg sync.WaitGroup
-	var walkErr atomic.Value
+
+	var walkErrMu sync.Mutex
+	var walkErr error
+	var closeOnce sync.Once
+	// reportErr records the first error and stops the producer. A plain error
+	// variable under a mutex replaces the old atomic.Value, which panics when
+	// two workers store errors of different concrete types.
+	reportErr := func(err error) {
+		walkErrMu.Lock()
+		if walkErr == nil {
+			walkErr = err
+		}
+		walkErrMu.Unlock()
+		closeOnce.Do(func() { close(done) })
+	}
+	firstErr := func() error {
+		walkErrMu.Lock()
+		defer walkErrMu.Unlock()
+		return walkErr
+	}
 
 	// Worker pool to process items
 	for i := 0; i < maxWorkers; i++ {
@@ -41,7 +65,7 @@ func FastWalk(root string, walkFn func(path string, info os.FileInfo, err error)
 			defer wg.Done()
 			for item := range items {
 				if err := walkFn(item.path, item.info, item.err); err != nil {
-					walkErr.Store(err)
+					reportErr(err)
 					return
 				}
 			}
@@ -51,21 +75,25 @@ func FastWalk(root string, walkFn func(path string, info os.FileInfo, err error)
 	// Single goroutine to walk directory tree and feed workers
 	go func() {
 		filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-			// Check if any worker reported error
-			if e := walkErr.Load(); e != nil {
+			// Check if any worker reported an error.
+			if firstErr() != nil {
 				return filepath.SkipDir
 			}
 
-			items <- walkItem{path, info, err}
-			return nil
+			select {
+			case items <- walkItem{path, info, err}:
+				return nil
+			case <-done:
+				return filepath.SkipDir
+			}
 		})
 		close(items)
 	}()
 
 	wg.Wait()
 
-	if e := walkErr.Load(); e != nil {
-		return e.(error)
+	if e := firstErr(); e != nil {
+		return e
 	}
 	return nil
 }

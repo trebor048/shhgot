@@ -40,15 +40,13 @@ type WebhookQueueItem struct {
 
 // WebhookQueue manages webhook delivery with deduplication, rate limiting, and retries
 type WebhookQueue struct {
-	queue          chan *WebhookQueueItem
-	sent           map[string]time.Time // hash -> last sent time
-	sentMutex      sync.Mutex
-	isRunning      bool
-	ticker         *time.Ticker
-	stopChan       chan bool
-	rateLimitMS    int64         // milliseconds between sends per webhook
-	dedupeWindow   time.Duration // how long to track duplicates
-	outputFileChan chan string   // for splitting output to files
+	queue        chan *WebhookQueueItem
+	sent         map[string]time.Time // hash -> last sent time
+	sentMutex    sync.Mutex
+	startOnce    sync.Once
+	stopChan     chan bool
+	rateLimitMS  int64         // milliseconds between sends per webhook
+	dedupeWindow time.Duration // how long to track duplicates
 }
 
 // NewWebhookQueue creates a new webhook queue with the specified config
@@ -62,34 +60,32 @@ func NewWebhookQueue(queueSize int, rateLimitMS int64, dedupeWindowSec int) *Web
 	}
 }
 
-// Start begins processing the webhook queue
+// Start begins processing the webhook queue. It is safe to call from any
+// goroutine and any number of times.
+//
+// It used to test and set a plain isRunning bool. Enqueue is called from scanner
+// workers, so two of them could both see false and each start a consumer, and the
+// loop clearing the flag raced with those reads. sync.Once makes it idempotent.
 func (wq *WebhookQueue) Start() {
-	if wq.isRunning {
-		return
-	}
-	wq.isRunning = true
-
-	// Process queue items
-	go func() {
-		for {
-			select {
-			case item := <-wq.queue:
-				if item != nil {
-					wq.processItem(item)
+	wq.startOnce.Do(func() {
+		go func() {
+			for {
+				select {
+				case item := <-wq.queue:
+					if item != nil {
+						wq.processItem(item)
+					}
+				case <-wq.stopChan:
+					return
 				}
-			case <-wq.stopChan:
-				wq.isRunning = false
-				return
 			}
-		}
-	}()
+		}()
+	})
 }
 
 // Enqueue adds a webhook message to the queue (non-blocking)
 func (wq *WebhookQueue) Enqueue(url, payload string) {
-	if !wq.isRunning {
-		wq.Start()
-	}
+	wq.Start()
 
 	// Calculate hash for deduplication
 	hash := wq.hashPayload(url, payload)
@@ -140,14 +136,8 @@ func (wq *WebhookQueue) processItem(item *WebhookQueueItem) {
 		item.RetryCount++
 		if item.RetryCount >= item.MaxRetries {
 			warnWebhookOnce(fmt.Sprintf("delivery failed after %d attempts (%v)", item.MaxRetries, err))
-
-			// Write to file instead if webhook fails permanently
-			if wq.outputFileChan != nil {
-				select {
-				case wq.outputFileChan <- item.Payload:
-				default:
-				}
-			}
+			// There is no file fallback: the field that would have fed one was
+			// never assigned by anything, so the block was dead.
 			return
 		}
 
@@ -176,9 +166,11 @@ func (wq *WebhookQueue) sendWebhook(url, payload string) error {
 		return fmt.Errorf("rate limited (429)")
 	}
 
-	// Check for other non-2xx status codes
+	// Check for other non-2xx status codes. The body is capped: a misbehaving or
+	// hostile endpoint could otherwise return an unbounded response, and the text
+	// ends up in a log line.
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return fmt.Errorf("http %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -228,24 +220,51 @@ func (wq *WebhookQueue) hashPayload(url, payload string) string {
 	// Try to extract meaningful content from JSON
 	var data map[string]interface{}
 	if err := json.Unmarshal([]byte(payload), &data); err == nil {
-		// For Discord embeds, hash the title, description, and fields (not timestamps)
+		hashed := false
+		// For Discord embeds, hash the title, description, and fields (not timestamps).
+		// Every assertion is checked: a payload whose embeds or fields hold a
+		// non-object (a string, a number) would otherwise panic the queue worker.
 		if embeds, ok := data["embeds"].([]interface{}); ok && len(embeds) > 0 {
-			embed := embeds[0].(map[string]interface{})
-			if title, ok := embed["title"]; ok {
-				io.WriteString(hash, fmt.Sprintf("%v", title))
-			}
-			if desc, ok := embed["description"]; ok {
-				io.WriteString(hash, fmt.Sprintf("%v", desc))
-			}
-			if fields, ok := embed["fields"].([]interface{}); ok {
-				for _, field := range fields {
-					f := field.(map[string]interface{})
-					io.WriteString(hash, fmt.Sprintf("%v%v", f["name"], f["value"]))
+			if embed, ok := embeds[0].(map[string]interface{}); ok {
+				if title, ok := embed["title"]; ok {
+					io.WriteString(hash, fmt.Sprintf("%v", title))
+					hashed = true
+				}
+				if desc, ok := embed["description"]; ok {
+					io.WriteString(hash, fmt.Sprintf("%v", desc))
+					hashed = true
+				}
+				if fields, ok := embed["fields"].([]interface{}); ok {
+					for _, field := range fields {
+						f, ok := field.(map[string]interface{})
+						if !ok {
+							continue
+						}
+						io.WriteString(hash, fmt.Sprintf("%v%v", f["name"], f["value"]))
+						hashed = true
+					}
 				}
 			}
-		} else if content, ok := data["content"].(string); ok {
-			// Generic webhook format
-			io.WriteString(hash, content)
+		}
+		// Slack/Mattermost and the generic webhook_payload template use "text",
+		// not "content".
+		if !hashed {
+			if content, ok := data["content"].(string); ok && content != "" {
+				io.WriteString(hash, content)
+				hashed = true
+			}
+		}
+		if !hashed {
+			if text, ok := data["text"].(string); ok && text != "" {
+				io.WriteString(hash, text)
+				hashed = true
+			}
+		}
+		if !hashed {
+			// Any shape we do not specifically understand must still be
+			// distinguished by its content. Hashing only the URL collapsed every
+			// such message into one key and deduplicated away all but the first.
+			io.WriteString(hash, payload)
 		}
 	} else {
 		// Fallback: hash the whole payload
@@ -253,12 +272,4 @@ func (wq *WebhookQueue) hashPayload(url, payload string) string {
 	}
 
 	return fmt.Sprintf("%x", hash.Sum(nil))
-}
-
-// OutputFileQueue manages writing to files when webhooks fail
-type OutputFileQueue struct {
-	filePath  string
-	queue     chan string
-	mu        sync.Mutex
-	isRunning bool
 }

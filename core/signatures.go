@@ -88,10 +88,10 @@ func (s SimpleSignature) Match(file MatchFile) (bool, string) {
 		matchPart = PartPath
 	case PartFilename:
 		haystack = &file.Filename
-		matchPart = PartPath
+		matchPart = PartFilename
 	case PartExtension:
 		haystack = &file.Extension
-		matchPart = PartPath
+		matchPart = PartExtension
 	default:
 		return false, matchPart
 	}

@@ -5,9 +5,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/trebor048/shhgot/core"
 )
@@ -36,8 +38,12 @@ const (
 
 // pruneHTTPClient and pruneGitHubUserURL are vars so tests can point them at a
 // local httptest server.
+//
+// The client carries a timeout: this runs once per configured token at startup,
+// and http.DefaultClient has none, so a single hung connection to the GitHub API
+// would stall the whole process before it ever started scanning.
 var (
-	pruneHTTPClient    = http.DefaultClient
+	pruneHTTPClient    = &http.Client{Timeout: 15 * time.Second}
 	pruneGitHubUserURL = "https://api.github.com/user"
 )
 
@@ -190,10 +196,46 @@ func rewriteConfigRemovingTokens(configPath string, removed map[string]bool) (in
 		out = append(out, line)
 	}
 
-	if err := os.WriteFile(configPath+".bak", data, 0o644); err != nil {
+	// The backup holds the same secrets as the config, so it gets the same
+	// restrictive mode. 0644 here made a world-readable copy of every token on
+	// the box; os.WriteFile only applies the mode when it creates the file, and
+	// this one is always created fresh.
+	if err := os.WriteFile(configPath+".bak", data, 0o600); err != nil {
 		return len(drop), err
 	}
-	return len(drop), os.WriteFile(configPath, []byte(strings.Join(out, "\n")), 0o644)
+
+	// Commit atomically. Writing the config in place truncates it first, so a
+	// crash, a full disk or a power loss mid-write left the operator with a
+	// corrupt file and no tokens. Same directory, so the rename is atomic.
+	dir := filepath.Dir(configPath)
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return len(drop), err
+	}
+	tmpName := tmp.Name()
+	// No-op once the rename has succeeded.
+	defer os.Remove(tmpName)
+
+	if _, err := tmp.Write([]byte(strings.Join(out, "\n"))); err != nil {
+		tmp.Close()
+		return len(drop), err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return len(drop), err
+	}
+	if err := tmp.Close(); err != nil {
+		return len(drop), err
+	}
+
+	// Keep whatever permissions the live config had (install.sh sets 0600).
+	if fi, err := os.Stat(configPath); err == nil {
+		_ = os.Chmod(tmpName, fi.Mode().Perm())
+	}
+	if err := os.Rename(tmpName, configPath); err != nil {
+		return len(drop), err
+	}
+	return len(drop), nil
 }
 
 // matchTokenLines returns the raw config values (as produced by

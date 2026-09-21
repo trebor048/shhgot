@@ -380,7 +380,7 @@ func (kv *KeyValidator) ScanDirectoryForKeys(dir string, session *Session) []Val
 					// If it's a GitHub token and we have a session, try to add it
 					if provider == "GITHUB" && session != nil {
 						if session.AddGitHubToken(match) {
-							kv.log.Info("Added new GitHub token to scanning pool: %s[..]", match[:10])
+							kv.log.Info("Added new GitHub token to scanning pool: %s[..]", MaskToken(match))
 						}
 					}
 

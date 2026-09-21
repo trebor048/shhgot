@@ -101,20 +101,18 @@ func copyStringIntMap(m map[string]int) map[string]int {
 }
 
 // WebHub manages matches and broadcasts.
+// WebHub owns the match history and the counters behind the JSON API.
+//
+// Live pushes to browsers go through feedClients (the SSE handler), not through
+// here. This struct used to carry a second per-client fan-out - a clients map
+// plus register/unregister channels and a WebClient type - that nothing ever
+// registered into, so the map was permanently empty and the fan-out loop below
+// never delivered anything.
 type WebHub struct {
-	clients      map[*WebClient]bool
 	broadcast    chan *Match
-	register     chan *WebClient
-	unregister   chan *WebClient
 	matches      []*Match
 	stats        Stats
 	matchesMutex sync.RWMutex
-}
-
-// WebClient represents a connected client.
-type WebClient struct {
-	hub  *WebHub
-	send chan interface{}
 }
 
 var (
@@ -307,11 +305,8 @@ func ensureWebHub() *WebHub {
 
 func newWebHub() *WebHub {
 	return &WebHub{
-		clients:    make(map[*WebClient]bool),
-		broadcast:  make(chan *Match, 256),
-		register:   make(chan *WebClient),
-		unregister: make(chan *WebClient),
-		matches:    make([]*Match, 0, maxMatches),
+		broadcast: make(chan *Match, 256),
+		matches:   make([]*Match, 0, maxMatches),
 		stats: Stats{
 			MatchesBySource:    make(map[string]int),
 			MatchesBySignature: make(map[string]int),
@@ -323,26 +318,6 @@ func newWebHub() *WebHub {
 func (h *WebHub) run() {
 	for {
 		select {
-		case client := <-h.register:
-			h.clients[client] = true
-			h.matchesMutex.RLock()
-			matchData := map[string]interface{}{
-				"type":    "history",
-				"matches": h.matches,
-				"stats":   h.stats,
-			}
-			h.matchesMutex.RUnlock()
-			select {
-			case client.send <- matchData:
-			case <-time.After(1 * time.Second):
-			}
-
-		case client := <-h.unregister:
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				close(client.send)
-			}
-
 		case match := <-h.broadcast:
 			h.matchesMutex.Lock()
 			h.matches = append(h.matches, match)
@@ -361,23 +336,6 @@ func (h *WebHub) run() {
 			h.matchesMutex.Unlock()
 
 			broadcastFeed(FeedEvent{Type: "match", Match: match, Stats: &statsCopy})
-
-			// statsCopy, not h.stats: this value is encoded later by the
-			// per-client writer goroutine, outside the lock.
-			data := map[string]interface{}{
-				"type":  "match",
-				"match": match,
-				"stats": statsCopy,
-			}
-			for client := range h.clients {
-				select {
-				case client.send <- data:
-				default:
-					go func(c *WebClient) {
-						h.unregister <- c
-					}(client)
-				}
-			}
 		}
 	}
 }
@@ -528,6 +486,38 @@ func getSignatures(w http.ResponseWriter, r *http.Request) {
 func getActivity(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(activity.Snapshot())
+}
+
+// skipRepo abandons an in-flight repository at the operator's request, so a
+// single repository that hangs or is unwanted does not have to be waited out.
+//
+// It only records the skip: the scanner checks the set before cloning, again
+// after a clone and once per file during a scan. A clone already in flight cannot
+// be interrupted, so the row disappears from the dashboard immediately while the
+// work stops at the next checkpoint.
+func skipRepo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var in struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBody)).Decode(&in); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	url := strings.TrimSpace(in.URL)
+	if url == "" {
+		writeJSONError(w, http.StatusBadRequest, "url is required")
+		return
+	}
+
+	activity.Skip(url)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "skipped", "url": url})
 }
 
 // GetScanProgress returns the scanner's aggregate progress counters
@@ -826,6 +816,7 @@ func registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/tokens", corsMiddleware(localGuard(getTokens)))
 	mux.HandleFunc("/api/signatures", corsMiddleware(localGuard(getSignatures)))
 	mux.HandleFunc("/api/activity", corsMiddleware(localGuard(getActivity)))
+	mux.HandleFunc("/api/activity/skip", corsMiddleware(localGuard(skipRepo)))
 	mux.HandleFunc("/api/scan/progress", corsMiddleware(localGuard(getScanProgress)))
 	mux.HandleFunc("/api/stats/regex", corsMiddleware(localGuard(getRegexStats)))
 	mux.HandleFunc("/api/file", corsMiddleware(localGuard(getMatchFile)))

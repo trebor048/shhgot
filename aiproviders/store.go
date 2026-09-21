@@ -233,6 +233,14 @@ func (s *Store) Set(v Settings) error {
 		tmp.Close()
 		return fmt.Errorf("chmod %s: %w", tmpName, err)
 	}
+	// Flush the data to disk before the rename. Without this the rename can
+	// reach the disk ahead of the contents, so a power loss right after a save
+	// leaves the settings file present but empty - exactly the truncated config
+	// the temp-and-rename dance exists to prevent.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync %s: %w", tmpName, err)
+	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close %s: %w", tmpName, err)
 	}

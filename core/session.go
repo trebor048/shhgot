@@ -118,7 +118,9 @@ func (s *Session) InitGitHubClients() {
 
 			// Mark as needing validation but add to pool immediately
 			s.TokenValidationResults = append(s.TokenValidationResults, TokenValidationResult{
-				Token: token[:10],
+				// MaskToken, not token[:10]: a token shorter than ten characters
+				// in github_access_tokens used to panic here at startup.
+				Token: MaskToken(token),
 				Valid: true, // Assume valid; will be tested on use
 			})
 
@@ -265,7 +267,12 @@ func (s *Session) InitCsvWriter() {
 	}
 
 	file, err := os.OpenFile(*s.Options.CsvPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	LogIfError("Could not create/open CSV file", err)
+	if err != nil {
+		// Without the return, csv.NewWriter(nil *os.File) was stored and the
+		// first WriteToCsv panicked on a nil file handle.
+		LogIfError("Could not create/open CSV file", err)
+		return
+	}
 
 	s.CsvWriter = csv.NewWriter(file)
 
@@ -320,7 +327,7 @@ func (s *Session) InitCleanupManager() {
 }
 
 func (s *Session) WriteToCsv(line []string) {
-	if *s.Options.CsvPath == "" {
+	if *s.Options.CsvPath == "" || s.CsvWriter == nil {
 		return
 	}
 
@@ -369,48 +376,62 @@ func (s *Session) InitTokenValidator() {
 	s.Log.Debug("Token validator initialized")
 }
 
-// AddGitHubToken adds a new GitHub token to the pool dynamically
+// AddGitHubToken adds a new GitHub token to the pool dynamically.
+//
+// Neither the validation call nor the pool top-up happens while TokenMutex is
+// held. That lock also guards IsTokenRemoved and hasUsableTokens, which every
+// GetClient call needs, so holding it across a timeout-less HTTP request - or
+// across a channel send that can block - froze the entire scanner.
 func (s *Session) AddGitHubToken(token string) bool {
 	s.TokenMutex.Lock()
-	defer s.TokenMutex.Unlock()
-
-	// Check if already added
 	if s.FoundTokens[token] {
+		s.TokenMutex.Unlock()
 		return false
 	}
-
-	// Validate token format
 	if !strings.HasPrefix(token, "ghp_") && !strings.HasPrefix(token, "github_pat_") {
+		s.TokenMutex.Unlock()
 		return false
 	}
-
 	s.FoundTokens[token] = true
+	s.TokenMutex.Unlock()
 
-	// Test the token
+	// Bound the validation call: s.Context carries no deadline of its own.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
 	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
-	tc := oauth2.NewClient(s.Context, ts)
+	tc := oauth2.NewClient(ctx, ts)
 	client := github.NewClient(tc)
 	client.UserAgent = fmt.Sprintf("%s v%s", Name, Version)
 
-	_, _, err := client.Users.Get(s.Context, "")
-	if err != nil {
-		s.Log.Warn("Failed to validate new token %s[..]: %s", token[:10], err)
+	if _, _, err := client.Users.Get(ctx, ""); err != nil {
+		s.Log.Warn("Failed to validate new token %s[..]: %s", MaskToken(token), err)
 		return false
 	}
 
-	// Add to config
+	s.TokenMutex.Lock()
 	s.Config.GitHubAccessTokens = append(s.Config.GitHubAccessTokens, token)
-
 	// A previously-revoked token that now validates successfully is usable
 	// again, so clear its removed marker.
 	delete(s.RemovedTokens, token)
+	s.TokenMutex.Unlock()
 
-	// Add to client pool
-	for i := 0; i <= *s.Options.Threads; i++ {
-		s.Clients <- &GitHubClientWrapper{client, token, time.Now().Add(-1 * time.Second)}
+	// Top the pool up without ever blocking. InitGitHubClients leaves exactly
+	// *Threads free slots per configured token, but this loop used to run one
+	// extra time (i <= Threads), so its final send blocked forever on a full
+	// channel while TokenMutex was still held - a deadlock that hung the scan.
+	// The default arm also covers a nil Clients channel, which is what --local
+	// leaves behind.
+	for i := 0; i < *s.Options.Threads; i++ {
+		select {
+		case s.Clients <- &GitHubClientWrapper{client, token, time.Now().Add(-1 * time.Second)}:
+		default:
+			s.Log.Warn("GitHub client pool is full; %s[..] is added but not pooled this run", MaskToken(token))
+			return true
+		}
 	}
 
-	s.Log.Info("Added new GitHub token: %s[..]", token[:10])
+	s.Log.Info("Added new GitHub token: %s[..]", MaskToken(token))
 	return true
 }
 
@@ -422,16 +443,26 @@ func (s *Session) InitRegexOptimizer() {
 	InitGlobalOptimizer(maxWorkers, timeoutMs)
 	s.Log.Debug("Regex optimizer initialized: %d workers", maxWorkers)
 
-	// Pre-compile all signature patterns
+	// Pre-compile all signature patterns. Signatures without a regex (or whose
+	// regex failed to compile at load time) are skipped, so the count below has
+	// to be of what was actually handed to the optimizer - reporting
+	// len(s.Signatures) claimed patterns that were never compiled.
+	compiled := 0
 	for _, sig := range s.Signatures {
-		if sig.GetRegex() != nil {
-			GlobalRegexOptimizer.CompilePattern(
-				sig.GetRegex().String(),
-				sig.Name(),
-				sig.GetPriority(),
-				sig.GetPart(),
-			)
+		re := sig.GetRegex()
+		if re == nil {
+			continue
 		}
+		if _, err := GlobalRegexOptimizer.CompilePattern(
+			re.String(),
+			sig.Name(),
+			sig.GetPriority(),
+			sig.GetPart(),
+		); err != nil {
+			// CompilePattern already logged the pattern and its error.
+			continue
+		}
+		compiled++
 	}
-	s.Log.Info("Pre-compiled %d regex patterns", len(s.Signatures))
+	s.Log.Info("Pre-compiled %d regex patterns", compiled)
 }

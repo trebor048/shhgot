@@ -157,12 +157,16 @@ func ParseConfig(options *Options) (*Config, error) {
 		return config, fmt.Errorf("config.yaml is not valid YAML: %w", err)
 	}
 
-	if len(*options.Local) <= 0 && (len(config.GitHubAccessTokens) < 1 || strings.TrimSpace(strings.Join(config.GitHubAccessTokens, "")) == "") {
-		return config, errors.New("config.yaml needs at least one GitHub access token under github_access_tokens (see https://help.github.com/en/articles/creating-a-personal-access-token-for-the-command-line), or pass --local to scan a local directory instead")
-	}
-
+	// Expand environment references BEFORE validating. A token written as
+	// "$GITHUB_TOKEN" is a non-empty string, so it used to pass this check even
+	// when the variable was unset, and the scanner then started with an empty
+	// token that failed every API call with a 401 instead of saying why.
 	for i := 0; i < len(config.GitHubAccessTokens); i++ {
 		config.GitHubAccessTokens[i] = os.ExpandEnv(config.GitHubAccessTokens[i])
+	}
+
+	if len(*options.Local) <= 0 && (len(config.GitHubAccessTokens) < 1 || strings.TrimSpace(strings.Join(config.GitHubAccessTokens, "")) == "") {
+		return config, errors.New("config.yaml needs at least one GitHub access token under github_access_tokens (see https://help.github.com/en/articles/creating-a-personal-access-token-for-the-command-line), or pass --local to scan a local directory instead")
 	}
 
 	if len(config.Webhook) > 0 {
@@ -202,8 +206,14 @@ func ConfigFilePath(options *Options) string {
 			return p
 		}
 	}
+	// The working-directory candidate is verified like the executable one: this
+	// function promises to return "" when no candidate exists, and returning an
+	// unchecked path made the caller try to rewrite a file that was not there.
 	if dir, err := os.Getwd(); err == nil {
-		return path.Join(dir, "config.yaml")
+		p := path.Join(dir, "config.yaml")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
 	}
 	return ""
 }

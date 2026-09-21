@@ -1,7 +1,8 @@
 package core
 
 import (
-	"log"
+	"fmt"
+	"os"
 	"regexp"
 	"sync"
 )
@@ -36,8 +37,6 @@ var GlobalRegexOptimizer *RegexOptimizer
 func InitGlobalOptimizer(maxWorkers int, timeoutMs int) {
 	if GlobalRegexOptimizer == nil {
 		GlobalRegexOptimizer = NewRegexOptimizer(maxWorkers, timeoutMs)
-		log.Printf("[REGEX] Global optimizer initialized: %d workers, timeout=%dms",
-			maxWorkers, timeoutMs)
 	}
 }
 
@@ -73,7 +72,10 @@ func (ro *RegexOptimizer) CompilePattern(patternStr string, name string, priorit
 	// Compile the pattern
 	compiled, err := regexp.Compile(patternStr)
 	if err != nil {
-		log.Printf("[REGEX] Error compiling pattern %s: %v", name, err)
+		// stderr rather than the stdlib logger: log.Printf prefixes a timestamp
+		// that no other shhgit output carries, which breaks the one-line-per-event
+		// format the minimal preset promises.
+		fmt.Fprintf(os.Stderr, "[REGEX] Error compiling pattern %s: %v\n", name, err)
 		pattern := &RegexPattern{
 			Original:   patternStr,
 			Name:       name,

@@ -5,25 +5,28 @@ import (
 )
 
 // ProgressManager tracks aggregate counters for the secret scan.
-// Rendering was removed - use these counters for any future reporting.
 type ProgressManager struct {
 	rateLimited atomic.Int64
-	totalFailed atomic.Int64
-	disabled    bool
 
-	// Deprecated callbacks (cleared after TUI removal)
+	// OnRateLimited, when set, runs every time the GitHub API rate limits a
+	// token. The main package points it at the dashboard's activity counter:
+	// this counter is only ever written here, and the number both UIs display
+	// ("Rate limited", the TUI's "limited N") is read from that one, so without
+	// the hook they reported zero for the whole run.
 	OnRateLimited func()
-	OnFailed      func()
 }
 
-// NewProgressManager creates a ProgressManager (always disabled).
+// NewProgressManager creates a ProgressManager.
 func NewProgressManager() *ProgressManager {
-	return &ProgressManager{disabled: true}
+	return &ProgressManager{}
 }
 
-// IncrementRateLimited bumps the rate-limited counter.
+// IncrementRateLimited bumps the rate-limited counter and notifies the hook.
 func (pm *ProgressManager) IncrementRateLimited() {
 	pm.rateLimited.Add(1)
+	if pm.OnRateLimited != nil {
+		pm.OnRateLimited()
+	}
 }
 
 // GitProgressWriter is a no-op progress writer.

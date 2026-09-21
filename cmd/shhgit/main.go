@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/fatih/color"
 	"github.com/trebor048/shhgot/core"
@@ -389,7 +391,13 @@ func previewMatch(match string) string {
 	if len(s) <= maxPreview {
 		return s
 	}
-	return fmt.Sprintf("%s... [truncated, %d chars]", s[:maxPreview], len(s))
+	// Cut on a rune boundary: slicing at an arbitrary byte split a multi-byte
+	// character, so the terminal rendered a replacement glyph at the cut.
+	cut := maxPreview
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return fmt.Sprintf("%s... [truncated, %d chars]", s[:cut], len(s))
 }
 
 // fileRef renders a finding's location as "path:line", or just the path when the
@@ -1147,7 +1155,12 @@ func ProcessComments() {
 
 func processComment(comment core.Comment) {
 	dir := core.GetTempDir(core.GetHash(comment.Body))
-	ioutil.WriteFile(filepath.Join(dir, "comment.ignore"), []byte(comment.Body), 0644)
+	// Checked: when this write failed, the scan below ran against a directory with
+	// no comment in it and the finding was silently lost.
+	if err := ioutil.WriteFile(filepath.Join(dir, "comment.ignore"), []byte(comment.Body), 0644); err != nil {
+		getSession().Log.Warn("Could not stage comment %s for scanning: %s", comment.Url, err)
+		return
+	}
 	if !checkSignatures(dir, comment.Url, "", 0, core.GITHUB_COMMENT) {
 		os.RemoveAll(dir)
 	}
@@ -1160,6 +1173,12 @@ func processComment(comment core.Comment) {
 }
 
 func processRepositoryOrGist(url string, ref string, stars int, source core.GitResourceType, workerID int) {
+	// The operator may have skipped this repository from the dashboard while it
+	// waited in the queue. Check before doing any work at all.
+	if activity.IsSkipped(url) {
+		return
+	}
+
 	dir := core.GetTempDir(core.GetHash(url))
 
 	activity.StartFetch(url)
@@ -1173,12 +1192,23 @@ func processRepositoryOrGist(url string, ref string, stars int, source core.GitR
 		activity.FailRepo(url)
 		return
 	}
+
+	// Skipped while the clone ran: the clone cannot be interrupted, so this is the
+	// first checkpoint after it. Drop what was fetched and stop before scanning.
+	if activity.IsSkipped(url) {
+		os.RemoveAll(dir)
+		activity.FailRepo(url)
+		return
+	}
+
 	activity.StartScan(url)
+	core.GlobalScanProgress.BeginScan(url)
 	getSession().Log.Debug("[%s] Cloning %s into %s",
 		url, ref,
 		strings.Replace(dir, *getSession().Options.TempDirectory, "", -1))
 	core.ApplySandboxToRepo(dir)
 	checkSignatures(dir, url, ref, stars, source)
+	core.GlobalScanProgress.EndScan()
 	activity.FinishScan(url)
 
 	// Mark directory as processed for cleanup tracking
@@ -1289,6 +1319,15 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 	}
 
 	for _, file := range core.GetMatchingFiles(dir) {
+		// The operator may have skipped this repository while the scan was running.
+		// Checking per file is what makes a skip land in a reasonable time on a
+		// large repository; the caller drops the directory afterwards.
+		if activity.IsSkipped(url) {
+			getSession().Log.Debug("[%s] Skipped by operator, stopping scan", url)
+			return matchedAny
+		}
+		core.GlobalScanProgress.FileScanned(file.Path)
+
 		// MatchFile.Contents is loaded lazily, and every match engine below reads the
 		// field directly. Reading it without loading saw nil for every file, which
 		// silently disabled --search-query, the high-entropy scan, the PEM
@@ -1310,6 +1349,11 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 		var (
 			matches          []string
 			relativeFileName string
+			// fileMatched is per-file. The cleanup below used the accumulated
+			// matchedAny, so after the first finding anywhere in the repository
+			// no further unmatched file was ever removed and the temp tree grew
+			// unbounded for the rest of the scan.
+			fileMatched bool
 		)
 
 		// Extract path relative to the cloned repo directory
@@ -1343,6 +1387,7 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 				// scan printed the match and then reported "No secrets found", and
 				// exited 0, so a CI job using --search-query never failed.
 				matchedAny = true
+				fileMatched = true
 				count := len(matches)
 				m := strings.Join(matches, ", ")
 				// The line of the finding has to be computed from the secret itself,
@@ -1395,6 +1440,7 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 
 							publish(&MatchEvent{Source: source, Url: url, Matches: matches, Signature: signature.Name(), File: relativeFileName, Stars: stars, Priority: signature.GetPriority(), Color: signature.GetColor(), FileContent: fileContent, Secret: secret, SecretLine: secretLineNum(file.Contents, secret)})
 							matchedAny = true
+							fileMatched = true
 							logSecret(count, url, signature.Name(), relativeFileName, m, ref, secretLineNum(file.Contents, secret), stars)
 							getSession().WriteToCsv([]string{url, signature.Name(), relativeFileName, m})
 							getSession().LogMatch(signature.Name(), url, relativeFileName, matches)
@@ -1416,6 +1462,7 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 						if *getSession().Options.PathChecks {
 							publish(&MatchEvent{Source: source, Url: url, Matches: matches, Signature: signature.Name(), File: relativeFileName, Stars: stars, Priority: signature.GetPriority(), Color: signature.GetColor(), FileContent: string(file.Contents)})
 							matchedAny = true
+							fileMatched = true
 							logFile(url, signature.Name(), relativeFileName, ref, stars)
 							getSession().WriteToCsv([]string{url, signature.Name(), relativeFileName, ""})
 							getSession().LogMatch(signature.Name(), url, relativeFileName, []string{relativeFileName})
@@ -1438,6 +1485,7 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 										if !blacklistedMatch {
 											publish(&MatchEvent{Source: source, Url: url, Matches: []string{line}, Signature: entropySignatureName, File: relativeFileName, Stars: stars, Priority: 0, Color: "", FileContent: string(file.Contents), Secret: line, SecretLine: lineNo})
 											matchedAny = true
+											fileMatched = true
 											logEntropy(url, relativeFileName, line, ref, lineNo, stars)
 											getSession().WriteToCsv([]string{url, entropySignatureName, relativeFileName, line})
 											getSession().LogMatch(entropySignatureName, url, relativeFileName, []string{line})
@@ -1451,7 +1499,7 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 			}
 		}
 
-		if !matchedAny && len(*getSession().Options.Local) <= 0 {
+		if !fileMatched && len(*getSession().Options.Local) <= 0 {
 			os.Remove(file.Path)
 		}
 	}
@@ -1492,7 +1540,28 @@ func newMatchID() string {
 	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), atomic.AddInt64(&matchIDSeq, 1))
 }
 
+// liveHTTPClient bounds the optional --live POST. http.DefaultClient has no
+// timeout, so one hung endpoint could otherwise hold a goroutine forever.
+var liveHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
+// postLive delivers one match to the configured --live endpoint. It runs on its
+// own goroutine and drains a bounded amount of the response so the connection
+// can be reused; delivery failures are intentionally silent, exactly as the
+// inline send was.
+func postLive(url string, body []byte) {
+	resp, err := liveHTTPClient.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
+}
+
 func publish(event *MatchEvent) {
+	// Every finding funnels through here, so this is the one place the scan
+	// progress counter needs to be bumped.
+	core.GlobalScanProgress.MatchFound()
+
 	// Feed the in-process web dashboard (when running with --web).
 	if webHub != nil {
 		m := &Match{
@@ -1510,10 +1579,14 @@ func publish(event *MatchEvent) {
 			Priority:  event.Priority,
 			Color:     event.Color,
 		}
-		select {
-		case webHub.broadcast <- m:
-		default:
-		}
+		// Blocking, deliberately. This used to be a non-blocking send with a
+		// default that discarded the match when the hub's 256-slot buffer was
+		// full, so a scanner that outran the hub lost findings silently - they
+		// never reached h.matches either, so a dashboard reload could not recover
+		// them. The hub loop never blocks (its per-client sends are non-blocking
+		// and a slow client is dropped instead), so waiting here only throttles
+		// the scanner to the hub's pace and loses nothing.
+		webHub.broadcast <- m
 		if event.FileContent != "" {
 			storeMatchFile(m.ID, event.Url, event.File, event.FileContent, event.Secret, event.SecretLine)
 		}
@@ -1560,7 +1633,11 @@ func publish(event *MatchEvent) {
 			"color":     event.Color,
 		}
 		data, _ := json.Marshal(match)
-		http.Post(*getSession().Options.Live, "application/json", bytes.NewBuffer(data))
+		// Off the scanner's goroutine and through a bounded client. This was an
+		// inline http.Post on http.DefaultClient, which has no timeout and whose
+		// response body was never closed: a hung --live endpoint stalled every
+		// worker and leaked the connection.
+		go postLive(*getSession().Options.Live, data)
 	}
 
 	// Send EVERY match to the main webhook.
@@ -1887,6 +1964,14 @@ func executeScanner() {
 	installRuntimeTokenPruner()
 	pruneInvalidGitHubTokens()
 
+	// Point core's rate-limit counter at the dashboard's. core can only bump its
+	// own ProgressManager counter, which nothing reads; the "Rate limited" stat
+	// and the TUI's "limited N" both come from activity, so without this they
+	// stayed at zero for the whole run.
+	if p := getSession().Progress; p != nil {
+		p.OnRateLimited = func() { activity.IncRateLimited() }
+	}
+
 	// ── Dispatch ──────────────────────────────────────────────
 	if *getSession().Options.TestTokens {
 		validator := core.NewTokenValidator(getSession().Log)
@@ -1927,6 +2012,10 @@ func executeScanner() {
 			validator.TestTokens(tokensToTest)
 		}
 		exitScanner(0)
+		// In web/TUI mode exitScanner returns instead of exiting; stop here so a
+		// one-shot --test-tokens run does not fall through into the scanner and
+		// start demanding a GitHub token it was never meant to use.
+		return
 	}
 
 	if len(*getSession().Options.ScanKeys) > 0 {
@@ -1971,6 +2060,9 @@ func executeScanner() {
 		lockPrintf("\n[*] Summary: %d valid, %d invalid out of %d keys found\n", validCount, invalidCount, len(validatedKeys))
 		lockPrintf("[*] All keys logged to: %s\n", logFilename)
 		exitScanner(0)
+		// Same as --test-tokens: exitScanner only returns in web/TUI mode, so
+		// return explicitly rather than falling through to the GitHub workers.
+		return
 	}
 
 	if len(*getSession().Options.Local) > 0 {

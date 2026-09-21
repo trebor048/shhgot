@@ -2,12 +2,14 @@ package core
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/fatih/color"
 	"golang.org/x/term"
@@ -172,10 +174,23 @@ func liveLinePrefix(writingToLogWriter bool) string {
 	return "\r\033[K"
 }
 
-func (l *Logger) Log(level int, format string, args ...interface{}) {
-	l.Lock()
-	defer l.Unlock()
+// postWebhook delivers one log line to the configured webhook.
+//
+// It exists because the delivery used to be an inline http.Post while the logger
+// mutex was held: http.Post uses http.DefaultClient, which has no timeout, so a
+// hung or slow endpoint blocked every log line in the process, and the response
+// body was never closed.
+func postWebhook(url, payload string) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(url, "application/json", strings.NewReader(payload))
+	if err != nil {
+		return
+	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
+}
 
+func (l *Logger) Log(level int, format string, args ...interface{}) {
 	if level == DEBUG && !l.debug {
 		return
 	}
@@ -184,6 +199,7 @@ func (l *Logger) Log(level int, format string, args ...interface{}) {
 		return
 	}
 
+	l.Lock()
 	prefix := liveLinePrefix(l.LogWriter != nil && !l.LogWriterIsTerminal)
 	if c, ok := LogColors[level]; ok {
 		line := c.Sprintf(prefix+format+"\n", args...)
@@ -200,11 +216,14 @@ func (l *Logger) Log(level int, format string, args ...interface{}) {
 			fmt.Print(line)
 		}
 	}
+	l.Unlock()
 
-	if level > WARN && session.Config.Webhook != "" {
+	// The webhook runs outside the lock and off the caller's goroutine: it is a
+	// network call, and the scanner must not wait on it.
+	if level > WARN && session != nil && session.Config != nil && session.Config.Webhook != "" {
 		text := colorStrip(fmt.Sprintf(format, args...))
 		payload := fmt.Sprintf(session.Config.WebhookPayload, text)
-		http.Post(session.Config.Webhook, "application/json", strings.NewReader(payload))
+		go postWebhook(session.Config.Webhook, payload)
 	}
 
 	if level == FATAL {

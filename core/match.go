@@ -74,9 +74,15 @@ func (m *MatchFile) GetContents() []byte {
 		m.Contents = make([]byte, m.Size)
 
 		reader := bufio.NewReaderSize(file, 64*1024) // 64KB buffer
-		_, err = io.ReadFull(reader, m.Contents)
+		n, err := io.ReadFull(reader, m.Contents)
 		if err != nil && err != io.ErrUnexpectedEOF {
 			m.Contents = []byte{}
+		} else if n < len(m.Contents) {
+			// The file shrank between os.Stat and the read. io.ReadFull reports
+			// io.ErrUnexpectedEOF and leaves the rest of the pre-allocated slice
+			// as zero bytes; trimming to what was actually read keeps the caller
+			// from scanning NUL padding that is not in the file.
+			m.Contents = m.Contents[:n]
 		}
 
 		m.loaded = true

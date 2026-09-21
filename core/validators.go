@@ -35,18 +35,15 @@ func GetWebhookQueue() *WebhookQueue {
 	return globalWebhookQueue
 }
 
-// ValidateDiscordToken validates a Discord bot token by making an API request
-func ValidateDiscordToken(token string) bool {
-	if token == "" {
-		return false
-	}
-
+// validateDiscordTokenFormat checks a Discord bot token's shape without any
+// network call: 59 characters, [MN] prefix, and three dot-separated segments
+// where the second is 6 characters and the third is 27.
+func validateDiscordTokenFormat(token string) bool {
 	// Discord bot tokens should be 59 characters long and follow the pattern: [MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27}
 	if len(token) != 59 {
 		return false
 	}
 
-	// Basic format validation
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return false
@@ -57,11 +54,15 @@ func ValidateDiscordToken(token string) bool {
 		return false
 	}
 
-	// Try to decode the base64 parts to ensure they're valid
+	// Try to decode the base64 parts to ensure they're valid. Discord encodes
+	// these segments as unpadded base64url, so the padded StdEncoding and
+	// URLEncoding both reject them (a 6- or 27-character segment is not a
+	// multiple of 4). The raw encodings are what actually decode them; without
+	// this the check always failed and no Discord token was ever verified.
 	for i, part := range parts[1:] {
-		if _, err := base64.StdEncoding.DecodeString(part); err != nil {
-			// Try URL-safe base64 as well
-			if _, err := base64.URLEncoding.DecodeString(part); err != nil {
+		if _, err := base64.RawURLEncoding.DecodeString(part); err != nil {
+			// Tolerate the standard alphabet too, in case of a non-Discord token.
+			if _, err := base64.RawStdEncoding.DecodeString(part); err != nil {
 				return false
 			}
 		}
@@ -71,6 +72,14 @@ func ValidateDiscordToken(token string) bool {
 		if i == 1 && len(part) != 27 { // Third part should be 27 chars
 			return false
 		}
+	}
+	return true
+}
+
+// ValidateDiscordToken validates a Discord bot token by making an API request
+func ValidateDiscordToken(token string) bool {
+	if !validateDiscordTokenFormat(token) {
+		return false
 	}
 
 	// API validation (optional, can be disabled for performance)
@@ -180,7 +189,9 @@ func ValidateDiscordWebhook(webhookURL string) bool {
 		return false
 	}
 
-	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(string(jsonData)))
+	// httpClient carries a 10s timeout; http.DefaultClient has none, so a hung
+	// Discord endpoint used to stall startup (this runs from ParseConfig).
+	resp, err := httpClient.Post(webhookURL, "application/json", strings.NewReader(string(jsonData)))
 	if err != nil {
 		Say("[ERROR] Discord webhook POST failed: %v\n", err)
 		return false
@@ -192,7 +203,7 @@ func ValidateDiscordWebhook(webhookURL string) bool {
 		return true
 	}
 
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 	Say("[ERROR] Discord webhook validation failed:\n")
 	Say("  HTTP Status: %d\n", resp.StatusCode)
 	Say("  Response: %s\n", string(body))
@@ -249,7 +260,10 @@ func ValidateTelegramWebhook(botToken string) bool {
 		return false
 	}
 
-	if ok, exists := result["ok"]; !exists || !ok.(bool) {
+	// Assert with the two-value form: a response whose "ok" is not a JSON
+	// boolean (a string, a number) must report "not configured" rather than
+	// panic the caller.
+	if ok, isBool := result["ok"].(bool); !isBool || !ok {
 		return false
 	}
 
@@ -286,8 +300,9 @@ func SendValidationWebhook(webhookURL, webhookPayload, tokenType, token, reposit
 		payload = fmt.Sprintf(webhookPayload, message)
 	}
 
-	// Send webhook notification
-	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(payload))
+	// Send webhook notification through the bounded client so a slow endpoint
+	// cannot hold the goroutine indefinitely.
+	resp, err := httpClient.Post(webhookURL, "application/json", strings.NewReader(payload))
 	if err != nil {
 		// Silently fail to avoid infinite loops
 		return
@@ -562,7 +577,7 @@ func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, m
 	}
 	payload := fmt.Sprintf(webhookPayload, message)
 
-	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(payload))
+	resp, err := httpClient.Post(webhookURL, "application/json", strings.NewReader(payload))
 	if err != nil {
 		Say("[ERROR] Generic webhook POST failed: %v\n", err)
 		return
@@ -570,7 +585,7 @@ func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, m
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		Say("[ERROR] Generic webhook returned %d: %s\n", resp.StatusCode, string(body))
 	}
 }
@@ -710,8 +725,11 @@ func chunkString(s string, maxSize int) []string {
 
 // findLineNumber finds the line number of the first occurrence of text in content
 func findLineNumber(content string, searchText string) int {
+	// 0 means "not found", which is what the callers test with lineNum > 0 to
+	// decide between an anchored and an unanchored link. Returning 1 here made
+	// the unanchored branch unreachable and pointed every not-found link at line 1.
 	if !strings.Contains(content, searchText) {
-		return 1
+		return 0
 	}
 
 	idx := strings.Index(content, searchText)

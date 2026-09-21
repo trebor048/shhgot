@@ -37,6 +37,49 @@ var GlobalScanProgress = &ScanProgress{
 	LastUpdateTime: time.Now(),
 }
 
+// The fields below are read by GetSnapshot under mu, so every writer takes the
+// same lock. They exist because nothing wrote this struct at all: the dashboard
+// polls /api/scan/progress and rendered a panel that could only ever show zero.
+
+// BeginScan records that a repository scan started.
+func (sp *ScanProgress) BeginScan(repo string) {
+	sp.mu.Lock()
+	sp.IsScanning = true
+	sp.CurrentRepo = repo
+	sp.CurrentFile = ""
+	sp.LastUpdateTime = time.Now()
+	sp.mu.Unlock()
+}
+
+// EndScan records that a repository scan finished.
+func (sp *ScanProgress) EndScan() {
+	sp.mu.Lock()
+	sp.IsScanning = false
+	sp.CurrentRepo = ""
+	sp.CurrentFile = ""
+	sp.LastUpdateTime = time.Now()
+	elapsed := time.Since(sp.StartTime).Seconds()
+	if elapsed > 0 {
+		sp.FilesPerSecond = float64(atomic.LoadInt64(&sp.FilesProcessed)) / elapsed
+	}
+	sp.mu.Unlock()
+	atomic.AddInt64(&sp.ReposScanned, 1)
+}
+
+// FileScanned records one processed file.
+func (sp *ScanProgress) FileScanned(file string) {
+	sp.mu.Lock()
+	sp.CurrentFile = file
+	sp.LastUpdateTime = time.Now()
+	sp.mu.Unlock()
+	atomic.AddInt64(&sp.FilesProcessed, 1)
+}
+
+// MatchFound bumps the match counter.
+func (sp *ScanProgress) MatchFound() {
+	atomic.AddInt64(&sp.MatchesFound, 1)
+}
+
 // GetSnapshot returns a snapshot of current progress
 func (sp *ScanProgress) GetSnapshot() map[string]interface{} {
 	sp.mu.RLock()

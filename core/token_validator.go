@@ -912,7 +912,7 @@ func (tv *TokenValidator) checkOpenAICompatible(token, url, provider string) (bo
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 
 	if resp.StatusCode == 200 {
 		return true, fmt.Sprintf("Valid %s Token", provider)
@@ -1160,7 +1160,7 @@ func (tv *TokenValidator) ValidateSlackToken(token string) (bool, string, string
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 	// Slack returns 200 OK even if auth fails, check body for "ok": false
 	if resp.StatusCode == 200 && strings.Contains(string(body), `"ok":true`) {
 		return true, ProviderSlack, "Valid Slack Token"
@@ -1225,7 +1225,7 @@ func (tv *TokenValidator) ValidateTelegramToken(token string) (bool, string, str
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 	if resp.StatusCode == 200 && strings.Contains(string(body), `"ok":true`) {
 		return true, ProviderTelegram, "Valid Telegram Bot Token"
 	}

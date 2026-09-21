@@ -680,7 +680,7 @@ func (c *Checker) checkKey(ctx context.Context, p Provider, key string) CheckRes
 		return result
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	result.Latency = time.Since(start)
 
 	// Determine validity
