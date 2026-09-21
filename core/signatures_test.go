@@ -122,6 +122,34 @@ func TestBadNotRegexSkipsOnlyItsRule(t *testing.T) {
 	}
 }
 
+// A signature entry with neither 'match' nor 'regex' is a typo. It must be
+// skipped rather than compiled as an empty regex, which matches every string:
+// as a contents rule it emitted an empty match at every position of every file,
+// and as a path rule it matched every path.
+func TestSignatureWithoutMatchOrRegexIsSkipped(t *testing.T) {
+	defer notRegexTestSession(t)()
+	session.Config.Signatures = []ConfigSignature{
+		{
+			Name:     "Good Rule",
+			Part:     PartContents,
+			Regex:    `AKIA[0-9A-Z]{16}`,
+			Priority: 3,
+		},
+		{
+			Name: "Typo Rule",
+			Part: PartContents,
+			// Neither Match nor Regex is set.
+		},
+	}
+	sigs := GetSignatures(session)
+	if len(sigs) != 1 {
+		t.Fatalf("expected 1 usable signature, got %d", len(sigs))
+	}
+	if sigs[0].Name() != "Good Rule" {
+		t.Fatalf("surviving signature = %q, want %q", sigs[0].Name(), "Good Rule")
+	}
+}
+
 // Without not_regex nothing changes: every regex hit is returned.
 func TestNoNotRegexKeepsOldBehavior(t *testing.T) {
 	defer notRegexTestSession(t)()

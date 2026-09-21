@@ -46,3 +46,10 @@ Dockerfile
 docker-compose.yml
 README.md
 LICENSE
+
+# Setup and run scripts (not part of the image)
+install.sh
+install.ps1
+run.sh
+run.ps1
+build.ps1

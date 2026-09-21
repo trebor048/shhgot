@@ -11,6 +11,7 @@ permissions:
   contents: read
 
 jobs:
+  # Fast gate: formatting, vet, tests and the race detector on one runner.
   test:
     name: Format, vet and test
     runs-on: ubuntu-latest
@@ -40,6 +41,39 @@ jobs:
 
       - name: Test with race detector
         run: CGO_ENABLED=1 go test ./... -count=1 -race
+
+  # Prove the suite passes and the binary runs on every supported OS, not just
+  # the cross-compile host. The race detector stays in the ubuntu job above
+  # because it needs cgo, which is not guaranteed on the Windows runners.
+  test-os:
+    name: Test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -count=1
+
+      - name: Build and smoke test the native binary
+        shell: bash
+        run: |
+          ext=""
+          [ "${RUNNER_OS}" = "Windows" ] && ext=".exe"
+          go build -trimpath -ldflags="-s -w" -o "shhgit-smoke${ext}" ./cmd/shhgit
+          "./shhgit-smoke${ext}" -h 2>&1 | grep -i usage
+          echo "native binary on ${RUNNER_OS} runs and lists its flags"
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
@@ -79,6 +113,8 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-      - name: Smoke test (native platform only)
+      # Only the linux binary can execute on this linux runner; the other five
+      # targets are exercised natively by the test-os job above.
+      - name: Smoke test
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: ./dist/shhgit-linux-amd64 -h 2>&1 | grep -i usage

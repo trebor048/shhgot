@@ -53,7 +53,9 @@ jobs:
           name="shhgit-${GOOS}-${GOARCH}${ext}"
           go build -trimpath -ldflags="-s -w" -o "$name" ./cmd/shhgit
 
-          extras="LICENSE README.md config.yaml.example"
+          # The installer and run scripts ship with the release so a download
+          # can be set up without cloning.
+          extras="LICENSE README.md config.yaml.example install.sh install.ps1 run.sh run.ps1"
           if [ "$GOOS" = "windows" ]; then
             zip -q "${name%.exe}.zip" "$name" $extras
             rm -f "$name"
@@ -61,7 +63,14 @@ jobs:
             tar czf "${name}.tar.gz" "$name" $extras
             rm -f "$name"
           fi
-          ls -lh shhgit-*.{zip,tar.gz} 2>/dev/null || ls -lh shhgit-*
+
+          # Checksum the archive so downloads can be verified.
+          if [ "$GOOS" = "windows" ]; then
+            sha256sum "shhgit-${GOOS}-${GOARCH}.zip" > "checksums-${GOOS}-${GOARCH}.txt"
+          else
+            sha256sum "shhgit-${GOOS}-${GOARCH}.tar.gz" > "checksums-${GOOS}-${GOARCH}.txt"
+          fi
+          ls -lh shhgit-*.{zip,tar.gz} checksums-*.txt 2>/dev/null || ls -lh shhgit-* checksums-*
 
       - name: Attach to release
         uses: softprops/action-gh-release@v2
@@ -70,5 +79,6 @@ jobs:
           files: |
             shhgit-*.tar.gz
             shhgit-*.zip
+            checksums-*.txt
           generate_release_notes: true
           fail_on_unmatched_files: true

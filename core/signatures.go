@@ -266,8 +266,12 @@ func (s PatternSignature) applyVerifier(match string, file MatchFile) bool {
 
 	// Send webhook notification if webhook is configured
 	if session != nil && session.Config != nil && session.Config.Webhook != "" {
-		// Extract repository and filename from current context if available
-		repository := "unknown"
+		// The scan loop attaches the repository to the file; fall back to
+		// "unknown" only when no repo context was available.
+		repository := file.Repo
+		if repository == "" {
+			repository = "unknown"
+		}
 		filename := file.Filename
 
 		// Send validation webhook
@@ -288,8 +292,19 @@ func (s PatternSignature) applyVerifier(match string, file MatchFile) bool {
 func GetSignatures(s *Session) []Signature {
 	var signatures []Signature
 	var unusable []string
+	var incomplete []string
 	regexCount, matchCount := 0, 0
 	for _, signature := range s.Config.Signatures {
+		if signature.Match == "" && signature.Regex == "" {
+			// An entry with neither a match string nor a regex is a typo, and a
+			// costly one: it used to fall through to regexp.Compile(""), which
+			// succeeds and matches every string. As a contents rule that emitted
+			// an empty match for every position in every file, and as a
+			// path/filename rule it matched every path - so one bad config line
+			// buried the report in false positives.
+			incomplete = append(incomplete, signature.Name)
+			continue
+		}
 		if signature.Match != "" {
 			matchCount++
 			signatures = append(signatures, SimpleSignature{
@@ -346,6 +361,13 @@ func GetSignatures(s *Session) []Signature {
 			len(unusable))
 		for _, u := range unusable {
 			s.Log.Warn("  - %s", u)
+		}
+	}
+	if len(incomplete) > 0 && s.Log != nil {
+		s.Log.Warn("%d configured signature(s) set neither 'match' nor 'regex' and were skipped "+
+			"(an empty regex matches every file, which would flag everything):", len(incomplete))
+		for _, name := range incomplete {
+			s.Log.Warn("  - %s", name)
 		}
 	}
 	if s.Log != nil && len(signatures) > 0 {

@@ -57,7 +57,7 @@ detect_platform() {
     case "$OS" in
         Linux)  GOOS="linux" ;;
         Darwin) GOOS="darwin" ;;
-        *)      fail "unsupported OS: $OS. On Windows use WSL2, or the Docker route (--docker)." ;;
+        *)      fail "unsupported OS: $OS. On Windows run install.ps1 (PowerShell), or use the Docker route (--docker)." ;;
     esac
 
     ARCH="$(uname -m)"
@@ -242,8 +242,13 @@ ${BOLD}Docker route${NC}
       docker compose up -d
       # dashboard on http://localhost:8080
 
-  The container needs a config.yaml; mount yours with
-  -v "\$(pwd)/config.yaml:/app/config.yaml:ro" or set GITHUB_TOKEN in .env.
+  The container needs a config.yaml. Create it first, then start the stack:
+
+      cp config.yaml.example config.yaml
+      docker compose up -d
+
+  docker-compose.yml mounts it read-write on purpose: shhgit prunes revoked
+  (HTTP 401) GitHub tokens from it at startup and writes a config.yaml.bak first.
 
 EOF
 }

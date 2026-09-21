@@ -1318,7 +1318,13 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 		queryRegex = re
 	}
 
-	for _, file := range core.GetMatchingFiles(dir) {
+	files := core.GetMatchingFiles(dir)
+	// len(files) is the exact number of files this scan will process, so it is
+	// the right denominator for the progress percentage. The GetFileCount above
+	// is only a size guard and counts every file, including the blacklisted
+	// ones this slice drops.
+	core.GlobalScanProgress.SetTotalFiles(len(files))
+	for _, file := range files {
 		// The operator may have skipped this repository while the scan was running.
 		// Checking per file is what makes a skip land in a reasonable time on a
 		// large repository; the caller drops the directory afterwards.
@@ -1339,6 +1345,11 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 		// per file. The load has to happen before any of those readers, including
 		// isViteOnlyEnvFile.
 		file.Contents = file.GetContents()
+
+		// Attach the repository to the file so verifier webhooks can name it;
+		// applyVerifier used to hardcode "unknown" because MatchFile carried
+		// no repo context.
+		file.Repo = url
 
 		// Env files whose only assignments are public VITE_* variables (Vite
 		// client-side envs ship to the browser by design) are not findings.

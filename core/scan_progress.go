@@ -16,6 +16,15 @@ type ScanProgress struct {
 	MatchesFound      int64
 	ErrorsEncountered int64
 
+	// repoFilesProcessed and repoTotalFiles describe only the repository being
+	// scanned right now, which is what ProgressPercent is derived from;
+	// FilesProcessed above stays cumulative across the whole run. They are
+	// atomics because several repository workers share this singleton, exactly
+	// as they share CurrentRepo and CurrentFile below - the percentage is
+	// therefore the latest worker's view, not a sum over concurrent scans.
+	repoFilesProcessed atomic.Int64
+	repoTotalFiles     atomic.Int64
+
 	// Current status
 	CurrentRepo    string
 	CurrentFile    string
@@ -43,12 +52,26 @@ var GlobalScanProgress = &ScanProgress{
 
 // BeginScan records that a repository scan started.
 func (sp *ScanProgress) BeginScan(repo string) {
+	sp.repoFilesProcessed.Store(0)
+	sp.repoTotalFiles.Store(0)
 	sp.mu.Lock()
 	sp.IsScanning = true
 	sp.CurrentRepo = repo
 	sp.CurrentFile = ""
+	sp.ProgressPercent = 0
 	sp.LastUpdateTime = time.Now()
 	sp.mu.Unlock()
+}
+
+// SetTotalFiles records how many files the current repository scan will
+// process. It is what lets FileScanned turn its counter into a percentage:
+// nothing ever set ProgressPercent, so the dashboard's scan bar and the
+// "scanning N%" status line sat at zero for the life of the process.
+func (sp *ScanProgress) SetTotalFiles(n int) {
+	if n < 0 {
+		n = 0
+	}
+	sp.repoTotalFiles.Store(int64(n))
 }
 
 // EndScan records that a repository scan finished.
@@ -68,10 +91,21 @@ func (sp *ScanProgress) EndScan() {
 
 // FileScanned records one processed file.
 func (sp *ScanProgress) FileScanned(file string) {
+	done := sp.repoFilesProcessed.Add(1)
+	total := sp.repoTotalFiles.Load()
+
 	sp.mu.Lock()
 	sp.CurrentFile = file
 	sp.LastUpdateTime = time.Now()
+	if total > 0 {
+		pct := int(done * 100 / total)
+		if pct > 100 {
+			pct = 100
+		}
+		sp.ProgressPercent = pct
+	}
 	sp.mu.Unlock()
+
 	atomic.AddInt64(&sp.FilesProcessed, 1)
 }
 

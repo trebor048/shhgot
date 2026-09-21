@@ -2,6 +2,8 @@
 #
 # Run shhgit as a web dashboard, logging to a file.
 #
+# On Windows use .\run.ps1, the native PowerShell counterpart.
+#
 #   ./run.sh                  # http://127.0.0.1:8080
 #   PORT=9000 ./run.sh        # different port
 #   THREADS=16 ./run.sh       # more scan concurrency
@@ -26,4 +28,4 @@ fi
 
 echo "starting shhgit dashboard on http://${HOST}:${PORT} (logs: ${LOG})"
 exec ./shhgit --web --web-host "$HOST" --web-port "$PORT" \
-    -threads "$THREADS" --config-path "$(pwd)" >>"$LOG" 2>&1
+    --threads "$THREADS" --config-path "$(pwd)" >>"$LOG" 2>&1

@@ -95,13 +95,36 @@ INSTALL_DIR=~/tools/shhgot ./install.sh   # install somewhere else
 ./install.sh --docker                     # print the Docker route instead
 ```
 
-The installer is a shell script, so it targets Linux and macOS only. On Windows,
-build from source below — shhgit compiles and runs natively there, no WSL or
-container needed — or use the [Docker](#docker) route.
+The installer is a shell script, so it targets Linux and macOS. Windows has its
+own installer below; shhgit compiles and runs natively there, with no WSL or
+container needed.
 
-### Option 2 — build from source
+### Option 2 — installer (Windows, PowerShell)
 
-Works on Linux, macOS and Windows.
+```powershell
+git clone https://github.com/trebor048/shhgot
+cd shhgot
+.\install.ps1
+```
+
+Or from anywhere, cloning into `$HOME\shhgit`:
+
+```powershell
+.\install.ps1                          # clone (if needed), build, configure
+.\install.ps1 -InstallDir C:\tools\shhgit
+.\install.ps1 -NoBuild                 # set up source + config only
+.\install.ps1 -Docker                  # print the Docker route instead
+```
+
+It checks for Go — installing it with `winget` or Chocolatey when available —
+fetches the source, builds `shhgit.exe`, creates `config.yaml` from the example
+with permissions restricted to your user, and smoke-tests the result. If
+PowerShell blocks the script, run it as
+`powershell -ExecutionPolicy Bypass -File .\install.ps1`.
+
+### Option 3 — build from source
+
+Works on Linux, macOS and Windows. Go 1.26 or newer is the only requirement.
 
 **Linux and macOS**
 
@@ -109,7 +132,7 @@ Works on Linux, macOS and Windows.
 git clone https://github.com/trebor048/shhgot
 cd shhgot
 cp config.yaml.example config.yaml        # then add your GitHub token(s)
-go build -o shhgit ./cmd/shhgit
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o shhgit ./cmd/shhgit
 ./shhgit
 ```
 
@@ -119,21 +142,28 @@ go build -o shhgit ./cmd/shhgit
 git clone https://github.com/trebor048/shhgot
 cd shhgot
 Copy-Item config.yaml.example config.yaml  # then add your GitHub token(s)
-go build -o shhgit.exe ./cmd/shhgit
+.\build.ps1                                # builds shhgit.exe
 .\shhgit.exe
 ```
 
-Or drive it through the Makefile (Linux and macOS; on Windows use `make` from Git
-Bash, or run the `go` commands above directly):
+`build.ps1` wraps the same `go build` invocation. To produce binaries for every
+supported platform from this one machine — no Mac or Linux box required — run
+`.\build.ps1 -All`, which cross-compiles all six OS/arch targets into `dist\`.
+
+**Make targets** — Linux, macOS, or Windows with GNU make
+(`choco install make` / `winget install GnuWin32.Make`) and Git for Windows:
 
 ```bash
 make build        # binary for this platform
-make build-all    # cross-compile Windows/Linux/macOS, amd64 + arm64, into dist/
+make build-all    # cross-compile Windows/Linux/macOS, amd64 and arm64, into dist/
 make test         # run the test suite
 make help         # list every target
 ```
 
-### Option 3 — Docker
+`make build-all` cross-compiles all six targets from any one machine — you do not
+need a Mac to build the macOS binary.
+
+### Option 4 — Docker
 
 ```bash
 cp config.yaml.example config.yaml        # must exist before you start
@@ -180,6 +210,10 @@ written first — so a dead token is never retried.
 ./shhgit --web           # web dashboard on http://127.0.0.1:8080
 ./shhgit --local ./code  # scan a directory, no token required
 ```
+
+On Windows the binary is `shhgit.exe`, so use `.\shhgit.exe`,
+`.\shhgit.exe --web`, `.\shhgit.exe --local .\code`, or the runner script
+`.\run.ps1` (dashboard, logging to `run.log`).
 
 `config.yaml` is looked for in the directory given by `--config-path`, then next
 to the binary, then the current directory. Set `--config-path` explicitly when
@@ -756,6 +790,17 @@ says which.
 **Port already in use**
 `--web-port 9000`, or set `SHHGIT_PORT` for Docker.
 
+**`make` is not recognised on Windows**
+GNU make is not installed by default. Either use the native scripts
+(`.\install.ps1`, `.\build.ps1`, `.\run.ps1`) or install make with
+`choco install make` / `winget install GnuWin32.Make`. Make recipes run through
+the `sh` that ships with Git for Windows, which shhgit needs anyway.
+
+**`.\install.ps1` is blocked by the execution policy**
+PowerShell refuses to run unsigned scripts under its default policy. Run
+`powershell -ExecutionPolicy Bypass -File .\install.ps1`, or allow locally-signed
+scripts for your user with `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+
 **Antivirus quarantines the binary, or `go build` fails with "contains a virus"**
 Expected false positive. shhgit embeds hundreds of credential-detection patterns,
 and heuristic scanners read that as a credential-stealer signature. Windows
@@ -802,6 +847,15 @@ make vet fmt       # static checks and formatting
 make run-web       # run the dashboard
 ```
 
+On Windows without GNU make, the PowerShell scripts cover the same ground:
+
+```powershell
+.\build.ps1            # build shhgit.exe
+.\build.ps1 -All       # cross-compile all six OS/arch targets into dist\
+.\run.ps1              # run the dashboard (logs to run.log)
+.\run.ps1 -Mode tui    # run the terminal UI
+```
+
 Layout:
 
 | Path | Contents |
@@ -825,8 +879,9 @@ there is no build step, package manager or bundler, and no network access is
 needed at runtime.
 
 CI (`go.yml`) checks formatting, runs `go vet`, runs the tests including under
-`-race`, and builds all six OS/arch combinations. Releases attach binaries for
-Windows, Linux and macOS on amd64 and arm64.
+`-race`, runs the suite natively on Linux, macOS and Windows, and builds all six
+OS/arch combinations. Releases attach binaries for Windows, Linux and macOS on
+amd64 and arm64, plus SHA-256 checksums.
 
 ---
 

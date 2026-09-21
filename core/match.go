@@ -14,8 +14,9 @@ type MatchFile struct {
 	Filename  string
 	Extension string
 	Contents  []byte
-	Size      int64 // Add file size
-	loaded    bool  // Track if contents are loaded
+	Size      int64  // Add file size
+	Repo      string // Repository the file belongs to, set by the scan loop
+	loaded    bool   // Track if contents are loaded
 }
 
 // Buffer pool for reading files to reduce allocations
