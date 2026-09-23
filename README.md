@@ -354,7 +354,7 @@ reference, and this section as the map.
 | `signatures` | The detection rules — 104 in the example. |
 | `performance` | Thread counts, API pacing, worker-pool and queue sizing. |
 | `scanning` | Per-repository size/file gates, clone depth and timeout, fork/archive filters. |
-| `webhook`, `webhook_ai_tokens`, `webhook_crypto` | Alert destinations ([details](#webhooks)). |
+| `webhook` | Alert destination ([details](#webhooks)). |
 | `webhook_payload` | Body template POSTed to the webhook. |
 | `logFormat` | Terminal UI style ([details](#log-styles)). |
 | `ai_review` | AI backend and model ([details](#ai-review)). |
@@ -583,16 +583,12 @@ paths get a plain `404`.
 
 ## Webhooks
 
-shhgit posts to Discord or Telegram when it finds something. Three options let
-you route by finding type:
+shhgit posts to Discord or Telegram when it finds something. Set `webhook` to
+the destination URL; every match is posted there.
 
 ```yaml
-webhook: 'https://discord.com/api/webhooks/<numeric-id>/<token>'    # everything
-webhook_ai_tokens: 'https://discord.com/api/webhooks/<id>/<token>'  # AI/LLM tokens
-webhook_crypto: 'https://discord.com/api/webhooks/<id>/<token>'     # crypto keys/seeds
+webhook: 'https://discord.com/api/webhooks/<numeric-id>/<token>'
 ```
-
-If a class-specific webhook is unset, that class falls back to `webhook`.
 
 **Payload template** — `%s` is replaced with the match text:
 

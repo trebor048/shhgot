@@ -495,32 +495,6 @@ func isAITokenSignature(sig string) bool {
 	return false
 }
 
-// isCryptoSignature checks if a signature is crypto-related
-func isCryptoSignature(sig string) bool {
-	sigLower := strings.ToLower(sig)
-
-	cryptoKeywords := []string{
-		"ethereum", "bitcoin", "wallet", "private key", "seed", "mnemonic",
-		"recovery", "bip39", "solana", "cardano", "ripple", "polkadot",
-		"monero", "zcash", "litecoin", "dogecoin", "tron", "arbitrum",
-		"optimism", "polygon", "avalanche", "fantom", "harmony", "celo",
-		"cosmos", "osmosis", "juno", "secret", "band", "near", "algorand",
-		"aptos", "sui", "starknet", "flow", "hedera", "icp", "filecoin",
-		"arweave", "thorchain", "stacks", "kaspa", "ergo", "nervos",
-		"zilliqa", "elrond", "vechain", "theta", "icon", "tezos", "neo",
-		"ontology", "waves", "eos", "telos", "crypto", "blockchain",
-		"web3", "nft", "defi", "token", "address", "keypair",
-	}
-
-	for _, keyword := range cryptoKeywords {
-		if strings.Contains(sigLower, keyword) {
-			return true
-		}
-	}
-
-	return false
-}
-
 // githubFileURL builds the GitHub "blob" URL for a file at a specific line. The
 // branch is normalised - a "refs/heads/" prefix is stripped and an empty branch
 // defaults to main - and the path is normalised to forward slashes, so the URL
@@ -1704,35 +1678,6 @@ func publish(event *MatchEvent) {
 		)
 	}
 
-	// Send AI tokens (excluding Google) to their dedicated webhook
-	if len(getSession().Config.WebhookAITokens) > 0 && isAITokenSignature(event.Signature) {
-		go core.SendMatchWebhook(
-			getSession().Config.WebhookAITokens,
-			getSession().Config.WebhookPayload,
-			event.Url,
-			event.Signature,
-			event.File,
-			event.Matches,
-			event.Color,
-			event.Priority,
-			event.FileContent,
-		)
-	}
-
-	// Send crypto-related matches to their dedicated webhook
-	if len(getSession().Config.WebhookCrypto) > 0 && isCryptoSignature(event.Signature) {
-		go core.SendMatchWebhook(
-			getSession().Config.WebhookCrypto,
-			getSession().Config.WebhookPayload,
-			event.Url,
-			event.Signature,
-			event.File,
-			event.Matches,
-			event.Color,
-			event.Priority,
-			event.FileContent,
-		)
-	}
 }
 
 // ──────────────────────────────────────────────────────────────

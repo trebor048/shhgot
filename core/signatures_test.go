@@ -251,3 +251,108 @@ func TestConnectionStringPlaceholderIsNotAFinding(t *testing.T) {
 		t.Errorf("real DSN: got %d matches, want 1 (%v)", len(got), got)
 	}
 }
+
+// The name-keyed rules are built as "<provider>[\w.-]{0,20}\s*[:=]\s*<value>".
+// A provider's own name is an ordinary word, so without a guard every one of
+// these was reported - and none of them is a credential.
+func TestProviderNameAssignmentsAreNotFindings(t *testing.T) {
+	for _, v := range []string{
+		`accessKey: credential.refresh_token`,
+		`accessToken = tokenJson.access_token`,
+		`client_id: this.policy.bucket_name`,
+		`lambda: _build_engine_and_rank`,
+		`public_key = tls_private_key.RSA-KEY.public_key_openssh`,
+		`highlighted = highlightedMessageId`,
+		`firebase:firebase-crashlytics`,
+		`highlightAlerts = HighlightAlertRuntimeBridge`,
+		`accessToken = leaseObject.requiredString`,
+		`accessToken = lease.accessToken.trim`,
+		`accessToken = accessLease.accessToken`,
+		`NEXUS_BASE_BRANCH=handoff-continuite-20260920`,
+		`api_key = aCamelCase2IdentifierName`,
+		`client_secret = config2ValueWithDigits`,
+		`client_key = oauth2ClientIdentifierValue`,
+		`access_token = a_lowercase_snake_identifier_name`,
+		`auth_token = someidentifiername`,
+	} {
+		if !looksLikeCodeReference(v) {
+			t.Errorf("code reference %q not recognised", v)
+		}
+	}
+}
+
+// A real credential must survive the guard: opaque strings, JWTs, connection
+// strings, PEM blocks and bare token formats all carry a signal it must not
+// reject.
+func TestCredentialValuesAreStillFindings(t *testing.T) {
+	for _, v := range []string{
+		`LAMBDA_API_KEY=AbCd1234EfGh5678IjKl9012`,
+		`DATABASE_URL=postgresql://app_rw:S3cr3tP4ss@db.prod.internal:5432/app`,
+		`accessToken = "Xk9mQ2vL7pW4zR8tY6ab"`,
+		`password = "Xk9#mQ2$vL7pW4zR8tY6"`,
+		`client_secret = "AbCd1234EfGh5678IjKl9012"`,
+		`AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`,
+		`firebase_api_key = AbCd1234EfGh5678IjKl9012`,
+		`db = "postgres://user:pass@host/db"`,
+		`Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig`,
+		`-----BEGIN RSA PRIVATE KEY-----`,
+		// Split so GitHub Push Protection does not read this synthetic fixture as
+		// a live Stripe key; the value the test observes is unchanged.
+		"sk_" + "live_51H8xkQAbCdEfGhIjKlMnOpQrStUvWx",
+		`https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXX`,
+		`o123.ingest.sentry.io`,
+		`api_key = "Zq7Wm2Rk9Yt4Pv6Ld3Hs8Cx1Nf5Jb0Gz"`,
+		`token = Xk9mQ2vL7pW4zR8tY6ab`,
+		`secret_key = AbCd9876EfGh5432IjKl2109MnOpQrSt`,
+		`api_key = 9f86d081884c7d659a2feaa0c55ad015`,
+	} {
+		if looksLikeCodeReference(v) {
+			t.Errorf("credential %q wrongly classified as code", v)
+		}
+	}
+}
+
+// End to end: the broad name-keyed rules that produced the false positives must
+// return nothing for code, while still reporting a real credential.
+func TestBroadNameKeyedRulesIgnoreCode(t *testing.T) {
+	defer notRegexTestSession(t)()
+	session.Config.Signatures = []ConfigSignature{
+		{
+			Name:     "Generic Access Key / Access Token / Auth Token",
+			Part:     PartContents,
+			Regex:    `(?i)\b(?:access[_-]?key|accessKey|access[_-]?token|accessToken|auth[_-]?token|authToken)\s*[:=]\s*["']?[A-Za-z0-9_.\-]{20,}`,
+			Priority: 2,
+		},
+		{
+			Name:     "Lambda Labs API Key",
+			Part:     PartContents,
+			Regex:    `(?i)\blambda[\w.-]{0,20}\s*[:=]\s*["']?[a-zA-Z0-9_-]{20,}\b`,
+			Priority: 3,
+		},
+		{
+			Name:     "Highlight.io API Key",
+			Part:     PartContents,
+			Regex:    `(?i)\bhighlight[\w.-]{0,20}\s*[:=]\s*["']?[A-Za-z0-9_-]{20,}\b`,
+			Priority: 2,
+		},
+	}
+	sigs := GetSignatures(session)
+
+	code := "accessToken = leaseObject.requiredString\n" +
+		"lambda: _build_engine_and_rank\n" +
+		"highlighted = highlightedMessageId\n"
+	for _, s := range sigs {
+		if got := s.GetContentsMatches(contentsFile(code)); len(got) != 0 {
+			t.Errorf("%s: code produced %d matches, want 0 (%v)", s.Name(), len(got), got)
+		}
+	}
+
+	real := "accessToken = \"Xk9mQ2vL7pW4zR8tY6ab\"\n" +
+		"lambda_api_key = AbCd1234EfGh5678IjKl9012\n" +
+		"highlight_api_key = ZzYy1234XxWw5678VvUu9012\n"
+	for _, s := range sigs {
+		if got := s.GetContentsMatches(contentsFile(real)); len(got) != 1 {
+			t.Errorf("%s: real credential produced %d matches, want 1 (%v)", s.Name(), len(got), got)
+		}
+	}
+}

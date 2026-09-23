@@ -559,7 +559,7 @@ func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, m
 	}
 
 	// Enhanced message format with clear signature match display
-	message := fmt.Sprintf("**%s** | Priority: %d\n**File:** [%s](%s)\n**Repository:** %s\n\n**<match>**\n```\n%s\n```",
+	message := fmt.Sprintf("**%s** | Priority: %d\n**File:** [%s](%s)\n**Repository:** %s\n\n```\n%s\n```",
 		signature, priority, file, githubLink, url, matchesStr)
 
 	// For .env files, embed FULL file content (match all .env variants)
@@ -616,10 +616,10 @@ func sendDiscordMatchWebhook(webhookURL string, url string, signature string, fi
 			"value": fmt.Sprintf("`%s`", file),
 		})
 	} else {
-		// Show the actual matched content in a highlighted <match> block
-		matchDisplay := fmt.Sprintf("```\n<match>\n%s\n</match>\n```", matchesStr)
+		// Show the actual matched content in a code block
+		matchDisplay := fmt.Sprintf("```\n%s\n```", matchesStr)
 		if len(matchDisplay) > 1024 {
-			matchDisplay = fmt.Sprintf("```\n<match>\n%s\n</match>\n```", matchesStr[:900]+"...")
+			matchDisplay = fmt.Sprintf("```\n%s\n```", matchesStr[:900]+"...")
 		}
 		fields = append(fields, map[string]interface{}{
 			"name":   "🔍 Signature Match",

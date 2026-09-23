@@ -16,8 +16,6 @@ type Config struct {
 	GitHubAccessTokens           []string          `yaml:"github_access_tokens"`
 	AITokens                     []string          `yaml:"ai_tokens"`
 	Webhook                      string            `yaml:"webhook,omitempty"`
-	WebhookAITokens              string            `yaml:"webhook_ai_tokens,omitempty"`
-	WebhookCrypto                string            `yaml:"webhook_crypto,omitempty"`
 	WebhookPayload               string            `yaml:"webhook_payload,omitempty"`
 	WebhookQueue                 WebhookQueueCfg   `yaml:"webhook_queue,omitempty"`
 	BlacklistedStrings           []string          `yaml:"blacklisted_strings"`
