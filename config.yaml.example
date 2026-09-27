@@ -1444,11 +1444,6 @@ signatures:
     priority: 2
     color: '#6b7280'
   - part: contents
-    regex: (api_endpoint|endpoint|base_url|baseurl|base-url)\s*[:=]\s*["\x27]https?://[^\"\x27]{10,}["\x27]
-    name: API Endpoint URL in Quotes
-    priority: 1
-    color: '#7c8798'
-  - part: contents
     regex: (?i)(gemini|palm|bard|makersuite|vertex)[\s_-]*(api[\s_-]*key|token)\s*[:=]\s*["\x27]?(AIza[A-Za-z0-9_-]{35})["\x27]?
     name: Google AI API Key in Assignment
     priority: 3

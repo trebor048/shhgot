@@ -1899,18 +1899,22 @@ func runTUIMode() {
 // as one atomic write, so background worker lines cannot land in the middle
 // of the banner while the scanner spins up.
 func printStartupBlock() {
+	// Print animated banner FIRST (directly to console, not through lockWrite)
+	// This happens before any other output
+	core.PrintAnimatedBanner()
+	
+	// Now build the rest of the startup info
 	var sb strings.Builder
-	// ── Banner (preset-aware) ──────────────────────────────────
+	
+	// Add author info based on format
 	switch getLogFormat() {
 	case LogFormatMinimal:
-		blogPrintf(&sb, "%s %s\n", minSearch("shhgit"), minDim(core.Author))
+		blogPrintf(&sb, "%s %s\n", minSearch(""), minDim(core.Author))
 
 	case LogFormatFancy:
-		blogPrintln(&sb, color.HiBlueString(core.Banner))
 		blogPrintln(&sb, "  "+color.HiCyanString(core.Author))
 
 	case LogFormatUltraFancy:
-		blogPrintln(&sb, color.HiBlueString(core.Banner))
 		blogPrintf(&sb, "  %s  %s\n",
 			ultraBadge(" ULTRA FANCY "),
 			ultraAccent(core.Author))
@@ -1920,7 +1924,6 @@ func printStartupBlock() {
 		blogPrintf(&sb, "  %s\n\n", cosmicAccent(core.Author))
 
 	case LogFormatNeon:
-		blogPrintln(&sb, color.HiMagentaString(core.Banner))
 		blogPrintf(&sb, "  %s %s\n",
 			neonEntropyLabel(" NEON MODE "),
 			neonValue(core.Author))
