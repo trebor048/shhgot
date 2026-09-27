@@ -10,6 +10,7 @@ import ActivityPanel from './components/ActivityPanel'
 import ReviewPanel from './components/ReviewPanel'
 import SettingsPanel from './components/SettingsPanel'
 import FileModal from './components/FileModal'
+import Particles from './components/Particles'
 import { ToastProvider, useToast } from './components/Toast'
 import { useFeed } from './lib/useFeed'
 import { csvEscape } from './lib/format'
@@ -85,7 +86,8 @@ function Workspace() {
   }
 
   return (
-    <div className="flex h-screen">
+    <div className="relative z-10 flex h-screen">
+      <Particles />
       <Sidebar
         isOpen={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
