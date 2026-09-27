@@ -1,8 +1,10 @@
 package core
 
 import (
+	"bytes"
 	"fmt"
 	"regexp"
+	"regexp/syntax"
 	"strings"
 )
 
@@ -197,7 +199,6 @@ type SimpleSignature struct {
 	part           string
 	match          string
 	name           string
-	verifier       string
 	priority       int
 	color          string
 	excludeInModes []string
@@ -212,6 +213,14 @@ type PatternSignature struct {
 	priority       int
 	color          string
 	excludeInModes []string
+
+	// prefilter holds literals such that any match must contain at least one of
+	// them; prefilterFold marks them case-insensitive. A pattern whose literals
+	// are absent cannot match, so the (much slower) regex is skipped. It is nil
+	// when no sound prefilter could be derived, in which case the regex always
+	// runs. See requiredLiterals.
+	prefilter     [][]byte
+	prefilterFold bool
 }
 
 func (s SimpleSignature) Match(file MatchFile) (bool, string) {
@@ -270,6 +279,153 @@ func (s SimpleSignature) GetPart() string {
 	return s.part
 }
 
+// requiredLiterals derives a sound prefilter for a pattern: literals such that
+// any input the pattern can match must contain at least one of them. The second
+// result marks them case-insensitive (the pattern folded their case). A nil
+// result means no prefilter could be proven and the regex must always run.
+//
+// The derivation walks the parsed regex and keeps only mandatory literals: the
+// first constrained element of a concatenation, the union of an alternation
+// whose branches are all constrained, and the operand of a mandatory
+// repetition. Optional, zero-width and unanalysable elements constrain nothing.
+// A regex matches anywhere in the input, so "the match must contain X" implies
+// "the input must contain X": skipping the regex when none of its literals is
+// present can never drop a real match.
+//
+// This matters because RE2 has no literal fast-path for a pattern with no
+// common prefix (an alternation of keywords, a leading (?i)), so every such
+// signature rescans the whole file (milliseconds). The prefilter turns that
+// into a handful of substring searches (microseconds).
+func requiredLiterals(pattern string) ([][]byte, bool) {
+	parsed, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, false
+	}
+	lits, fold, ok := collectRequired(parsed.Simplify())
+	if !ok {
+		return nil, false
+	}
+	seen := make(map[string]bool, len(lits))
+	out := make([][]byte, 0, len(lits))
+	for _, l := range lits {
+		if l == "" || seen[l] || !literalIsASCII(l) {
+			continue
+		}
+		seen[l] = true
+		if fold {
+			// bytes.ToLower folds ASCII only, which literalIsASCII guarantees.
+			l = strings.ToLower(l)
+		}
+		out = append(out, []byte(l))
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, fold
+}
+
+// collectRequired implements the mandatory-literal walk described on
+// requiredLiterals. ok is false when the node imposes no usable constraint.
+func collectRequired(re *syntax.Regexp) (lits []string, fold bool, ok bool) {
+	switch re.Op {
+	case syntax.OpLiteral:
+		if len(re.Rune) == 0 {
+			return nil, false, false
+		}
+		return []string{string(re.Rune)}, re.Flags&syntax.FoldCase != 0, true
+	case syntax.OpConcat:
+		// Every element of a concatenation must match, so any element's
+		// guaranteed literal is a valid prefilter. Keep the most selective one
+		// (the longest shortest-literal), so a mandatory "admin" is preferred
+		// over a mandatory "a".
+		var best []string
+		bestFold := false
+		bestScore := -1
+		for _, sub := range re.Sub {
+			l, f, ok := collectRequired(sub)
+			if !ok {
+				continue
+			}
+			if score := minLiteralLen(l); score > bestScore {
+				bestScore, best, bestFold = score, l, f
+			}
+		}
+		if bestScore < 0 {
+			return nil, false, false
+		}
+		return best, bestFold, true
+	case syntax.OpAlternate:
+		var out []string
+		foldAny := false
+		for _, sub := range re.Sub {
+			l, f, ok := collectRequired(sub)
+			if !ok {
+				// One branch could match without a known literal.
+				return nil, false, false
+			}
+			out = append(out, l...)
+			foldAny = foldAny || f
+		}
+		return out, foldAny, len(out) > 0
+	case syntax.OpCapture:
+		if len(re.Sub) == 1 {
+			return collectRequired(re.Sub[0])
+		}
+		return nil, false, false
+	case syntax.OpPlus:
+		if len(re.Sub) == 1 {
+			return collectRequired(re.Sub[0])
+		}
+		return nil, false, false
+	case syntax.OpRepeat:
+		if len(re.Sub) == 1 && re.Min >= 1 {
+			return collectRequired(re.Sub[0])
+		}
+		return nil, false, false
+	default:
+		return nil, false, false
+	}
+}
+
+func literalIsASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// minLiteralLen is the selectivity of an any-of literal set: the shortest
+// literal is the one most likely to appear by chance.
+func minLiteralLen(lits []string) int {
+	m := -1
+	for _, l := range lits {
+		if n := len(l); m < 0 || n < m {
+			m = n
+		}
+	}
+	return m
+}
+
+// prefilterMiss reports whether the prefilter proves the pattern cannot match
+// contents, so the regex can be skipped.
+func (s PatternSignature) prefilterMiss(file MatchFile, contents []byte) bool {
+	if len(s.prefilter) == 0 {
+		return false
+	}
+	hay := contents
+	if s.prefilterFold {
+		hay = file.LowerContents()
+	}
+	for _, l := range s.prefilter {
+		if bytes.Contains(hay, l) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s PatternSignature) Match(file MatchFile) (bool, string) {
 	var (
 		haystack  *string
@@ -289,6 +445,9 @@ func (s PatternSignature) Match(file MatchFile) (bool, string) {
 	case PartContents:
 		// Lazy load contents only when needed
 		contents := (&file).GetContents()
+		if s.prefilterMiss(file, contents) {
+			return false, PartContents
+		}
 		return s.match.Match(contents), PartContents
 	default:
 		return false, matchPart
@@ -313,6 +472,9 @@ func (s PatternSignature) GetContentsMatches(file MatchFile) []string {
 
 	// Lazy load contents only when needed
 	contents := (&file).GetContents()
+	if s.prefilterMiss(file, contents) {
+		return nil
+	}
 
 	for _, match := range s.match.FindAllSubmatch(contents, -1) {
 		match := string(match[0])
@@ -401,18 +563,38 @@ func (s PatternSignature) applyVerifier(match string, file MatchFile) bool {
 	var isValid bool
 	var tokenType string
 
-	switch s.verifier {
-	case "discord":
-		isValid = ValidateDiscordToken(match)
-		tokenType = "Discord"
-	case "telegram":
-		isValid = ValidateTelegramToken(match)
-		tokenType = "Telegram"
-	case "ssh":
-		isValid = ValidateSSHKey(match)
-		tokenType = "SSH Key"
-	default:
-		return true // No verifier or unknown verifier, accept the match
+	if aiTokenVerifiers[s.verifier] {
+		// Route through TokenValidator so the provider's API is actually called.
+		// Before this, verifier: openai / verifier: claude fell into the default
+		// branch below and every match was accepted unverified.
+		if session != nil && session.TokenValidator != nil {
+			isValid = session.TokenValidator.TestAndLogToken(match, s.color)
+			tokenType = session.TokenValidator.DetectProvider(match)
+		} else {
+			// No validator available (e.g. a unit test): fail open rather than
+			// silently dropping the finding.
+			isValid = true
+			tokenType = "AI Token (unverified)"
+		}
+	} else {
+		switch s.verifier {
+		case "discord":
+			isValid = ValidateDiscordToken(match)
+			tokenType = "Discord"
+		case "telegram":
+			isValid = ValidateTelegramToken(match)
+			tokenType = "Telegram"
+		case "ssh":
+			isValid = ValidateSSHKey(match)
+			tokenType = "SSH Key"
+		case "crypto_balance":
+			isValid, tokenType = ValidateCryptoKey(match)
+		default:
+			// config.yaml validation rejects unknown verifiers at load time, so
+			// this is only reached if a signature was built programmatically.
+			isValid = true
+			tokenType = "Unverified"
+		}
 	}
 
 	// Send webhook notification if webhook is configured
@@ -440,10 +622,39 @@ func (s PatternSignature) applyVerifier(match string, file MatchFile) bool {
 	return isValid
 }
 
+// aiTokenVerifiers maps the verifier names accepted in config.yaml to the
+// TokenValidator provider path. A signature carrying one of these is verified
+// against the provider's live API rather than merely matching its shape.
+var aiTokenVerifiers = map[string]bool{
+	"openai": true, "openai_project": true,
+	"anthropic": true, "claude": true,
+	"gemini": true, "google": true,
+	"xai": true, "grok": true,
+	"openrouter": true, "huggingface": true, "replicate": true,
+	"elevenlabs": true, "stability": true, "assemblyai": true, "deepgram": true,
+	"deepseek": true, "groq": true, "mistral": true, "cohere": true,
+	"perplexity": true, "together": true,
+}
+
+// knownVerifiers is every verifier name the scanner can actually execute. A
+// config that names anything else is a typo that would otherwise silently accept
+// every match; GetSignatures warns about each one.
+func knownVerifier(name string) bool {
+	if aiTokenVerifiers[name] {
+		return true
+	}
+	switch name {
+	case "discord", "telegram", "ssh", "crypto_balance":
+		return true
+	}
+	return false
+}
+
 func GetSignatures(s *Session) []Signature {
 	var signatures []Signature
 	var unusable []string
 	var incomplete []string
+	var badVerifiers []string
 	regexCount, matchCount := 0, 0
 	for _, signature := range s.Config.Signatures {
 		if signature.Match == "" && signature.Regex == "" {
@@ -458,16 +669,26 @@ func GetSignatures(s *Session) []Signature {
 		}
 		if signature.Match != "" {
 			matchCount++
+			// A verifier only runs on content matches; on a path/filename rule
+			// it can never execute, so flag it rather than let the operator
+			// believe the rule is validated.
+			if signature.Verifier != "" {
+				badVerifiers = append(badVerifiers, fmt.Sprintf(
+					"%s: verifier %q is ignored on a 'match' (filename/path) rule", signature.Name, signature.Verifier))
+			}
 			signatures = append(signatures, SimpleSignature{
 				name:           signature.Name,
 				part:           signature.Part,
 				match:          signature.Match,
-				verifier:       signature.Verifier,
 				priority:       signature.Priority,
 				color:          signature.Color,
 				excludeInModes: signature.ExcludeInModes,
 			})
 		} else {
+			if signature.Verifier != "" && !knownVerifier(signature.Verifier) {
+				badVerifiers = append(badVerifiers, fmt.Sprintf(
+					"%s: unknown verifier %q (match would be accepted unverified)", signature.Name, signature.Verifier))
+			}
 			// regexp.Compile validates with Perl-compatible flags so patterns
 			// using (?i), (?:...), lazy quantifiers, etc. are accepted. The
 			// old syntax.Parse(..., syntax.FoldCase) check ran in POSIX mode
@@ -493,6 +714,7 @@ func GetSignatures(s *Session) []Signature {
 				}
 			}
 			regexCount++
+			prefilter, prefilterFold := requiredLiterals(signature.Regex)
 			signatures = append(signatures, PatternSignature{
 				name:           signature.Name,
 				part:           signature.Part,
@@ -502,6 +724,8 @@ func GetSignatures(s *Session) []Signature {
 				priority:       signature.Priority,
 				color:          signature.Color,
 				excludeInModes: signature.ExcludeInModes,
+				prefilter:      prefilter,
+				prefilterFold:  prefilterFold,
 			})
 		}
 	}
@@ -519,6 +743,12 @@ func GetSignatures(s *Session) []Signature {
 			"(an empty regex matches every file, which would flag everything):", len(incomplete))
 		for _, name := range incomplete {
 			s.Log.Warn("  - %s", name)
+		}
+	}
+	if len(badVerifiers) > 0 && s.Log != nil {
+		s.Log.Warn("%d configured signature(s) have a verifier that will not run; the rule still matches, but unverified:", len(badVerifiers))
+		for _, b := range badVerifiers {
+			s.Log.Warn("  - %s", b)
 		}
 	}
 	if s.Log != nil && len(signatures) > 0 {

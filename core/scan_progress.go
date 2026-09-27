@@ -11,10 +11,9 @@ type ScanProgress struct {
 	mu sync.RWMutex
 
 	// Counters
-	ReposScanned      int64
-	FilesProcessed    int64
-	MatchesFound      int64
-	ErrorsEncountered int64
+	ReposScanned   int64
+	FilesProcessed int64
+	MatchesFound   int64
 
 	// repoFilesProcessed and repoTotalFiles describe only the repository being
 	// scanned right now, which is what ProgressPercent is derived from;
@@ -44,6 +43,35 @@ type ScanProgress struct {
 var GlobalScanProgress = &ScanProgress{
 	StartTime:      time.Now(),
 	LastUpdateTime: time.Now(),
+}
+
+// Last GitHub API rate-limit reading, published for the UIs. Kept in atomics
+// because the scanner goroutines write it while the render loop reads it.
+var (
+	apiRateRemaining atomic.Int64
+	apiRateResetUnix atomic.Int64
+)
+
+// RecordAPIRate stores the most recent GitHub rate-limit reading. Called after
+// API calls where a response carries one, so the TUI/dashboard can show the
+// remaining budget instead of a permanent zero.
+func RecordAPIRate(remaining int, reset time.Time) {
+	apiRateRemaining.Store(int64(remaining))
+	if reset.IsZero() {
+		apiRateResetUnix.Store(0)
+		return
+	}
+	apiRateResetUnix.Store(reset.Unix())
+}
+
+// APIRate returns the most recent remaining-call count and reset time. The
+// zero time means no reading has been recorded yet.
+func APIRate() (int, time.Time) {
+	u := apiRateResetUnix.Load()
+	if u == 0 {
+		return int(apiRateRemaining.Load()), time.Time{}
+	}
+	return int(apiRateRemaining.Load()), time.Unix(u, 0)
 }
 
 // The fields below are read by GetSnapshot under mu, so every writer takes the
@@ -120,23 +148,16 @@ func (sp *ScanProgress) GetSnapshot() map[string]interface{} {
 	defer sp.mu.RUnlock()
 
 	elapsedSeconds := time.Since(sp.StartTime).Seconds()
-	estimatedTimeRemaining := 0
-	if sp.FilesPerSecond > 0 && sp.ProgressPercent > 0 {
-		totalEstimated := int(float64(sp.FilesProcessed) / (float64(sp.ProgressPercent) / 100))
-		estimatedTimeRemaining = int((float64(totalEstimated) - float64(sp.FilesProcessed)) / sp.FilesPerSecond)
-	}
 
 	return map[string]interface{}{
-		"is_scanning":              sp.IsScanning,
-		"progress":                 sp.ProgressPercent,
-		"repos_scanned":            atomic.LoadInt64(&sp.ReposScanned),
-		"files_processed":          atomic.LoadInt64(&sp.FilesProcessed),
-		"matches_found":            atomic.LoadInt64(&sp.MatchesFound),
-		"errors":                   atomic.LoadInt64(&sp.ErrorsEncountered),
-		"current_repo":             sp.CurrentRepo,
-		"current_file":             sp.CurrentFile,
-		"speed":                    sp.FilesPerSecond,
-		"elapsed_seconds":          int(elapsedSeconds),
-		"estimated_time_remaining": estimatedTimeRemaining,
+		"is_scanning":     sp.IsScanning,
+		"progress":        sp.ProgressPercent,
+		"repos_scanned":   atomic.LoadInt64(&sp.ReposScanned),
+		"files_processed": atomic.LoadInt64(&sp.FilesProcessed),
+		"matches_found":   atomic.LoadInt64(&sp.MatchesFound),
+		"current_repo":    sp.CurrentRepo,
+		"current_file":    sp.CurrentFile,
+		"speed":           sp.FilesPerSecond,
+		"elapsed_seconds": int(elapsedSeconds),
 	}
 }

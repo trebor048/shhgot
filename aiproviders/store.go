@@ -248,6 +248,13 @@ func (s *Store) Set(v Settings) error {
 	if err := os.Rename(tmpName, s.path); err != nil {
 		return fmt.Errorf("replace %s: %w", s.path, err)
 	}
+	// Fsync the containing directory so the rename itself is durable; syncing
+	// only the file can still lose the directory entry on power loss.
+	// Best-effort: not every platform/filesystem supports it.
+	if d, derr := os.Open(filepath.Dir(s.path)); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 	return nil
 }
 

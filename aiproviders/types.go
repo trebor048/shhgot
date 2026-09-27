@@ -355,7 +355,7 @@ func TestConnection(ctx context.Context, s Settings) (string, error) {
 	case *ollamaClient:
 		_, err = c.chat(ctx, probe, 1)
 	default:
-		_, err = client.Chat(ctx, probe)
+		return "", fmt.Errorf("unsupported client type %T", client)
 	}
 	if err != nil {
 		return "", err

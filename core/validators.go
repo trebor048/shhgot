@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,14 +24,55 @@ var (
 	// Global webhook queue for rate limiting and retry
 	globalWebhookQueue *WebhookQueue
 	webhookQueueOnce   sync.Once
+
+	// webhookQueueConfig is applied by ConfigureWebhookQueue and read when the
+	// queue is first used. Defaults are Discord-safe: 500 ms spacing keeps one
+	// webhook at 4 sends per 2 s, under Discord's 5-per-2-s bucket.
+	webhookQueueConfig = WebhookQueueCfg{
+		QueueSize:       defaultWebhookQueueSize,
+		RateLimitMS:     defaultWebhookRateLimitMS,
+		DedupeWindowSec: defaultWebhookDedupeWindowSec,
+		BatchSize:       defaultWebhookBatchSize,
+	}
+	webhookQueueConfigMutex sync.Mutex
 )
+
+const (
+	defaultWebhookQueueSize       = 1000
+	defaultWebhookRateLimitMS     = 500
+	defaultWebhookDedupeWindowSec = 300
+	defaultWebhookBatchSize       = 1
+)
+
+// ConfigureWebhookQueue applies the webhook_queue section of config.yaml. Call
+// it after ParseConfig and before the first alert is delivered; a zero or
+// negative value keeps the built-in default for that field.
+func ConfigureWebhookQueue(cfg WebhookQueueCfg) {
+	webhookQueueConfigMutex.Lock()
+	defer webhookQueueConfigMutex.Unlock()
+
+	if cfg.QueueSize > 0 {
+		webhookQueueConfig.QueueSize = cfg.QueueSize
+	}
+	if cfg.RateLimitMS > 0 {
+		webhookQueueConfig.RateLimitMS = cfg.RateLimitMS
+	}
+	if cfg.DedupeWindowSec > 0 {
+		webhookQueueConfig.DedupeWindowSec = cfg.DedupeWindowSec
+	}
+	if cfg.BatchSize > 0 {
+		webhookQueueConfig.BatchSize = cfg.BatchSize
+	}
+}
 
 // GetWebhookQueue returns the singleton webhook queue instance
 func GetWebhookQueue() *WebhookQueue {
 	webhookQueueOnce.Do(func() {
-		// Discord allows 5 requests per 2 seconds per webhook = 400ms between requests
-		// Use 500ms to be safe
-		globalWebhookQueue = NewWebhookQueue(1000, 500, 300)
+		webhookQueueConfigMutex.Lock()
+		cfg := webhookQueueConfig
+		webhookQueueConfigMutex.Unlock()
+
+		globalWebhookQueue = NewWebhookQueue(cfg.QueueSize, cfg.RateLimitMS, cfg.DedupeWindowSec, cfg.BatchSize)
 		globalWebhookQueue.Start()
 	})
 	return globalWebhookQueue
@@ -423,98 +465,63 @@ func testSSHConnection(signer ssh.Signer, target SSHTestTarget) bool {
 	return true
 }
 
-// ValidateSSHKeyFormat validates the format of an SSH private key without connecting
-func ValidateSSHKeyFormat(privateKey string) bool {
+// ValidateCryptoKey derives the address for a recognised private key and checks
+// its on-chain balance. Returns (isFundedOrUnverified, label).
+//
+// A key whose format is recognised is no longer accepted unconditionally: if a
+// node answers and the balance is zero, the result is false and the match is
+// discarded. If no node can be reached the key is kept and labelled unverified,
+// so a network outage never hides a real leak.
+func ValidateCryptoKey(privateKey string) (bool, string) {
 	if privateKey == "" {
-		return false
+		return false, ""
 	}
 
 	privateKey = strings.TrimSpace(privateKey)
 
-	// Check for common SSH key formats
-	if strings.Contains(privateKey, "-----BEGIN") {
-		// PEM format
-		validBeginnings := []string{
-			"-----BEGIN RSA PRIVATE KEY-----",
-			"-----BEGIN DSA PRIVATE KEY-----",
-			"-----BEGIN EC PRIVATE KEY-----",
-			"-----BEGIN OPENSSH PRIVATE KEY-----",
-			"-----BEGIN PRIVATE KEY-----",
+	// EVM private key (64 hex chars, optionally with 0x prefix).
+	ethKey := strings.TrimPrefix(privateKey, "0x")
+	if isEVMKeyFormat(ethKey) {
+		return checkEthereumBalance(ethKey)
+	}
+
+	// Bitcoin WIF (51-52 base58 chars, K/L/5 prefix).
+	if isWIFKeyFormat(privateKey) {
+		return checkBitcoinBalance(privateKey)
+	}
+
+	// Base64 encoded 32-byte key (Solana and others export this way).
+	if decoded, err := base64.StdEncoding.DecodeString(privateKey); err == nil && len(decoded) == 32 {
+		if isEVMKeyFormat(hex.EncodeToString(decoded)) {
+			return checkEthereumBalance(hex.EncodeToString(decoded))
 		}
-
-		for _, beginning := range validBeginnings {
-			if strings.Contains(privateKey, beginning) {
-				// Try to parse it
-				_, err := ssh.ParsePrivateKey([]byte(privateKey))
-				return err == nil
-			}
-		}
-		return false
 	}
 
-	// Try to parse as raw key data
-	_, err := ssh.ParsePrivateKey([]byte(privateKey))
-	if err == nil {
-		return true
-	}
-
-	// Try base64 decoding
-	if decoded, err := base64.StdEncoding.DecodeString(privateKey); err == nil {
-		_, err := ssh.ParsePrivateKey(decoded)
-		return err == nil
-	}
-
-	return false
+	// Unrecognised shape: keep the finding rather than silently dropping it.
+	return true, "Crypto (unverified)"
 }
 
-// ExtractSSHKeys extracts potential SSH private keys from text content
-func ExtractSSHKeys(content string) []string {
-	var keys []string
-	lines := strings.Split(content, "\n")
-
-	var currentKey strings.Builder
-	inKeyBlock := false
-	keyType := ""
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-
-		// Check for key block start
-		for _, keyStart := range []string{
-			"-----BEGIN RSA PRIVATE KEY-----",
-			"-----BEGIN DSA PRIVATE KEY-----",
-			"-----BEGIN EC PRIVATE KEY-----",
-			"-----BEGIN OPENSSH PRIVATE KEY-----",
-			"-----BEGIN PRIVATE KEY-----",
-		} {
-			if strings.HasPrefix(line, keyStart) {
-				inKeyBlock = true
-				keyType = keyStart
-				currentKey.Reset()
-				currentKey.WriteString(line)
-				currentKey.WriteString("\n")
-				break
-			}
-		}
-
-		// Check for key block end
-		if inKeyBlock {
-			endMarker := strings.Replace(keyType, "BEGIN", "END", 1)
-			if strings.HasPrefix(line, endMarker) {
-				currentKey.WriteString(line)
-				keys = append(keys, currentKey.String())
-				inKeyBlock = false
-				currentKey.Reset()
-				continue
-			}
-
-			// Add line to current key
-			currentKey.WriteString(line)
-			currentKey.WriteString("\n")
-		}
+// isEVMKeyFormat reports whether s is a 64-character hex string.
+func isEVMKeyFormat(s string) bool {
+	if len(s) != 64 {
+		return false
 	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
 
-	return keys
+// isWIFKeyFormat reports whether s has the shape of a mainnet Bitcoin WIF key:
+// 51-52 characters beginning with K, L (compressed) or 5 (uncompressed).
+func isWIFKeyFormat(s string) bool {
+	if len(s) < 51 || len(s) > 52 {
+		return false
+	}
+	switch s[0] {
+	case 'K', 'L', '5':
+		return true
+	default:
+		return false
+	}
 }
 
 // SendMatchWebhook sends a match alert to a configured webhook. It builds a
@@ -539,7 +546,7 @@ func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, m
 	}
 
 	// For filename-based matches, show the filename if no content matches
-	if len(matchesStr) == 0 || matchesStr == "" {
+	if matchesStr == "" {
 		matchesStr = fmt.Sprintf("Filename: %s", file)
 	}
 
@@ -558,9 +565,16 @@ func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, m
 		githubLink = generateGitHubBlobLinkNoAnchor(url, file)
 	}
 
+	// Check if we should ping for this match (AI keys, DB connection strings)
+	shouldPing := shouldPingForMatch(signature)
+	userMention := ""
+	if shouldPing {
+		userMention = "<@995923917594173440>\n"
+	}
+
 	// Enhanced message format with clear signature match display
-	message := fmt.Sprintf("**%s** | Priority: %d\n**File:** [%s](%s)\n**Repository:** %s\n\n```\n%s\n```",
-		signature, priority, file, githubLink, url, matchesStr)
+	message := fmt.Sprintf("%s**%s** | Priority: %d\n**File:** [%s](%s)\n**Repository:** %s\n\n```\n%s\n```",
+		userMention, signature, priority, file, githubLink, url, matchesStr)
 
 	// For .env files, embed FULL file content (match all .env variants)
 	isEnvFile := fileContent != "" && (strings.HasSuffix(strings.ToLower(file), ".env") ||
@@ -581,17 +595,48 @@ func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, m
 	}
 	payload := fmt.Sprintf(webhookPayload, message)
 
-	resp, err := httpClient.Post(webhookURL, "application/json", strings.NewReader(payload))
-	if err != nil {
-		Say("[ERROR] Generic webhook POST failed: %v\n", err)
-		return
-	}
-	defer resp.Body.Close()
+	// Deliver through the shared queue so a generic endpoint gets the same
+	// deduplication, spacing and retry as Discord. This used to POST inline,
+	// which meant Slack or a custom endpoint had none of that.
+	GetWebhookQueue().Enqueue(webhookURL, payload)
+}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		Say("[ERROR] Generic webhook returned %d: %s\n", resp.StatusCode, string(body))
+// shouldPingForMatch returns true if the signature should trigger a Discord mention
+// This is used for high-priority items like AI API keys and database connection strings
+func shouldPingForMatch(signature string) bool {
+	sigLower := strings.ToLower(signature)
+	// AI API key patterns (all get pinged)
+	aiPatterns := []string{
+		"api key", "anthropic", "openai", "claude", "deepseek", "mistral",
+		"huggingface", "hf ", "together", "replicate", "perplexity", "cohere",
+		"gemini", "bard", "ollama", "groq", "xai", "grok", "zhipu", "glm",
+		"azure openai", "vertex ai", "makersuite", "palm", "llama", "moonshot",
+		"kimi", "siliconflow", "sambanova", "qwen", "fireworks", "elevenlabs",
+		"assemblyai", "deepgram", "anyscale", "aleph", "ai21", "davinci",
+		"codex", "gpt-", "gpt3", "gpt4", "stability", "nvidia", "cerebras",
+		"cloudflare", "workers", "stripe", "twilio", "sendgrid", "mailgun",
+		"resend", "postmark", "hubspot", "zendesk", "intercom", "brevo", "loops",
 	}
+	// DB connection string patterns (all get pinged)
+	dbPatterns := []string{
+		"connection string", "connection_string", "database connection",
+		"db_connection", "db_url", "database_url", "db password", "db_password",
+		"database password", "database_password", "root password", "root_password",
+		"postgres", "postgresql", "mysql", "mongodb", "redis", "mariadb",
+		"sqlite", "mssql", "oracle",
+	}
+
+	for _, p := range aiPatterns {
+		if strings.Contains(sigLower, p) {
+			return true
+		}
+	}
+	for _, p := range dbPatterns {
+		if strings.Contains(sigLower, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // sendDiscordMatchWebhook sends a match alert as a rich Discord embed via the webhook queue.
@@ -603,6 +648,13 @@ func sendDiscordMatchWebhook(webhookURL string, url string, signature string, fi
 	matchesStr := strings.Join(matches, ", ")
 	if len(matchesStr) > 2048 {
 		matchesStr = matchesStr[:2045] + "..."
+	}
+
+	// Check if we should ping for this match (AI keys, DB connection strings)
+	shouldPing := shouldPingForMatch(signature)
+	userMention := ""
+	if shouldPing {
+		userMention = "<@995923917594173440>\n"
 	}
 
 	// Create Discord embed payload
@@ -701,7 +753,8 @@ func sendDiscordMatchWebhook(webhookURL string, url string, signature string, fi
 	}
 
 	payload := map[string]interface{}{
-		"embeds": []map[string]interface{}{embed},
+		"content": userMention,
+		"embeds":  []map[string]interface{}{embed},
 	}
 
 	jsonPayload, err := json.Marshal(payload)
@@ -822,6 +875,8 @@ func parseColorHex(hexColor string) int {
 
 	// Convert hex to int
 	var colorInt int
-	fmt.Sscanf(hexColor, "%x", &colorInt)
+	if _, err := fmt.Sscanf(hexColor, "%x", &colorInt); err != nil {
+		return 15158332 // Red
+	}
 	return colorInt
 }

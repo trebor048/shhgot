@@ -28,10 +28,3 @@ func (pm *ProgressManager) IncrementRateLimited() {
 		pm.OnRateLimited()
 	}
 }
-
-// GitProgressWriter is a no-op progress writer.
-type GitProgressWriter struct{}
-
-func (w *GitProgressWriter) Write(p []byte) (n int, err error) {
-	return len(p), nil
-}

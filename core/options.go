@@ -25,6 +25,8 @@ type Options struct {
 	ConfigPath             *string
 	TestTokens             *bool
 	ScanKeys               *string
+	LowImpact              *bool
+	DryRun                 *bool
 }
 
 func ParseOptions() (*Options, error) {
@@ -47,6 +49,8 @@ func ParseOptions() (*Options, error) {
 		ConfigPath:             flag.String("config-path", "", "Searches for config.yaml from given directory. If not set, tries to find if from shhgit binary's and current directory"),
 		TestTokens:             flag.Bool("test-tokens", false, "Test Claude/OpenAI tokens from config and save valid ones to logs/priority3.log"),
 		ScanKeys:               flag.String("scan-keys", "", "Scan a directory for API keys and validate them"),
+		LowImpact:              flag.Bool("low-impact", false, "Reduce CPU priority and worker count so a scan does not make the machine unusable"),
+		DryRun:                 flag.Bool("dry-run", false, "With --local, report what would be scanned and what the blacklists and size caps drop, then exit without reading any file"),
 	}
 
 	// Mode flags are consumed by the main package's mode system (modes.go).

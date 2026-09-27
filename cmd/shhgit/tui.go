@@ -38,6 +38,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/trebor048/shhgot/core"
 	"golang.org/x/term"
 )
 
@@ -106,6 +107,40 @@ func AddTUIToken(token string, valid bool, provider string) {
 // SetTUIStatus replaces the scanner status shown in the header. It never blocks
 // and is safe to call at any time.
 func SetTUIStatus(s TUIStatus) { tuiState.setStatus(s) }
+
+// lastTUIStatus lets refreshTUIStatusFromScanner skip a redundant poke when
+// nothing changed.
+var lastTUIStatus TUIStatus
+
+// refreshTUIStatusFromScanner copies the scanner's live progress and the last
+// GitHub rate reading into the header. Without this the header's "repos"/"api"
+// counters and the status line were never written by the scanner and read zero
+// for the whole run.
+func refreshTUIStatusFromScanner() {
+	snap := core.GlobalScanProgress.GetSnapshot()
+
+	var next TUIStatus
+	if n, ok := snap["repos_scanned"].(int64); ok {
+		next.ReposScanned = int(n)
+	}
+	if repo, _ := snap["current_repo"].(string); repo != "" {
+		next.Message = "scanning " + repo
+	} else if snap["is_scanning"] == true {
+		next.Message = "scanning"
+	} else {
+		next.Message = "waiting for work"
+	}
+	if remaining, reset := core.APIRate(); remaining > 0 || !reset.IsZero() {
+		next.RequestsRemaining = remaining
+		next.RateLimitReset = reset
+	}
+
+	if next == lastTUIStatus {
+		return
+	}
+	lastTUIStatus = next
+	SetTUIStatus(next)
+}
 
 // SetTUIReview attaches (or replaces) the AI review text for one finding, as
 // identified by TUIMatch.ID. Pass running true while the model is still
@@ -1317,7 +1352,7 @@ func tuiStatusLine(v *tuiView) tuiLine {
 	if !v.status.RateLimitReset.IsZero() && v.status.RateLimitReset.After(v.now) {
 		dockText = "rate limit resets in " + tuiDuration(v.status.RateLimitReset.Sub(v.now))
 		dockSGR = tuiSGRYellow
-	} else if !v.now.IsZero() && v.uptime > 0 {
+	} else if v.uptime > 0 {
 		dockText = "up " + tuiDuration(v.uptime)
 	}
 	msgWidth := v.width - 1
@@ -2638,6 +2673,7 @@ func StartTUI() error {
 
 		case <-ticker.C:
 			ui.spin++
+			refreshTUIStatusFromScanner()
 			resized := false
 			if nw, nh, err := term.GetSize(outFD); err == nil && (nw != w || nh != h) {
 				w, h, resized = nw, nh, true

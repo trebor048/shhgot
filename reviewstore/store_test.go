@@ -161,7 +161,7 @@ func TestCreateHonoursSuppliedIDAndTimestamps(t *testing.T) {
 func TestListOrderingAndCount(t *testing.T) {
 	s, _ := newTestStore(t)
 
-	if got := s.Count(); got != 0 {
+	if got := len(s.List()); got != 0 {
 		t.Fatalf("Count() on empty store = %d, want 0", got)
 	}
 	if got := s.List(); len(got) != 0 {
@@ -180,7 +180,7 @@ func TestListOrderingAndCount(t *testing.T) {
 		ids[i] = r.ID
 	}
 
-	if got := s.Count(); got != n {
+	if got := len(s.List()); got != n {
 		t.Fatalf("Count() = %d, want %d", got, n)
 	}
 
@@ -351,7 +351,7 @@ func TestDeleteRemovesIndexEntryAndFile(t *testing.T) {
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("review file still present after Delete: stat err = %v", err)
 	}
-	if got := s.Count(); got != 1 {
+	if got := len(s.List()); got != 1 {
 		t.Errorf("Count() = %d, want 1", got)
 	}
 	for _, r := range s.List() {
@@ -373,7 +373,7 @@ func TestDeleteRemovesIndexEntryAndFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore(reopen): %v", err)
 	}
-	if got := reopened.Count(); got != 1 {
+	if got := len(reopened.List()); got != 1 {
 		t.Errorf("Count() after reopen = %d, want 1", got)
 	}
 	if _, ok := reopened.Get(drop.ID); ok {
@@ -472,7 +472,7 @@ func TestInvalidIDsAreRejected(t *testing.T) {
 			if err := s.AppendMessage(id, Message{Role: "user"}); !errors.Is(err, os.ErrNotExist) {
 				t.Errorf("AppendMessage(%q) error = %v, want errors.Is(err, os.ErrNotExist)", id, err)
 			}
-			if got := s.Count(); got != 0 {
+			if got := len(s.List()); got != 0 {
 				t.Errorf("Count() = %d after rejected ids, want 0", got)
 			}
 
@@ -679,7 +679,7 @@ func TestConcurrentAccess(t *testing.T) {
 					errCh <- fmt.Errorf("reader %d: List() is empty while reviews exist", i)
 					return
 				}
-				if n := s.Count(); n < 1 {
+				if n := len(s.List()); n < 1 {
 					errCh <- fmt.Errorf("reader %d: Count() = %d", i, n)
 					return
 				}
@@ -693,7 +693,7 @@ func TestConcurrentAccess(t *testing.T) {
 		t.Errorf("concurrent access: %v", err)
 	}
 
-	if got, want := s.Count(), workers+1; got != want {
+	if got, want := len(s.List()), workers+1; got != want {
 		t.Fatalf("Count() = %d, want %d", got, want)
 	}
 	for i := 0; i < workers; i++ {
@@ -726,7 +726,7 @@ func TestConcurrentAccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore(reopen): %v", err)
 	}
-	if got, want := reopened.Count(), workers+1; got != want {
+	if got, want := len(reopened.List()), workers+1; got != want {
 		t.Errorf("Count() after reopen = %d, want %d", got, want)
 	}
 	if got, want := len(reopened.List()), workers+1; got != want {
@@ -765,7 +765,7 @@ func TestCorruptionTolerance(t *testing.T) {
 	if len(list) != 2 {
 		t.Fatalf("List() = %d reviews, want 2 (corrupt files must be ignored): %+v", len(list), list)
 	}
-	if got := s.Count(); got != 2 {
+	if got := len(s.List()); got != 2 {
 		t.Errorf("Count() = %d, want 2", got)
 	}
 	for _, r := range list {
@@ -783,7 +783,7 @@ func TestCorruptionTolerance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore over a corrupt directory: %v", err)
 	}
-	if got := reopened.Count(); got != 2 {
+	if got := len(reopened.List()); got != 2 {
 		t.Errorf("Count() after reopen = %d, want 2", got)
 	}
 	got, ok := reopened.Get(first.ID)
@@ -819,7 +819,7 @@ func TestPartsOfAnInterruptedWriteAreIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	if got := reopened.Count(); got != 1 {
+	if got := len(reopened.List()); got != 1 {
 		t.Fatalf("Count() = %d, want 1 (temp files are not reviews)", got)
 	}
 	if _, ok := reopened.Get("ghost"); ok {
@@ -916,7 +916,7 @@ func TestNewStoreOverExistingDirectoryAndErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore(again): %v", err)
 	}
-	if got := again.Count(); got != 1 {
+	if got := len(again.List()); got != 1 {
 		t.Errorf("Count() = %d, want 1", got)
 	}
 }

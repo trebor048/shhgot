@@ -132,10 +132,19 @@ const (
 	ProviderUnknown     = "Unknown"
 )
 
+// tokenTestResult is the cached outcome of validating one token. Its presence
+// in TokenValidator.testedTokens is what "has been tested" means; the value
+// carries the verdict so a later duplicate match can be accepted or dropped
+// without a second network round-trip.
+type tokenTestResult struct {
+	valid    bool
+	provider string
+}
+
 // TokenValidator handles validation of AI API tokens and other secrets
 type TokenValidator struct {
 	logger       *Logger
-	testedTokens map[string]bool
+	testedTokens map[string]tokenTestResult
 	mutex        sync.Mutex
 	httpClient   *http.Client
 
@@ -152,7 +161,7 @@ type TokenValidator struct {
 func NewTokenValidator(logger *Logger) *TokenValidator {
 	return &TokenValidator{
 		logger:       logger,
-		testedTokens: make(map[string]bool),
+		testedTokens: make(map[string]tokenTestResult),
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},
@@ -178,20 +187,6 @@ func (tv *TokenValidator) waitForRateLimit() {
 	tv.lastRequest = time.Now()
 }
 
-// HasBeenTested checks if a token has already been tested
-func (tv *TokenValidator) HasBeenTested(token string) bool {
-	tv.mutex.Lock()
-	defer tv.mutex.Unlock()
-	return tv.testedTokens[token]
-}
-
-// MarkAsTested marks a token as tested
-func (tv *TokenValidator) MarkAsTested(token string) {
-	tv.mutex.Lock()
-	defer tv.mutex.Unlock()
-	tv.testedTokens[token] = true
-}
-
 // CRITICAL PERFORMANCE FIX: Pre-compile all token extraction regexes at package init
 // This avoids compiling 40+ regexes on EVERY match, which was causing massive slowdown
 var (
@@ -210,20 +205,15 @@ var (
 	cohereRegex     = regexp.MustCompile(`[A-Za-z0-9]{40}(_[A-Za-z0-9]{10,})?`)
 	ai21Regex       = regexp.MustCompile(`[A-Za-z0-9]{32}`)
 	elevenRegex     = regexp.MustCompile(`sk_[a-z0-9]{48}`)
-	togetherRegex   = regexp.MustCompile(`sk-[a-zA-Z0-9]{86}`)
 	sambaRegex      = regexp.MustCompile(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
 	fireworksRegex  = regexp.MustCompile(`[A-Za-z0-9]{48}`)
-	pineconeRegex   = regexp.MustCompile(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
-	stabilityRegex  = regexp.MustCompile(`sk-[a-zA-Z0-9]{40,}`)
 	assemblyRegex   = regexp.MustCompile(`[a-f0-9]{32}`)
-	deepgramRegex   = regexp.MustCompile(`[a-f0-9]{40}`)
 	azureRegex      = regexp.MustCompile(`[a-f0-9]{32}`)
 
 	// Cloud Providers
 	awsRegex       = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
 	awsSecretRegex = regexp.MustCompile(`[A-Za-z0-9/+=]{40}`)
 	doRegex        = regexp.MustCompile(`dop_v1_[a-f0-9]{64}`)
-	herokuRegex    = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 	cfRegex        = regexp.MustCompile(`[A-Za-z0-9_-]{40}`)
 	vercelRegex    = regexp.MustCompile(`[A-Za-z0-9]{24}`)
 
@@ -241,7 +231,6 @@ var (
 	twilioRegex   = regexp.MustCompile(`SK[0-9a-f]{32}`)
 	sendgridRegex = regexp.MustCompile(`SG\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}`)
 	mailgunRegex  = regexp.MustCompile(`key-[a-f0-9]{32}`)
-	postmarkRegex = regexp.MustCompile(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
 	pusherRegex   = regexp.MustCompile(`[a-f0-9]{20}`)
 	pubnubRegex   = regexp.MustCompile(`pub-c-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
 
@@ -371,11 +360,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 		addUnique(t)
 	}
 
-	// 15. Together AI (sk-... with specific length)
-	for _, t := range togetherRegex.FindAllString(match, -1) {
-		addUnique(t)
-	}
-
 	// 16. SambaNova
 	for _, t := range sambaRegex.FindAllString(match, -1) {
 		addUnique(t)
@@ -388,26 +372,9 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 		}
 	}
 
-	// 18. Pinecone
-	for _, t := range pineconeRegex.FindAllString(match, -1) {
-		addUnique(t)
-	}
-
-	// 19. Stability AI
-	for _, t := range stabilityRegex.FindAllString(match, -1) {
-		addUnique(t)
-	}
-
 	// 20. AssemblyAI
 	for _, t := range assemblyRegex.FindAllString(match, -1) {
 		addUnique(t)
-	}
-
-	// 21. Deepgram
-	for _, t := range deepgramRegex.FindAllString(match, -1) {
-		if len(t) == 40 {
-			addUnique(t)
-		}
 	}
 
 	// 22. Azure OpenAI
@@ -435,11 +402,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 
 	// 25. DigitalOcean
 	for _, t := range doRegex.FindAllString(match, -1) {
-		addUnique(t)
-	}
-
-	// 26. Heroku
-	for _, t := range herokuRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
@@ -517,11 +479,6 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 
 	// 39. Mailgun
 	for _, t := range mailgunRegex.FindAllString(match, -1) {
-		addUnique(t)
-	}
-
-	// 40. Postmark
-	for _, t := range postmarkRegex.FindAllString(match, -1) {
 		addUnique(t)
 	}
 
@@ -765,8 +722,11 @@ func (tv *TokenValidator) DetectProvider(token string) string {
 		// "sk-" and are 64+ chars, so the generic case swallowed them and they
 		// were validated against OpenAI endpoints (and always reported invalid).
 		return ProviderOpenRouter
+	case strings.HasPrefix(token, "sk_"):
+		// ElevenLabs keys use "sk_" (underscore), distinct from OpenAI's "sk-".
+		return ProviderElevenLabs
 	case strings.HasPrefix(token, "sk-") && len(token) > 20:
-		// Could be OpenAI, DeepSeek, Together, Stability, etc.
+		// Could be OpenAI, DeepSeek, Together, etc.
 		if FastMatch("deepseek_key", token) {
 			return ProviderDeepSeek
 		}
@@ -1057,60 +1017,6 @@ func (tv *TokenValidator) ValidateElevenLabsToken(token string) (bool, string, s
 	return false, ProviderElevenLabs, fmt.Sprintf("Invalid (%d)", resp.StatusCode)
 }
 
-// ValidateStabilityToken validates Stability AI
-func (tv *TokenValidator) ValidateStabilityToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
-	req, _ := http.NewRequest("GET", "https://api.stability.ai/v1/user/account", nil)
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-
-	resp, err := tv.httpClient.Do(req)
-	if err != nil {
-		return false, ProviderStability, fmt.Sprintf("Net Err: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		return true, ProviderStability, "Valid Stability AI Token"
-	}
-	return false, ProviderStability, fmt.Sprintf("Invalid (%d)", resp.StatusCode)
-}
-
-// ValidateAssemblyAIToken validates AssemblyAI
-func (tv *TokenValidator) ValidateAssemblyAIToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
-	req, _ := http.NewRequest("GET", "https://api.assemblyai.com/v2/account", nil)
-	req.Header.Set("Authorization", token)
-
-	resp, err := tv.httpClient.Do(req)
-	if err != nil {
-		return false, ProviderAssemblyAI, fmt.Sprintf("Net Err: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		return true, ProviderAssemblyAI, "Valid AssemblyAI Token"
-	}
-	return false, ProviderAssemblyAI, fmt.Sprintf("Invalid (%d)", resp.StatusCode)
-}
-
-// ValidateDeepgramToken validates Deepgram
-func (tv *TokenValidator) ValidateDeepgramToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
-	req, _ := http.NewRequest("GET", "https://api.deepgram.com/v1/projects", nil)
-	req.Header.Set("Authorization", fmt.Sprintf("Token %s", token))
-
-	resp, err := tv.httpClient.Do(req)
-	if err != nil {
-		return false, ProviderDeepgram, fmt.Sprintf("Net Err: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		return true, ProviderDeepgram, "Valid Deepgram Token"
-	}
-	return false, ProviderDeepgram, fmt.Sprintf("Invalid (%d)", resp.StatusCode)
-}
-
 // ValidateGithubToken validates GitHub PAT
 func (tv *TokenValidator) ValidateGithubToken(token string) (bool, string, string) {
 	tv.waitForRateLimit()
@@ -1133,22 +1039,49 @@ func (tv *TokenValidator) ValidateGithubToken(token string) (bool, string, strin
 	return false, ProviderGithub, fmt.Sprintf("Invalid (%d)", resp.StatusCode)
 }
 
-// ValidateDiscordToken validates Discord Bot/User Token
+// discordAPIBase is overridable so the validation flow can be exercised against
+// a local test server.
+var discordAPIBase = "https://discord.com/api/v10"
+
+// ValidateDiscordToken validates a Discord bot or user token.
+//
+// Discord bot tokens must be sent as "Bot <token>"; user (OAuth) tokens go in
+// the header bare. This used to send the bare token for both, so every valid
+// bot token came back 401 and was reported invalid. The two schemes are tried
+// in turn, and only an auth failure (401/403) triggers the second attempt.
 func (tv *TokenValidator) ValidateDiscordToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
-	req, _ := http.NewRequest("GET", "https://discord.com/api/users/@me", nil)
-	req.Header.Set("Authorization", token)
+	schemes := []string{"Bot ", ""}
+	lastMsg := "Invalid Discord Token"
 
-	resp, err := tv.httpClient.Do(req)
-	if err != nil {
-		return false, ProviderDiscord, fmt.Sprintf("Net Err: %v", err)
-	}
-	defer resp.Body.Close()
+	for _, prefix := range schemes {
+		tv.waitForRateLimit()
 
-	if resp.StatusCode == 200 {
-		return true, ProviderDiscord, "Valid Discord Token"
+		req, err := http.NewRequest("GET", discordAPIBase+"/users/@me", nil)
+		if err != nil {
+			return false, ProviderDiscord, fmt.Sprintf("Req Err: %v", err)
+		}
+		req.Header.Set("Authorization", prefix+token)
+		req.Header.Set("User-Agent", fmt.Sprintf("%s v%s", Name, Version))
+
+		resp, err := tv.httpClient.Do(req)
+		if err != nil {
+			return false, ProviderDiscord, fmt.Sprintf("Net Err: %v", err)
+		}
+
+		if resp.StatusCode == 200 {
+			resp.Body.Close()
+			return true, ProviderDiscord, "Valid Discord Token"
+		}
+		lastMsg = fmt.Sprintf("Invalid (%d)", resp.StatusCode)
+		resp.Body.Close()
+
+		// A non-auth failure (e.g. 429 or 5xx) will not be fixed by swapping the
+		// scheme, so stop rather than burn a second request.
+		if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+			break
+		}
 	}
-	return false, ProviderDiscord, fmt.Sprintf("Invalid (%d)", resp.StatusCode)
+	return false, ProviderDiscord, lastMsg
 }
 
 // ValidateSlackToken validates Slack Bot/User Token
@@ -1290,59 +1223,6 @@ func (tv *TokenValidator) ValidateDigitalOceanToken(token string) (bool, string,
 	return false, ProviderDigitalOcean, fmt.Sprintf("Invalid (%d)", resp.StatusCode)
 }
 
-// ValidateHerokuToken validates Heroku API Key
-func (tv *TokenValidator) ValidateHerokuToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
-	req, _ := http.NewRequest("GET", "https://api.heroku.com/account", nil)
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-	req.Header.Set("Accept", "application/vnd.heroku+json; version=3")
-
-	resp, err := tv.httpClient.Do(req)
-	if err != nil {
-		return false, ProviderHeroku, fmt.Sprintf("Net Err: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		return true, ProviderHeroku, "Valid Heroku Token"
-	}
-	return false, ProviderHeroku, fmt.Sprintf("Invalid (%d)", resp.StatusCode)
-}
-
-// ValidateShodanToken validates Shodan API Key
-func (tv *TokenValidator) ValidateShodanToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
-	url := fmt.Sprintf("https://api.shodan.io/api-info?key=%s", token)
-
-	resp, err := tv.httpClient.Get(url)
-	if err != nil {
-		return false, ProviderShodan, fmt.Sprintf("Net Err: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		return true, ProviderShodan, "Valid Shodan Key"
-	}
-	return false, ProviderShodan, fmt.Sprintf("Invalid (%d)", resp.StatusCode)
-}
-
-// ValidateIPInfoToken validates IPInfo API Key
-func (tv *TokenValidator) ValidateIPInfoToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
-	url := fmt.Sprintf("https://ipinfo.io/me?token=%s", token)
-
-	resp, err := tv.httpClient.Get(url)
-	if err != nil {
-		return false, ProviderIPInfo, fmt.Sprintf("Net Err: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		return true, ProviderIPInfo, "Valid IPInfo Key"
-	}
-	return false, ProviderIPInfo, fmt.Sprintf("Invalid (%d)", resp.StatusCode)
-}
-
 // ValidateJWT checks if a string is a valid JWT format
 func (tv *TokenValidator) ValidateJWT(token string) (bool, string, string) {
 	parts := strings.Split(token, ".")
@@ -1381,12 +1261,6 @@ func (tv *TokenValidator) ValidateToken(token string) (bool, string, string) {
 		return tv.ValidateReplicateToken(token)
 	case ProviderElevenLabs:
 		return tv.ValidateElevenLabsToken(token)
-	case ProviderStability:
-		return tv.ValidateStabilityToken(token)
-	case ProviderAssemblyAI:
-		return tv.ValidateAssemblyAIToken(token)
-	case ProviderDeepgram:
-		return tv.ValidateDeepgramToken(token)
 	case ProviderGithub:
 		return tv.ValidateGithubToken(token)
 	case ProviderDiscord:
@@ -1407,12 +1281,6 @@ func (tv *TokenValidator) ValidateToken(token string) (bool, string, string) {
 		return tv.ValidateSendGridToken(token)
 	case ProviderDigitalOcean:
 		return tv.ValidateDigitalOceanToken(token)
-	case ProviderHeroku:
-		return tv.ValidateHerokuToken(token)
-	case ProviderShodan:
-		return tv.ValidateShodanToken(token)
-	case ProviderIPInfo:
-		return tv.ValidateIPInfoToken(token)
 	case ProviderJWT:
 		return tv.ValidateJWT(token)
 	default:
@@ -1456,12 +1324,18 @@ func (tv *TokenValidator) maskToken(token string) string {
 	return token[:8] + "..." + token[len(token)-4:]
 }
 
-// TestAndLogToken tests a single token and logs the result
-func (tv *TokenValidator) TestAndLogToken(token string, sigColor string) {
-	if tv.HasBeenTested(token) {
-		return
+// TestAndLogToken tests a single token, logs the outcome and returns whether it
+// is valid. The verdict is cached, so a repeated match for the same token is
+// answered from the cache instead of re-hitting the provider.
+func (tv *TokenValidator) TestAndLogToken(token string, sigColor string) bool {
+	tv.mutex.Lock()
+	if res, ok := tv.testedTokens[token]; ok {
+		tv.mutex.Unlock()
+		return res.valid
 	}
-	tv.MarkAsTested(token)
+	// Reserve the token so a concurrent worker does not start a second call.
+	tv.testedTokens[token] = tokenTestResult{valid: true}
+	tv.mutex.Unlock()
 
 	displayToken := token
 	if len(token) > 20 {
@@ -1470,24 +1344,32 @@ func (tv *TokenValidator) TestAndLogToken(token string, sigColor string) {
 
 	// Pre-detect provider for logging
 	providerHint := tv.DetectProvider(token)
-	tv.logger.Info("🔍 Testing [%s]: %s", providerHint, displayToken)
+	if tv.logger != nil {
+		tv.logger.Info("🔍 Testing [%s]: %s", providerHint, displayToken)
+	}
 
 	valid, provider, response := tv.ValidateToken(token)
+
+	tv.mutex.Lock()
+	tv.testedTokens[token] = tokenTestResult{valid: valid, provider: provider}
+	tv.mutex.Unlock()
 
 	if valid {
 		color := sigColor
 		if color == "" {
 			color = "#10A37F"
 		}
-		tv.logger.LogWithColor(color, "✓ %s token is VALID!", provider)
-		tv.logger.Important("Response: %s", response)
+		if tv.logger != nil {
+			tv.logger.LogWithColor(color, "✓ %s token is VALID!", provider)
+			tv.logger.Important("Response: %s", response)
 
-		if err := tv.SaveValidToken(token, provider, response); err != nil {
-			tv.logger.Error("Failed to save valid token: %v", err)
-		} else {
-			tv.logger.Important("✅ Valid token saved to logs/priority3.log")
+			if err := tv.SaveValidToken(token, provider, response); err != nil {
+				tv.logger.Error("Failed to save valid token: %v", err)
+			} else {
+				tv.logger.Important("✅ Valid token saved to logs/priority3.log")
+			}
 		}
-	} else {
+	} else if tv.logger != nil {
 		tv.logger.LogWithColor("#FF0000", "✗ %s token is INVALID", provider)
 		tv.logger.Warn("Response: %s", response)
 	}
@@ -1500,6 +1382,8 @@ func (tv *TokenValidator) TestAndLogToken(token string, sigColor string) {
 		}
 		tv.OnTokenResult(masked, valid, provider)
 	}
+
+	return valid
 }
 
 // TestMatchedTokens extracts and tests tokens from a match

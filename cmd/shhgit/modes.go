@@ -17,9 +17,6 @@ const (
 	ModeWeb
 	// ModeTUI runs the interactive full-screen terminal UI.
 	ModeTUI
-	// ModeScanner is an explicit alias for ModeDefault, kept because it has always
-	// been documented; it behaves exactly like the default.
-	ModeScanner
 )
 
 // ModeConfig holds all mode configuration.
@@ -39,10 +36,7 @@ func splitFlagArg(arg string) (name, value string, hasValue bool) {
 	if len(arg) < 2 || arg[0] != '-' {
 		return "", "", false
 	}
-	trimmed := arg[1:]
-	if strings.HasPrefix(trimmed, "-") {
-		trimmed = trimmed[1:]
-	}
+	trimmed := strings.TrimPrefix(arg[1:], "-")
 	if trimmed == "" || trimmed == "-" {
 		return "", "", false
 	}
@@ -177,8 +171,6 @@ func (mc *ModeConfig) PrintModeInfo() {
 		fmt.Printf("   Address: http://%s:%s\n", mc.WebHost, mc.WebPort)
 	case ModeTUI:
 		fmt.Printf("🖥️  Mode: Terminal UI (interactive) - press ? for keys, q to quit\n")
-	case ModeScanner:
-		fmt.Printf("🔍 Mode: Scanner Only (plain terminal output)\n")
 	default:
 		fmt.Printf("📟 Mode: Terminal (live match feed)\n")
 	}

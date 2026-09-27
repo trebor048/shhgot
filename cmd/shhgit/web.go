@@ -136,7 +136,7 @@ var (
 	fileMu            sync.Mutex
 	fileDetails       = make(map[string]*MatchFileDetail)
 	fileOrder         []string
-	maxFileDetails    = 300
+	maxFileDetails    = 100
 	maxStoreFileBytes = 128 * 1024
 )
 
@@ -239,8 +239,17 @@ var (
 )
 
 // broadcastFeed marshals an event and non-blocking sends it to every
-// connected dashboard (dropped for slow clients).
+// connected dashboard (dropped for slow clients). With no dashboard attached
+// there is nothing to send, so the marshal - the expensive part, run for every
+// log line - is skipped entirely.
 func broadcastFeed(ev FeedEvent) {
+	feedMu.Lock()
+	if len(feedClients) == 0 {
+		feedMu.Unlock()
+		return
+	}
+	feedMu.Unlock()
+
 	data, err := json.Marshal(ev)
 	if err != nil {
 		return
@@ -253,6 +262,19 @@ func broadcastFeed(ev FeedEvent) {
 		}
 	}
 	feedMu.Unlock()
+}
+
+// configureWebLimits applies the performance.max_* ring-buffer caps. They are
+// package vars read by the hub and the stores, so this must run before the web
+// server starts.
+func configureWebLimits(p core.PerformanceConfig) {
+	maxMatches = p.Int(p.MaxMatches, maxMatches)
+	maxLogs = p.Int(p.MaxLogLines, maxLogs)
+	maxTokens = p.Int(p.MaxTokenResults, maxTokens)
+	maxFileDetails = p.Int(p.MaxFileDetails, maxFileDetails)
+	if kb := p.Int(p.MaxFileDetailKB, 0); kb > 0 {
+		maxStoreFileBytes = kb * 1024
+	}
 }
 
 var ansiRe = regexp.MustCompile("[\u001B\u009B][[\\]()#;?]*(?:(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PRZcf-ntqry=><~]))")
@@ -316,27 +338,24 @@ func newWebHub() *WebHub {
 }
 
 func (h *WebHub) run() {
-	for {
-		select {
-		case match := <-h.broadcast:
-			h.matchesMutex.Lock()
-			h.matches = append(h.matches, match)
-			if len(h.matches) > maxMatches {
-				h.matches = h.matches[len(h.matches)-maxMatches:]
-			}
-
-			h.stats.TotalMatches++
-			h.stats.MatchesBySource[match.Source]++
-			h.stats.MatchesBySignature[match.Signature]++
-			h.stats.MatchesByPriority[match.Priority]++
-			h.stats.LastUpdated = time.Now()
-
-			h.updateTopSignatures()
-			statsCopy := h.stats.snapshot()
-			h.matchesMutex.Unlock()
-
-			broadcastFeed(FeedEvent{Type: "match", Match: match, Stats: &statsCopy})
+	for match := range h.broadcast {
+		h.matchesMutex.Lock()
+		h.matches = append(h.matches, match)
+		if len(h.matches) > maxMatches {
+			h.matches = h.matches[len(h.matches)-maxMatches:]
 		}
+
+		h.stats.TotalMatches++
+		h.stats.MatchesBySource[match.Source]++
+		h.stats.MatchesBySignature[match.Signature]++
+		h.stats.MatchesByPriority[match.Priority]++
+		h.stats.LastUpdated = time.Now()
+
+		h.updateTopSignatures()
+		statsCopy := h.stats.snapshot()
+		h.matchesMutex.Unlock()
+
+		broadcastFeed(FeedEvent{Type: "match", Match: match, Stats: &statsCopy})
 	}
 }
 
@@ -833,28 +852,16 @@ func registerRoutes(mux *http.ServeMux) {
 }
 
 // serveEmbeddedWeb serves the embedded web interface.
+//
+// Since the dashboard was rebuilt as a React SPA, "/" and "/assets/..." come
+// from the compiled bundle embedded in the binary (see serveWebUI in webui.go).
+// The original single-file dashboard is still embedded and remains the
+// fallback if that bundle is unavailable; it can also be requested explicitly
+// with ?legacy=1 or by setting SHHGIT_LEGACY_UI=1 for the whole process.
 func serveEmbeddedWeb(w http.ResponseWriter, r *http.Request) {
-	// Only "/" is the dashboard. Unknown paths used to receive a 200 carrying
-	// dashboard HTML, so a missing API route looked like success to any JSON
-	// client and typos were impossible to spot.
-	if r.URL.Path != "/" {
-		switch {
-		case r.URL.Path == "/favicon.ico":
-			w.WriteHeader(http.StatusNoContent)
-		case strings.HasPrefix(r.URL.Path, "/api/"):
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprintf(w, `{"error":"no such endpoint","path":%q}`, r.URL.Path)
-		default:
-			http.NotFound(w, r)
-		}
+	if uiLegacyRequested(r) {
+		serveLegacyDashboard(w, r)
 		return
 	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	// Never cache the dashboard: a stale cached copy from an older build has
-	// caused "matches not showing" reports when the new UI was already live.
-	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, dashboardHTML)
+	serveWebUI(w, r)
 }

@@ -163,9 +163,9 @@ func TestLogPresetsDoNotDuplicateMatchBlocks(t *testing.T) {
 // column out. All three box lines must occupy the same number of terminal cells.
 func TestLogCosmicBoxIsWidthSafe(t *testing.T) {
 	setLogFormat(LogFormatEvenMoreFancy)
-	out := captureStdout(t, func() {
-		cosmicBox(cosmicBorder, cosmicTitle, "🔥  🚨 LEGENDARY SECRET BREACH  🔥")
-	})
+	var sb strings.Builder
+	blogCosmicBox(&sb, cosmicBorder, cosmicTitle, "🔥  🚨 LEGENDARY SECRET BREACH  🔥")
+	out := sb.String()
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
 	if len(lines) != 3 {
 		t.Fatalf("cosmic box has %d lines, want 3:\n%s", len(lines), out)

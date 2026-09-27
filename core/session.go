@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/csv"
 	"fmt"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,36 +15,26 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// TokenValidationResult holds one token's validation outcome.
-type TokenValidationResult struct {
-	Token string
-	Valid bool
-	Error string
-}
-
 type Session struct {
-	sync.Mutex
-
-	Version                string
-	Log                    *Logger
-	Options                *Options
-	Config                 *Config
-	Signatures             []Signature
-	Repositories           chan GitResource
-	Gists                  chan string
-	Comments               chan Comment
-	Context                context.Context
-	Clients                chan *GitHubClientWrapper
-	ExhaustedClients       chan *GitHubClientWrapper
-	CsvWriter              *csv.Writer
-	MatchLogger            *MatchLogger
-	CleanupManager         *CleanupManager
-	TokenValidator         *TokenValidator
-	Progress               *ProgressManager
-	FoundTokens            map[string]bool
-	TokenMutex             sync.Mutex
-	RemovedTokens          map[string]bool
-	TokenValidationResults []TokenValidationResult
+	Version          string
+	Log              *Logger
+	Options          *Options
+	Config           *Config
+	Signatures       []Signature
+	Repositories     chan GitResource
+	Gists            chan string
+	Comments         chan Comment
+	Context          context.Context
+	Clients          chan *GitHubClientWrapper
+	ExhaustedClients chan *GitHubClientWrapper
+	CsvWriter        *csv.Writer
+	MatchLogger      *MatchLogger
+	CleanupManager   *CleanupManager
+	TokenValidator   *TokenValidator
+	Progress         *ProgressManager
+	FoundTokens      map[string]bool
+	TokenMutex       sync.Mutex
+	RemovedTokens    map[string]bool
 }
 
 var (
@@ -71,8 +60,6 @@ func MaskToken(token string) string {
 }
 
 func (s *Session) Start() {
-	rand.Seed(time.Now().Unix())
-
 	s.InitLogger()
 	s.InitProgress()
 	s.InitThreads()
@@ -89,7 +76,6 @@ func (s *Session) InitLogger() {
 	s.Log = &Logger{}
 	s.Log.SetDebug(*s.Options.Debug)
 	s.Log.SetSilent(*s.Options.Silent)
-	s.Log.SetConfig(s.Config)
 }
 
 func (s *Session) InitProgress() {
@@ -105,7 +91,6 @@ func (s *Session) InitGitHubClients() {
 		chanSize := *s.Options.Threads * (len(s.Config.GitHubAccessTokens) + 1)
 		s.Clients = make(chan *GitHubClientWrapper, chanSize)
 		s.ExhaustedClients = make(chan *GitHubClientWrapper, chanSize)
-		s.TokenValidationResults = make([]TokenValidationResult, 0)
 
 		// Don't validate tokens during init - they'll be tested on first use
 		// This prevents hangs on startup if GitHub is slow/down
@@ -115,14 +100,6 @@ func (s *Session) InitGitHubClients() {
 
 			client := github.NewClient(tc)
 			client.UserAgent = fmt.Sprintf("%s v%s", Name, Version)
-
-			// Mark as needing validation but add to pool immediately
-			s.TokenValidationResults = append(s.TokenValidationResults, TokenValidationResult{
-				// MaskToken, not token[:10]: a token shorter than ten characters
-				// in github_access_tokens used to panic here at startup.
-				Token: MaskToken(token),
-				Valid: true, // Assume valid; will be tested on use
-			})
 
 			for i := 0; i < *s.Options.Threads; i++ {
 				s.Clients <- &GitHubClientWrapper{client, token, time.Now().Add(-1 * time.Second)}
@@ -248,12 +225,44 @@ func (s *Session) RemoveUnauthorizedToken(token string) {
 }
 
 func (s *Session) InitThreads() {
+	low := s.lowImpact()
+
 	if *s.Options.Threads == 0 {
 		numCPUs := runtime.NumCPU()
+		if low && numCPUs > 2 {
+			// Leave half the machine free so the scan does not make it unusable.
+			numCPUs /= 2
+		}
 		s.Options.Threads = &numCPUs
 	}
 
-	runtime.GOMAXPROCS(*s.Options.Threads + 1)
+	// GOMAXPROCS bounds the whole process, not just the workers, so it is the
+	// lever that decides whether a scan starves the desktop. A normal run keeps
+	// one extra P of headroom; a low-impact run does not.
+	cpus := *s.Options.Threads
+	if !low {
+		cpus++
+	}
+	if cpus < 1 {
+		cpus = 1
+	}
+	runtime.GOMAXPROCS(cpus)
+
+	if low {
+		ReduceProcessPriority()
+	}
+}
+
+// lowImpact reports whether this run should trade throughput for a responsive
+// machine: --low-impact, or performance.low_impact in config.yaml.
+func (s *Session) lowImpact() bool {
+	if s.Options != nil && s.Options.LowImpact != nil && *s.Options.LowImpact {
+		return true
+	}
+	if s.Config != nil {
+		return s.Config.Performance.Bool(s.Config.Performance.LowImpact, false)
+	}
+	return false
 }
 
 func (s *Session) InitCsvWriter() {
@@ -360,6 +369,11 @@ func GetSession() *Session {
 		// (file/repo size caps, clone timeout). Must happen before Start(), whose
 		// workers capture these values.
 		session.Config.ApplyScanningOverrides(session.Options)
+
+		// Webhook pacing comes from config. Without this the queue used a
+		// hard-coded spacing value that its delivery loop never actually applied,
+		// so bursts of matches went out back-to-back and tripped Discord's limit.
+		ConfigureWebhookQueue(session.Config.WebhookQueue)
 
 		// Recreate the queue channels at the configured buffer sizes now that
 		// the config is parsed (no consumer has touched them yet). Absent or

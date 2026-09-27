@@ -498,13 +498,6 @@ func (s *Store) Delete(id string) error {
 	return nil
 }
 
-// Count returns the number of reviews currently held.
-func (s *Store) Count() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.index)
-}
-
 // path returns the on-disk path of a review, rejecting ids that could resolve
 // outside the store directory.
 func (s *Store) path(id string) (string, error) {
@@ -652,6 +645,13 @@ func writeAtomic(path string, r *Review) (err error) {
 	}
 	if rerr := os.Rename(tmpName, path); rerr != nil {
 		return fmt.Errorf("reviewstore: commit %q: %w", filepath.Base(path), rerr)
+	}
+	// Fsync the directory so the rename itself (the directory entry) is durable
+	// too; syncing only the file leaves the commit vulnerable to power loss.
+	// Best-effort: not every platform/filesystem supports it.
+	if d, derr := os.Open(dir); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	return nil
 }

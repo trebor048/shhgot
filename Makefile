@@ -1,9 +1,11 @@
 # ===========================================================================
 # shhgit — build, test and run targets
 #
-# The product is a single static Go binary built from cmd/shhgit. The dashboard
-# is embedded from cmd/shhgit/dashboard/index.html; there is no build step for
-# it and no JavaScript toolchain to install.
+# The product is a single static Go binary built from cmd/shhgit. The React
+# dashboard under cmd/shhgit/web is compiled to a bundle (committed under
+# cmd/shhgit/web/dist) and embedded with go:embed, so building the binary needs
+# no JavaScript toolchain. Rebuild that bundle with `make web` only after
+# changing the UI sources (requires Node 18+).
 #
 # The recipes use a POSIX shell. That is what make picks on Linux and macOS, and
 # on Windows it picks the sh.exe that ships with Git for Windows — which shhgit
@@ -47,7 +49,7 @@ endif
 
 .DEFAULT_GOAL := help
 .PHONY: help build build-one build-all test test-race race-run vet fmt fmt-check \
-        tidy clean run run-web run-tui run-terminal run-scanner scan test-tokens \
+        tidy web web-dev clean run run-web run-tui run-terminal run-scanner scan test-tokens \
         docker-build docker-up docker-down docker-logs
 
 help:
@@ -60,6 +62,8 @@ help:
 	@echo   fmt              Format all Go source
 	@echo   fmt-check        Fail if any Go file is unformatted
 	@echo   tidy             Tidy go.mod / go.sum
+	@echo   web              Rebuild the embedded React dashboard (npm ci + build)
+	@echo   web-dev          Run the dashboard dev server (proxies to :8080)
 	@echo   clean            Remove build output and test caches
 	@echo   run-web          Run the web dashboard on 127.0.0.1:8080
 	@echo   run-tui          Run the interactive terminal UI
@@ -115,6 +119,17 @@ fmt-check:
 
 tidy:
 	go mod tidy
+
+# --- Web dashboard ---------------------------------------------------------
+
+# Rebuild the bundle that is embedded into the binary. The bundle is committed,
+# so this is only needed after editing cmd/shhgit/web.
+web:
+	@cd cmd/shhgit/web && npm ci --no-audit --no-fund && npm run build
+
+# Dev server on :5173 proxying the API to a running `--web` instance on :8080.
+web-dev:
+	@cd cmd/shhgit/web && npm run dev
 
 clean:
 	-@rm -rf "$(DIST)" "$(BINARY)$(GOEXE)" run.log

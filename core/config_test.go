@@ -1,7 +1,7 @@
 package core
 
 import (
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -31,7 +31,7 @@ performance:
 github_access_tokens:
   - 'ghp_placeholder'
 `
-	if err := ioutil.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfg), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfg), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -91,7 +91,7 @@ scanning:
 github_access_tokens:
   - 'ghp_placeholder'
 `
-	if err := ioutil.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfg), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfg), 0644); err != nil {
 		t.Fatal(err)
 	}
 

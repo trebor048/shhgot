@@ -183,7 +183,7 @@ func TestScanProgressEndpointReturnsSnapshot(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	for _, key := range []string{"is_scanning", "progress", "repos_scanned", "files_processed", "matches_found", "speed", "estimated_time_remaining", "current_repo"} {
+	for _, key := range []string{"is_scanning", "progress", "repos_scanned", "files_processed", "matches_found", "speed", "current_repo"} {
 		if _, ok := snap[key]; !ok {
 			t.Errorf("scan progress snapshot is missing %q", key)
 		}

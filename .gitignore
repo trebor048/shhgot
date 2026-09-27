@@ -70,6 +70,12 @@ workspace.code-workspace
 node_modules/
 /frontend/
 
+# The rebuilt React dashboard lives in cmd/shhgit/web. Its compiled bundle is
+# committed (and go:embed-ed) so `go build` still needs no Node toolchain; only
+# the sources, lockfile and built dist are tracked.
+!cmd/shhgit/web/dist/
+!cmd/shhgit/web/dist/**
+
 # --- Local agent-harness state (never publish your own use) ---------------
 # Session replays, trajectories, evidence, plans and local workflow config.
 # These are personal tooling state, not shhgit content.

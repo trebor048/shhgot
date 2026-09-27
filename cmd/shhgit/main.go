@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -94,13 +93,6 @@ func isSignatureExcludedInMode(signature core.Signature, mode string) bool {
 }
 
 // isSignatureExcludedInMode checks if a signature should be excluded in the current mode
-
-// Shared across all presets
-var (
-	styleBold      = color.New(color.Bold).SprintFunc()
-	styleUnderline = color.New(color.Underline).SprintFunc()
-	styleItalic    = color.New(color.Italic).SprintFunc()
-)
 
 // ── stdout serialization helpers (prevents progress-area corruption) ──
 
@@ -269,7 +261,6 @@ var (
 	minFile    = color.New(color.FgYellow).SprintFunc()
 	minEntropy = color.New(color.FgMagenta).SprintFunc()
 	minDim     = color.New(color.Faint).SprintFunc()
-	minRepo    = color.New(color.FgHiMagenta, color.Bold).SprintFunc()
 	minLink    = color.New(color.FgHiBlue, color.Underline).SprintFunc()
 )
 
@@ -281,7 +272,6 @@ var (
 	fancyEntropy = color.New(color.FgHiMagenta, color.Bold).SprintFunc()
 	fancyAccent  = color.New(color.FgHiGreen, color.Bold).SprintFunc()
 	fancyArrow   = color.New(color.FgHiMagenta).SprintFunc()
-	fancyRepo    = color.New(color.FgHiMagenta, color.Bold, color.Underline).SprintFunc()
 	fancyLink    = color.New(color.FgHiCyan, color.Underline).SprintFunc()
 )
 
@@ -294,7 +284,6 @@ var (
 	ultraAccent  = color.New(color.FgHiGreen, color.Bold).SprintFunc()
 	ultraBadge   = color.New(color.FgBlack, color.BgHiCyan).SprintFunc()
 	ultraDanger  = color.New(color.FgBlack, color.BgHiRed).SprintFunc()
-	ultraRepo    = color.New(color.FgHiMagenta, color.BgHiBlack, color.Bold, color.Underline).SprintFunc()
 	ultraLink    = color.New(color.FgHiCyan, color.BgHiBlack, color.Bold).SprintFunc()
 )
 
@@ -307,8 +296,6 @@ var (
 	cosmicFile    = color.New(color.FgHiYellow).SprintFunc()
 	cosmicEntropy = color.New(color.FgHiMagenta).SprintFunc()
 	cosmicAccent  = color.New(color.FgHiGreen).SprintFunc()
-	cosmicRepo    = color.New(color.FgHiMagenta, color.Bold, color.BlinkSlow).SprintFunc()
-	cosmicLink    = color.New(color.FgHiCyan, color.Bold, color.Underline).SprintFunc()
 )
 
 // ── NEON palette (background highlights) ─────────────────────
@@ -321,7 +308,6 @@ var (
 	neonMatch        = color.New(color.FgHiGreen, color.Bold).SprintFunc()
 	neonStar         = color.New(color.FgHiYellow, color.Bold).SprintFunc()
 	neonDim          = color.New(color.Faint, color.Italic).SprintFunc()
-	neonRepo         = color.New(color.FgBlack, color.BgHiMagenta, color.Bold, color.Underline).SprintFunc()
 	neonLink         = color.New(color.FgBlack, color.BgHiCyan, color.Bold).SprintFunc()
 )
 
@@ -621,13 +607,6 @@ func blogCosmicBox(sb *strings.Builder, borderColor func(...interface{}) string,
 	blogPrintln(sb, borderColor("╔"+bar+"╗"))
 	blogPrintln(sb, borderColor("║")+titleColor(padded)+borderColor("║"))
 	blogPrintln(sb, borderColor("╚"+bar+"╝"))
-}
-
-// cosmicBox renders a centered 3-line bordered box (Even More Fancy / Cosmic preset).
-func cosmicBox(borderColor func(...interface{}) string, titleColor func(...interface{}) string, title string) {
-	var sb strings.Builder
-	blogCosmicBox(&sb, borderColor, titleColor, title)
-	lockWrite(sb.String())
 }
 
 func initLogFormat() {
@@ -1033,9 +1012,15 @@ func secretLineNum(contents []byte, secret string) int {
 
 func ProcessRepositories() {
 	threadNum := *getSession().Options.Threads
-	// Cap from config (default 20) to prevent overwhelming the machine.
-	if cap := getSession().Config.Performance.Int(getSession().Config.Performance.MaxRepositoryThreads, 20); threadNum > cap {
-		threadNum = cap
+	// Cap from config (default 8) to keep a scan from saturating the machine. A
+	// configured cap below 1 would start no workers and stall the scan, so the
+	// worker count is floored at one.
+	maxThreads := getSession().Config.Performance.Int(getSession().Config.Performance.MaxRepositoryThreads, 8)
+	if threadNum > maxThreads {
+		threadNum = maxThreads
+	}
+	if threadNum < 1 {
+		threadNum = 1
 	}
 
 	// Create worker pool with buffered channels
@@ -1088,8 +1073,12 @@ func processRepository(repository core.GitResource, workerID int) {
 func ProcessGists() {
 	threadNum := *getSession().Options.Threads
 	// Cap from config (default 5) to avoid hammering the gist API.
-	if cap := getSession().Config.Performance.Int(getSession().Config.Performance.MaxGistThreads, 5); threadNum > cap {
-		threadNum = cap
+	maxThreads := getSession().Config.Performance.Int(getSession().Config.Performance.MaxGistThreads, 5)
+	if threadNum > maxThreads {
+		threadNum = maxThreads
+	}
+	if threadNum < 1 {
+		threadNum = 1
 	}
 
 	// Create worker pool with buffered channels
@@ -1116,8 +1105,12 @@ func ProcessGists() {
 func ProcessComments() {
 	threadNum := *getSession().Options.Threads
 	// Cap from config (default 3) to avoid hammering the API.
-	if cap := getSession().Config.Performance.Int(getSession().Config.Performance.MaxCommentThreads, 3); threadNum > cap {
-		threadNum = cap
+	maxThreads := getSession().Config.Performance.Int(getSession().Config.Performance.MaxCommentThreads, 3)
+	if threadNum > maxThreads {
+		threadNum = maxThreads
+	}
+	if threadNum < 1 {
+		threadNum = 1
 	}
 
 	// Create worker pool with buffered channels
@@ -1149,7 +1142,7 @@ func processComment(comment core.Comment) {
 	dir := core.GetTempDir(core.GetHash(comment.Url))
 	// Checked: when this write failed, the scan below ran against a directory with
 	// no comment in it and the finding was silently lost.
-	if err := ioutil.WriteFile(filepath.Join(dir, "comment.ignore"), []byte(comment.Body), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "comment.ignore"), []byte(comment.Body), 0644); err != nil {
 		getSession().Log.Warn("Could not stage comment %s for scanning: %s", comment.Url, err)
 		return
 	}
@@ -1175,9 +1168,7 @@ func processRepositoryOrGist(url string, ref string, stars int, source core.GitR
 
 	activity.StartFetch(url)
 
-	var gitProgress *core.GitProgressWriter
-
-	_, err := core.CloneRepository(getSession(), url, ref, dir, gitProgress)
+	_, err := core.CloneRepository(getSession(), url, ref, dir, nil)
 	if err != nil {
 		getSession().Log.Debug("[%s] Cloning failed: %s", url, err.Error())
 		os.RemoveAll(dir)
@@ -1302,8 +1293,16 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 		scanDeadline = time.Now().Add(time.Duration(scanTimeoutSecs) * time.Second)
 	}
 
-	scanner := core.NewDirectoryScanner(getSession().Log)
-	fileCount := scanner.GetFileCount(dir)
+	// Optional per-repository byte budget (scanning.max_scan_mb, 0 = no limit).
+	// A wall-clock timeout depends on how loaded the machine is; a byte budget
+	// stops a pathological repository in a predictable amount of work.
+	maxScanBytes := int64(cfg.Scanning.Int(cfg.Scanning.MaxScanMB, 0)) << 20
+	var bytesScanned int64
+
+	// One walk of the tree yields both the scannable files and the total count
+	// the size guard needs. These used to be two full traversals of the same
+	// tree (a FastWalk for the count, then a filepath.Walk for the files).
+	files, fileCount := core.GetMatchingFilesCounted(dir)
 
 	if fileCount > maxFileCount {
 		lockPrintf("[SKIP] Repository has %d files (max: %d): %s\n", fileCount, maxFileCount, url)
@@ -1324,12 +1323,25 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 		queryRegex = re
 	}
 
-	files := core.GetMatchingFiles(dir)
 	// len(files) is the exact number of files this scan will process, so it is
-	// the right denominator for the progress percentage. The GetFileCount above
-	// is only a size guard and counts every file, including the blacklisted
-	// ones this slice drops.
+	// the right denominator for the progress percentage. fileCount above is the
+	// size guard and counts every file, including the blacklisted ones.
 	core.GlobalScanProgress.SetTotalFiles(len(files))
+
+	// The entropy scan compares the blacklist case-insensitively against every
+	// high-entropy line. Lowering the entries once here (and the line once per
+	// line below) replaces two ToLower calls per entry per line with one per
+	// line, which on a large repository is the difference between tens of
+	// thousands of allocations and a handful. Empty entries are dropped: they
+	// would make strings.Contains true for every line and silently disable the
+	// entropy scan.
+	lowerBlacklist := make([]string, 0, len(getSession().Config.BlacklistedStrings))
+	for _, b := range getSession().Config.BlacklistedStrings {
+		if b != "" {
+			lowerBlacklist = append(lowerBlacklist, strings.ToLower(b))
+		}
+	}
+
 	for i, file := range files {
 		// Checked per file so a runaway scan stops within one file rather than
 		// after the whole repository.
@@ -1357,6 +1369,17 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 		// per file. The load has to happen before any of those readers, including
 		// isViteOnlyEnvFile.
 		file.Contents = file.GetContents()
+		if maxScanBytes > 0 {
+			bytesScanned += int64(len(file.Contents))
+			if bytesScanned > maxScanBytes {
+				lockPrintf("[SKIP] Scan byte budget reached (%d MB): %s\n", maxScanBytes>>20, url)
+				return matchedAny
+			}
+		}
+		// Share one lowercased buffer across the per-signature copies, so a
+		// case-insensitive prefilter lowers the file once, not once per rule.
+		// GetContents returns empty for a binary file, so no rule can match it.
+		file.EnableLowerCache()
 
 		// Attach the repository to the file so verifier webhooks can name it;
 		// applyVerifier used to hardcode "unknown" because MatchFile carried
@@ -1460,11 +1483,14 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 							// content must be captured here.
 							fileContent := string(file.Contents)
 							secret := matches[0]
+							// Walked once: this scans the whole file, and it used
+							// to run twice per finding (publish and logSecret).
+							secretLine := secretLineNum(file.Contents, secret)
 
-							publish(&MatchEvent{Source: source, Url: url, Matches: matches, Signature: signature.Name(), File: relativeFileName, Stars: stars, Priority: signature.GetPriority(), Color: signature.GetColor(), FileContent: fileContent, Secret: secret, SecretLine: secretLineNum(file.Contents, secret)})
+							publish(&MatchEvent{Source: source, Url: url, Matches: matches, Signature: signature.Name(), File: relativeFileName, Stars: stars, Priority: signature.GetPriority(), Color: signature.GetColor(), FileContent: fileContent, Secret: secret, SecretLine: secretLine})
 							matchedAny = true
 							fileMatched = true
-							logSecret(count, url, signature.Name(), relativeFileName, m, ref, secretLineNum(file.Contents, secret), stars)
+							logSecret(count, url, signature.Name(), relativeFileName, m, ref, secretLine, stars)
 							getSession().WriteToCsv([]string{url, signature.Name(), relativeFileName, m})
 							getSession().LogMatch(signature.Name(), url, relativeFileName, matches)
 
@@ -1500,9 +1526,11 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 									entropy := core.GetEntropy(line)
 									if entropy >= *getSession().Options.EntropyThreshold {
 										blacklistedMatch := false
-										for _, blacklistedString := range getSession().Config.BlacklistedStrings {
-											if strings.Contains(strings.ToLower(line), strings.ToLower(blacklistedString)) {
+										lowerLine := strings.ToLower(line)
+										for _, blacklistedString := range lowerBlacklist {
+											if strings.Contains(lowerLine, blacklistedString) {
 												blacklistedMatch = true
+												break
 											}
 										}
 										if !blacklistedMatch {
@@ -1702,9 +1730,8 @@ func main() {
 
 	// Dispatch on the mode selected by InitIntegratedMode/scanModeArgs. The mode
 	// flags are stripped before flag.Parse, so this is the only place that
-	// decides which UI runs. ModeScanner is an alias of ModeDefault and is never
-	// selected (scanModeArgs maps "scanner" onto ModeDefault), so the default arm
-	// covers both.
+	// decides which UI runs. scanModeArgs maps both "terminal" and "scanner" onto
+	// ModeDefault, so the default arm covers both.
 	switch modeConfig.Mode {
 	case ModeWeb:
 		runWebMode()
@@ -1739,6 +1766,9 @@ func runWebMode() {
 
 	// Initialize the web hub before the scanner starts so no matches are lost.
 	ensureWebHub()
+	// Ring-buffer caps from config (performance.max_*), applied before the hub
+	// and the stores can accumulate anything.
+	configureWebLimits(getSession().Config.Performance)
 	webLogCapture = true
 
 	// The web dashboard renders ANSI colours client-side, so force the
@@ -1923,10 +1953,7 @@ func printStartupBlock() {
 
 // runScanner executes the scanner with UI reporting
 func runScanner() {
-	// Original banner output suppressed if UI is active
-	if modeConfig.Mode == ModeScanner {
-		printStartupBlock()
-	}
+	printStartupBlock()
 
 	// Execute scanner logic
 	executeScanner()
@@ -1948,6 +1975,21 @@ func runScannerCLI() {
 	printStartupBlock()
 
 	executeScanner()
+}
+
+// printScanPlan reports what a scan of dir would do, without reading a file.
+func printScanPlan(dir string) {
+	plan, err := core.PlanScan(dir)
+	if err != nil {
+		lockPrintf("[DRY RUN] could not walk %s: %s\n", dir, err)
+		return
+	}
+	lockPrintf("[DRY RUN] %s\n", dir)
+	lockPrintf("  files seen:      %d\n", plan.Total)
+	lockPrintf("  would scan:      %d\n", plan.Scannable)
+	lockPrintf("  skipped (size):  %d\n", plan.SkippedSize)
+	lockPrintf("  skipped (ext):   %d\n", plan.SkippedExt)
+	lockPrintf("  skipped (path):  %d\n", plan.SkippedPath)
 }
 
 // executeScanner runs the scanner core logic
@@ -2060,6 +2102,11 @@ func executeScanner() {
 	}
 
 	if len(*getSession().Options.Local) > 0 {
+		if *getSession().Options.DryRun {
+			printScanPlan(*getSession().Options.Local)
+			exitScanner(0)
+			return
+		}
 		lockPrintf("[*] Scanning local: %s\n", color.HiYellowString(*getSession().Options.Local))
 		rc := 0
 		if checkSignatures(*getSession().Options.Local, *getSession().Options.Local, "", -1, core.LOCAL_SOURCE) {

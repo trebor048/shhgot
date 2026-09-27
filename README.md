@@ -311,6 +311,8 @@ Tests the Claude/OpenAI tokens in `config.yaml` and writes the valid ones to
 | `--web-port` | `8080` | Dashboard port. |
 | `--web-host` | `127.0.0.1` | Dashboard bind address. |
 | `-threads` | `0` (one per logical CPU) | Concurrent worker count, capped by the `max_*_threads` keys below. |
+| `--low-impact` | `false` | Trade throughput for a responsive machine: halves the worker count, caps `GOMAXPROCS`, and drops the process to below-normal CPU priority. |
+| `--dry-run` | `false` | With `--local`: report what would be scanned and what the size caps and blacklists drop, then exit without reading a file. |
 | `--local` | – | Scan this directory recursively instead of GitHub. |
 | `--live` | – | Your shhgit live endpoint. |
 | `--config-path` | – | Directory to look for `config.yaml` in. |
@@ -351,7 +353,7 @@ reference, and this section as the map.
 | Key | Purpose |
 |---|---|
 | `github_access_tokens` | One or more GitHub tokens; revoked ones are pruned automatically. |
-| `signatures` | The detection rules — 104 in the example. |
+| `signatures` | The detection rules — 200 in the example. |
 | `performance` | Thread counts, API pacing, worker-pool and queue sizing. |
 | `scanning` | Per-repository size/file gates, clone depth and timeout, fork/archive filters. |
 | `webhook` | Alert destination ([details](#webhooks)). |
@@ -395,13 +397,13 @@ skipped at startup with a warning, so check the log if a rule never fires.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `max_repository_threads` | `20` | Repositories cloned/processed concurrently. |
+| `max_repository_threads` | `8` | Repositories cloned/processed concurrently. Raise it if you have cores to spare. |
 | `max_gist_threads` | `5` | Gists processed concurrently. |
 | `max_comment_threads` | `3` | Comment streams processed concurrently. |
-| `api_pages_per_cycle` | `3` | API pages fetched per polling cycle. |
+| `api_pages_per_cycle` | `3` | Ceiling on API pages per polling cycle. The loop stops early on an unchanged (`304 Not Modified`) or already-seen page, so a quiet feed costs no quota. |
 | `api_per_page` | `100` | Results per page (GitHub caps this at 100). |
 | `api_sleep_seconds` | `5` | Pause between polling cycles. |
-| `worker_pool_size` | `20` | Concurrent event processors. |
+| `worker_pool_size` | `8` | Concurrent event processors. |
 | `queue_buffer_size` | `0` | Internal queue depth. Unset keeps the built-in `1000`/`100`/`1000` sizes. |
 | `max_file_count` | `10000` | Legacy location of the per-repository file cap. Prefer `scanning.max_file_count`; this key still works and is used when `scanning` leaves it unset. |
 
@@ -419,6 +421,8 @@ the compiled-in default (or the value passed on the command line).
 | `clone_depth` | `1` | Git clone depth. `1` is a shallow clone; a full-history clone is never implied. |
 | `clone_timeout_seconds` | CLI `--clone-repository-timeout` (`30`) | Abort a clone after this long. |
 | `scan_timeout_seconds` | `0` (no limit) | Abort a repository's scan after this long, checked per file. |
+| `max_scan_mb` | `0` (no limit) | Byte budget per repository. Predictable where a wall-clock timeout is not. |
+| `rescan_repositories` | `false` | By default each repository is cloned and scanned at most once per run, because the events feed repeats the same pushes; set true to re-scan every pushed commit. |
 | `skip_forks` | `false` | Skip forked repositories. |
 | `skip_archived` | `false` | Skip archived repositories. |
 
@@ -502,8 +506,26 @@ instead of printing raw escape sequences.
 ./shhgit --web
 ```
 
-One self-contained HTML page served by the scanning process itself — no build
-step, no separate frontend server, nothing extra to deploy.
+A React single-page app served by the scanning process itself — no separate
+frontend server and nothing extra to deploy. The compiled bundle is embedded in
+the binary with `go:embed`, so a plain `go build` needs no Node toolchain.
+
+**Building the UI**
+
+The built bundle lives in `cmd/shhgit/web/dist` and is committed, which is why
+`go build` alone produces a binary with the full dashboard. Only rebuild it when
+you change something under `cmd/shhgit/web`:
+
+```bash
+make web                 # npm ci && npm run build (needs Node 18+)
+# or: cd cmd/shhgit/web && npm ci && npm run build
+```
+
+The Docker image and the CI/release workflows rebuild the bundle from source on
+every run, so a stale committed copy can never reach a release.
+
+The previous single-file dashboard is still embedded as a fallback and is
+reachable at `/?legacy=1` (or by setting `SHHGIT_LEGACY_UI=1` for the process).
 
 **What is in it**
 
@@ -607,32 +629,56 @@ Discord URLs are validated at startup and the webhook ID must be **numeric** —
 placeholder like `YOUR_WEBHOOK_HERE` makes shhgit refuse to start, so keep the
 line commented out until you have a real URL.
 
-Delivery is queued and rate-limited (1000 slots, 500 ms spacing, 300 s dedupe),
-so a burst of matches will not get you throttled. Those numbers are currently
-fixed in code; the commented-out `webhook_queue` block in the example documents
-them but does not change them.
+Delivery is queued and paced. `webhook_queue` in `config.yaml` controls it, and
+every endpoint — Discord, Slack, Mattermost, custom — goes through the same
+queue, so all of them get deduplication, spacing and retry:
+
+```yaml
+webhook_queue:
+  queue_size: 1000       # buffered messages before new ones are dropped
+  rate_limit_ms: 500     # minimum gap between sends to the same webhook
+  dedupe_window_sec: 300 # window in which an identical alert is suppressed
+  batch_size: 10         # coalesce up to 10 Discord findings into one message
+```
+
+`rate_limit_ms` is enforced between consecutive deliveries, so a burst of matches
+cannot trip the endpoint's limit. Discord webhooks are additionally held to a
+500 ms floor (4 sends per 2 s, under Discord's 5-per-2 s bucket) even if a
+smaller value is configured. `batch_size` coalesces up to that many consecutive
+Discord findings into one message (Discord allows ten embeds per message), which
+cuts the request count; it is ignored for non-Discord endpoints, whose payload
+template cannot be merged safely. A `429` response is retried after the server's
+`Retry-After` window rather than immediately.
 
 ---
 
 ## Performance tuning
 
 shhgit is I/O bound: most of its time goes to cloning repositories and waiting on
-the GitHub API. Tune in this order.
+the GitHub API. Several things are already handled for you — each signature is
+gated by a mandatory-literal prefilter (a rule whose literal is absent is skipped
+without a pass over the file), clones use a native `git` binary when one is on
+`PATH`, a file with a NUL byte in its first few KB is treated as binary and never
+read further, and the events poller sends `If-None-Match` so an unchanged page is
+a free `304`. Tune in this order.
 
-1. **Tokens first.** Throughput comes from GitHub's per-token rate limit, so more
+1. **If the scan is making the machine unusable, use `--low-impact`** (or
+   `performance.low_impact: true`): it halves the worker count, caps
+   `GOMAXPROCS`, and drops the process to below-normal priority.
+2. **Tokens first.** Throughput comes from GitHub's per-token rate limit, so more
    tokens means more throughput — almost always the biggest single win.
-2. **`performance.max_*_threads` and `worker_pool_size`.** Raise them for more
+3. **`performance.max_*_threads` and `worker_pool_size`.** Raise them for more
    concurrency; raise them too far and you are only fighting the API limit.
-3. **Safety rails.** `--maximum-repository-size`, `--maximum-file-size`,
+4. **Safety rails.** `--maximum-repository-size`, `--maximum-file-size`,
    `--clone-repository-timeout` and `--minimum-stars` stop pathological
    repositories from eating bandwidth — their `scanning.*_mb` /
    `scanning.clone_timeout_seconds` equivalents live in `config.yaml`. On a fast
    link, lower the clone timeout so a hung clone cannot stall a worker, and set
    `scanning.max_file_count` to skip a spam repository of thousands of junk
    files before it is walked at all.
-4. **`--entropy-threshold`.** Higher reduces false positives at the cost of
+5. **`--entropy-threshold`.** Higher reduces false positives at the cost of
    missing weak-but-real secrets; `0` disables the check.
-5. **Trim the signature set.** Every rule is a regex pass over every candidate
+6. **Trim the signature set.** Every rule is a regex pass over every candidate
    file. If you only care about cloud credentials, deleting the rules you do not
    need is the cheapest speedup available.
 
@@ -912,8 +958,9 @@ Recorded honestly, so nobody has to rediscover them:
 - **Reviews need a reachable provider.** With no provider configured the Review
   tab works, but every review fails with the provider's error; the Settings tab's
   **Test Connection** tells you why.
-- **`webhook_queue` settings are ignored** — the live queue uses fixed values in
-  `core/validators.go`.
+- **`webhook_queue` controls delivery pacing only.** `queue_size`,
+  `rate_limit_ms`, `dedupe_window_sec` and `batch_size` take effect; there is no
+  file-output option.
 - **Token pruning needs a writable `config.yaml`.** With a read-only mount,
   pruning is skipped.
 - **`--local` scans once.** The directory is scanned and the results are fed to

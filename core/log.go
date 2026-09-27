@@ -8,7 +8,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/fatih/color"
@@ -122,11 +121,9 @@ func GetColorFromHex(hex string) *color.Color {
 type Logger struct {
 	sync.Mutex
 
-	debug       bool
-	silent      bool
-	config      *Config
-	RateLimited atomic.Int64
-	LogWriter   func(string) // Optional: redirect log output (e.g., to TUI)
+	debug     bool
+	silent    bool
+	LogWriter func(string) // Optional: redirect log output (e.g., to TUI)
 	// LogWriterIsTerminal reports whether LogWriter output ultimately reaches
 	// the live terminal. The main package sets it when its hook prints through
 	// the shared console mutex: the live "\r\033[K" prefix must then be kept,
@@ -151,15 +148,15 @@ func Say(format string, args ...interface{}) {
 }
 
 func (l *Logger) SetDebug(d bool) {
+	l.Lock()
 	l.debug = d
+	l.Unlock()
 }
 
 func (l *Logger) SetSilent(d bool) {
+	l.Lock()
 	l.silent = d
-}
-
-func (l *Logger) SetConfig(c *Config) {
-	l.config = c
+	l.Unlock()
 }
 
 // liveLinePrefix is the carriage-return plus erase-to-end-of-line pair that lets
@@ -191,15 +188,19 @@ func postWebhook(url, payload string) {
 }
 
 func (l *Logger) Log(level int, format string, args ...interface{}) {
-	if level == DEBUG && !l.debug {
-		return
-	}
-
-	if l.silent && level < IMPORTANT {
-		return
-	}
-
 	l.Lock()
+	// The flags are read under the same lock the setters use; reading them
+	// unlocked here raced SetDebug/SetSilent.
+	debug, silent := l.debug, l.silent
+	if level == DEBUG && !debug {
+		l.Unlock()
+		return
+	}
+	if silent && level < IMPORTANT {
+		l.Unlock()
+		return
+	}
+
 	prefix := liveLinePrefix(l.LogWriter != nil && !l.LogWriterIsTerminal)
 	if c, ok := LogColors[level]; ok {
 		line := c.Sprintf(prefix+format+"\n", args...)
@@ -269,8 +270,8 @@ func (l *Logger) Debug(format string, args ...interface{}) {
 	l.Log(DEBUG, format, args...)
 }
 
+var ansiRegex = regexp.MustCompile("[\u001B\u009B][[\\]()#;?]*(?:(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PRZcf-ntqry=><~]))")
+
 func colorStrip(str string) string {
-	ansi := "[\u001B\u009B][[\\]()#;?]*(?:(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PRZcf-ntqry=><~]))"
-	re := regexp.MustCompile(ansi)
-	return re.ReplaceAllString(str, "")
+	return ansiRegex.ReplaceAllString(str, "")
 }

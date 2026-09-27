@@ -7,10 +7,12 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
 type KeyValidator struct {
+	mu        sync.Mutex
 	log       *Logger
 	logFile   *os.File
 	keysFound map[string]bool
@@ -32,16 +34,23 @@ func NewKeyValidator(log *Logger) *KeyValidator {
 
 // OpenLogFile opens a file for logging keys
 func (kv *KeyValidator) OpenLogFile(filename string) error {
-	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// 0600: the file holds plaintext API keys, so it must not be readable by
+	// other local users.
+	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
+	kv.mu.Lock()
 	kv.logFile = f
+	kv.mu.Unlock()
 	return nil
 }
 
 // LogKey logs a single API key to file
 func (kv *KeyValidator) LogKey(key, provider string, valid bool) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	if kv.logFile == nil {
 		return
 	}
@@ -52,13 +61,21 @@ func (kv *KeyValidator) LogKey(key, provider string, valid bool) {
 	}
 
 	line := fmt.Sprintf("%s|%s|%s\n", key, provider, status)
-	kv.logFile.WriteString(line)
+	if _, err := kv.logFile.WriteString(line); err != nil {
+		kv.log.Warn("Failed to write key log: %s", err)
+	}
 }
 
 // CloseLogFile closes the log file
 func (kv *KeyValidator) CloseLogFile() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	if kv.logFile != nil {
-		kv.logFile.Close()
+		if err := kv.logFile.Close(); err != nil {
+			kv.log.Warn("Failed to close key log: %s", err)
+		}
+		kv.logFile = nil
 	}
 }
 
@@ -67,10 +84,13 @@ func (kv *KeyValidator) ValidateKey(key string) *ValidatedKey {
 	key = strings.TrimSpace(key)
 
 	// Skip if already processed
+	kv.mu.Lock()
 	if kv.keysFound[key] {
+		kv.mu.Unlock()
 		return nil
 	}
 	kv.keysFound[key] = true
+	kv.mu.Unlock()
 
 	// Detect provider and validate
 	if strings.HasPrefix(key, "sk-ant-api03-") {
@@ -98,6 +118,8 @@ func (kv *KeyValidator) ValidateKey(key string) *ValidatedKey {
 		return kv.validateXAI(key)
 	} else if strings.HasPrefix(key, "hf_") {
 		return kv.validateHuggingFace(key)
+	} else if strings.HasPrefix(key, "ghp_") || strings.HasPrefix(key, "gho_") || strings.HasPrefix(key, "github_pat_") {
+		return kv.validateGitHubKey(key)
 	}
 
 	return &ValidatedKey{
@@ -192,7 +214,7 @@ func (kv *KeyValidator) validateGoogleAPI(key string) *ValidatedKey {
 	}
 	defer resp.Body.Close()
 
-	valid := resp.StatusCode != 403 && resp.StatusCode != 401
+	valid := resp.StatusCode >= 200 && resp.StatusCode < 300
 	return &ValidatedKey{
 		Key:      key,
 		Provider: "GOOGLE_API",
@@ -272,6 +294,29 @@ func (kv *KeyValidator) validateHuggingFace(key string) *ValidatedKey {
 		Key:      key,
 		Provider: "HUGGINGFACE",
 		Valid:    valid,
+		Error:    fmt.Sprintf("HTTP %d", resp.StatusCode),
+	}
+}
+
+func (kv *KeyValidator) validateGitHubKey(key string) *ValidatedKey {
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest("GET", "https://api.github.com/user", nil)
+	if err != nil {
+		return &ValidatedKey{Key: key, Provider: "GITHUB", Valid: false, Error: err.Error()}
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return &ValidatedKey{Key: key, Provider: "GITHUB", Valid: false, Error: err.Error()}
+	}
+	defer resp.Body.Close()
+
+	return &ValidatedKey{
+		Key:      key,
+		Provider: "GITHUB",
+		Valid:    resp.StatusCode == 200,
 		Error:    fmt.Sprintf("HTTP %d", resp.StatusCode),
 	}
 }
@@ -391,7 +436,7 @@ func (kv *KeyValidator) ScanDirectoryForKeys(dir string, session *Session) []Val
 					if validated != nil {
 						validatedKeys = append(validatedKeys, *validated)
 						kv.LogKey(match, validated.Provider, validated.Valid)
-						kv.log.Info("Found %s key: %s (Valid: %v)", provider, match[:20]+"...", validated.Valid)
+						kv.log.Info("Found %s key: %s (Valid: %v)", provider, MaskToken(match)+"...", validated.Valid)
 					}
 				}
 			}

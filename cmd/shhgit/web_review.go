@@ -763,8 +763,9 @@ func reviewStreamHandler(w http.ResponseWriter, r *http.Request, id string) {
 
 // reviewChatHandler answers a follow-up question, streaming the reply.
 func reviewChatHandler(w http.ResponseWriter, r *http.Request, id string) {
-	rev, ok := reviewStore.Get(id)
-	if !ok {
+	// Existence probe only: the review is re-read after the user's message is
+	// appended, so the body here is intentionally discarded.
+	if _, ok := reviewStore.Get(id); !ok {
 		writeJSONError(w, http.StatusNotFound, "no such review")
 		return
 	}
@@ -795,7 +796,7 @@ func reviewChatHandler(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	// Re-read so the new question is part of the replayed conversation.
-	rev, ok = reviewStore.Get(id)
+	rev, ok := reviewStore.Get(id)
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "no such review")
 		return

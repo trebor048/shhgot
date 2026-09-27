@@ -64,12 +64,9 @@ const (
 	AuthBearer AuthType = iota
 	AuthAPIKey
 	AuthXAPIKey
-	AuthBasic
 	AuthToken
 	AuthURLParam
 	AuthGitHubToken
-	AuthGitLabToken
-	AuthOpenAIProject
 	AuthAnthropicKey
 )
 
@@ -77,9 +74,7 @@ type CheckResult struct {
 	Provider    string
 	DisplayName string
 	Status      string // "valid", "invalid", "error", "skipped", "no_key"
-	Balance     string
 	Credits     string
-	Usage       string
 	Tier        string
 	Detail      string
 	Latency     time.Duration
@@ -87,20 +82,17 @@ type CheckResult struct {
 }
 
 type Provider struct {
-	ID              string   // internal ID
-	DisplayName     string   // pretty name
-	Category        string   // "AI/LLM", "Cloud", "DevTools", etc.
-	BaseURL         string   // API base URL
-	CheckPath       string   // endpoint to check key validity
-	CheckMethod     string   // GET, POST, etc.
-	AuthType        AuthType // how to authenticate
-	AuthHeader      string   // header name for auth
-	AuthPrefix      string   // "Bearer ", "token ", etc.
-	EnvVars         []string // environment variable names
-	KeyPrefixes     []string // known key prefix patterns
-	DocsURL         string   // provider docs link
-	CanCheckBalance bool     // whether balance/usage can be queried
-	BalancePath     string   // path for balance/usage info
+	ID          string   // internal ID
+	DisplayName string   // pretty name
+	Category    string   // "AI/LLM", "Cloud", "DevTools", etc.
+	BaseURL     string   // API base URL
+	CheckPath   string   // endpoint to check key validity
+	CheckMethod string   // GET, POST, etc.
+	AuthType    AuthType // how to authenticate
+	AuthHeader  string   // header name for auth
+	AuthPrefix  string   // "Bearer ", "token ", etc.
+	EnvVars     []string // environment variable names
+	KeyPrefixes []string // known key prefix patterns
 }
 
 // ─── Provider Registry ─────────────────────────────────────────────────
@@ -111,17 +103,15 @@ var providers = []Provider{
 		ID: "openai", DisplayName: "OpenAI", Category: "AI/LLM",
 		BaseURL: "https://api.openai.com", CheckPath: "/v1/models", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars:         []string{"OPENAI_API_KEY", "OPENAI_KEY", "OPENAI_SECRET_KEY"},
-		KeyPrefixes:     []string{"sk-"},
-		CanCheckBalance: true, BalancePath: "/v1/organization/usage?date=",
+		EnvVars:     []string{"OPENAI_API_KEY", "OPENAI_KEY", "OPENAI_SECRET_KEY"},
+		KeyPrefixes: []string{"sk-"},
 	},
 	{
 		ID: "anthropic", DisplayName: "Anthropic", Category: "AI/LLM",
 		BaseURL: "https://api.anthropic.com", CheckPath: "/v1/messages", CheckMethod: "POST",
 		AuthType: AuthAnthropicKey, AuthHeader: "x-api-key", AuthPrefix: "",
-		EnvVars:         []string{"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"},
-		KeyPrefixes:     []string{"sk-ant-"},
-		CanCheckBalance: true, BalancePath: "/v1/messages?beta=true",
+		EnvVars:     []string{"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"},
+		KeyPrefixes: []string{"sk-ant-"},
 	},
 	{
 		ID: "google", DisplayName: "Google/Gemini", Category: "AI/LLM",
@@ -148,9 +138,8 @@ var providers = []Provider{
 		ID: "openrouter", DisplayName: "OpenRouter", Category: "AI/LLM",
 		BaseURL: "https://openrouter.ai", CheckPath: "/api/v1/auth/key", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars:         []string{"OPENROUTER_API_KEY", "OPENROUTER_KEY"},
-		KeyPrefixes:     []string{"sk-or-v1-"},
-		CanCheckBalance: true, BalancePath: "/api/v1/auth/key",
+		EnvVars:     []string{"OPENROUTER_API_KEY", "OPENROUTER_KEY"},
+		KeyPrefixes: []string{"sk-or-v1-"},
 	},
 
 	// ═══════════ INFERENCE / HOSTING PROVIDERS ═══════════
@@ -190,7 +179,7 @@ var providers = []Provider{
 		ID: "baseten", DisplayName: "Baseten", Category: "AI/LLM",
 		BaseURL: "https://api.baseten.co", CheckPath: "/v1/models", CheckMethod: "GET",
 		AuthType: AuthAPIKey, AuthHeader: "Authorization", AuthPrefix: "Api-Key ",
-		EnvVars: []string{"BASETEN_API_KEY", "BASETEN_API_KEY"},
+		EnvVars: []string{"BASETEN_API_KEY"},
 	},
 	{
 		ID: "nvidia", DisplayName: "NVIDIA NIM", Category: "AI/LLM",
@@ -359,12 +348,6 @@ var providers = []Provider{
 		EnvVars: []string{"ANYSCALE_API_KEY", "ANYSCALE_ENDPOINT_API_KEY"},
 	},
 	{
-		ID: "togetherai", DisplayName: "TogetherCompute", Category: "AI/LLM",
-		BaseURL: "https://api.together.xyz", CheckPath: "/v1/models", CheckMethod: "GET",
-		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars: []string{"TOGETHER_API_KEY", "TOGETHER_KEY"},
-	},
-	{
 		ID: "jina", DisplayName: "Jina AI", Category: "AI/LLM",
 		BaseURL: "https://api.jina.ai", CheckPath: "/v1/models", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
@@ -431,8 +414,8 @@ func discoverKeys() map[string][]string {
 				keys[p.ID] = appendIfUnique(keys[p.ID], val)
 			}
 		}
-		if vars := envLike(os.Getenv(p.ID + "_API_KEY")); vars != "" {
-			keys[p.ID] = appendIfUnique(keys[p.ID], vars)
+		if val := os.Getenv(p.ID + "_API_KEY"); val != "" {
+			keys[p.ID] = appendIfUnique(keys[p.ID], val)
 		}
 	}
 
@@ -522,8 +505,7 @@ func discoverKeys() map[string][]string {
 			}
 			if apiKey, ok := provMap["api_key"].(string); ok && apiKey != "" {
 				for _, p := range providers {
-					if strings.EqualFold(p.ID, provName) || strings.EqualFold(p.DisplayName, provName) ||
-						strings.Contains(strings.ToLower(p.DisplayName), strings.ToLower(provName)) {
+					if strings.EqualFold(p.ID, provName) || strings.EqualFold(p.DisplayName, provName) {
 						keys[p.ID] = appendIfUnique(keys[p.ID], apiKey)
 					}
 				}
@@ -532,13 +514,6 @@ func discoverKeys() map[string][]string {
 	}
 
 	return keys
-}
-
-func envLike(val string) string {
-	if val == "" {
-		return ""
-	}
-	return val
 }
 
 func appendIfUnique(slice []string, item string) []string {
@@ -629,6 +604,20 @@ func (c *Checker) checkKey(ctx context.Context, p Provider, key string) CheckRes
 	start := time.Now()
 
 	url := p.BaseURL + p.CheckPath
+	// Azure OpenAI keys only work against a per-resource endpoint, so the literal
+	// "RESOURCE" placeholder host can never resolve. Derive the real host from
+	// AZURE_OPENAI_ENDPOINT and skip (rather than report a bogus network error)
+	// when it is not configured.
+	if p.ID == "azure" {
+		ep := strings.TrimRight(os.Getenv("AZURE_OPENAI_ENDPOINT"), "/")
+		if ep == "" {
+			result.Status = "skipped"
+			result.Detail = "set AZURE_OPENAI_ENDPOINT to check Azure OpenAI keys"
+			result.Latency = time.Since(start)
+			return result
+		}
+		url = ep + p.CheckPath
+	}
 	if p.AuthType == AuthURLParam {
 		if strings.Contains(url, "?") {
 			url += "&key=" + key
@@ -637,9 +626,18 @@ func (c *Checker) checkKey(ctx context.Context, p Provider, key string) CheckRes
 		}
 	}
 
+	// Every POST provider needs a body: an empty one makes the endpoint answer
+	// 400 regardless of the key, so the check could never validate it.
 	var body io.Reader
-	if p.CheckMethod == "POST" && p.ID == "anthropic" {
-		body = strings.NewReader(`{"model":"claude-3-haiku-20240307","max_tokens":1,"messages":[{"role":"user","content":"Hi"}]}`)
+	if p.CheckMethod == "POST" {
+		switch p.ID {
+		case "anthropic":
+			body = strings.NewReader(`{"model":"claude-3-haiku-20240307","max_tokens":1,"messages":[{"role":"user","content":"Hi"}]}`)
+		case "minimax":
+			body = strings.NewReader(`{"model":"abab6.5s-chat","messages":[{"role":"user","content":"Hi"}]}`)
+		default:
+			body = strings.NewReader(`{}`)
+		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, p.CheckMethod, url, body)
@@ -663,8 +661,6 @@ func (c *Checker) checkKey(ctx context.Context, p Provider, key string) CheckRes
 	case AuthGitHubToken:
 		req.Header.Set("Authorization", "token "+key)
 		req.Header.Set("Accept", "application/vnd.github.v3+json")
-	case AuthGitLabToken:
-		req.Header.Set("PRIVATE-TOKEN", key)
 	case AuthAnthropicKey:
 		req.Header.Set("x-api-key", key)
 		req.Header.Set("anthropic-version", "2023-06-01")
@@ -960,12 +956,10 @@ func (ui *terminalUI) printResults(results []CheckResult) {
 				dim, detail, reset,
 			)
 
-			if r.Latency > 0 {
-				fmt.Printf("      %s⏱ %v%s", dim, r.Latency.Round(time.Millisecond), reset)
-				if r.Status == "no_key" {
-					fmt.Printf("  %s(env: %s)%s", dim, strings.Join(p.EnvVars, ", "), reset)
-				}
-				fmt.Println()
+			if r.Status == "no_key" {
+				fmt.Printf("      %s(env: %s)%s\n", dim, strings.Join(p.EnvVars, ", "), reset)
+			} else if r.Latency > 0 {
+				fmt.Printf("      %s⏱ %v%s\n", dim, r.Latency.Round(time.Millisecond), reset)
 			}
 		}
 		fmt.Println()
@@ -997,6 +991,8 @@ func (ui *terminalUI) statusDisplay(status string) (string, string) {
 		return iconWarn, yellow
 	case "no_key":
 		return "  ", dim
+	case "skipped":
+		return "–", dim
 	default:
 		return "?", dim
 	}
@@ -1022,8 +1018,13 @@ func main() {
 	// Discover keys
 	keys := discoverKeys()
 	foundCount := 0
-	for _, v := range keys {
+	providerCount := 0
+	for id, v := range keys {
+		if id == "unknown" {
+			continue
+		}
 		foundCount += len(v)
+		providerCount++
 	}
 
 	if foundCount == 0 {
@@ -1040,15 +1041,15 @@ func main() {
 		return
 	}
 
-	fmt.Printf("  %sFound %d key(s) across %d providers%s\n\n", green, foundCount, len(keys), reset)
+	fmt.Printf("  %sFound %d key(s) across %d providers%s\n", green, foundCount, providerCount, reset)
+	if n := len(keys["unknown"]); n > 0 {
+		fmt.Printf("  %s%d key(s) matched no known provider and were not checked%s\n", dim, n, reset)
+	}
+	fmt.Println()
 
 	// Start checking
 	checker := NewChecker()
 	sem := make(chan struct{}, 8) // max 8 concurrent checks
-	totalKeys := 0
-	for _, k := range keys {
-		totalKeys += len(k)
-	}
 	checker.total.Store(0)
 	checker.checked.Store(0)
 	checker.found.Store(int64(foundCount))
@@ -1089,8 +1090,10 @@ func main() {
 	}
 
 	// Progress display
+	progressDone := make(chan struct{})
 	if ui.isTerminal {
 		go func() {
+			defer close(progressDone)
 			ticker := time.NewTicker(250 * time.Millisecond)
 			defer ticker.Stop()
 			for {
@@ -1102,10 +1105,13 @@ func main() {
 				}
 			}
 		}()
+	} else {
+		close(progressDone)
 	}
 
 	wg.Wait()
-	cancel() // stop ticker
+	cancel()       // stop ticker
+	<-progressDone // wait for it to actually stop before printing results
 
 	// Print results
 	ui.printResults(checker.results)

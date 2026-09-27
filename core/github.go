@@ -22,7 +22,7 @@ const (
 	defaultPerPage    = 100             // GitHub API max page size
 	defaultSleep      = 5 * time.Second // Default event-poll interval
 	defaultMaxPages   = 3               // Default pages of events per cycle
-	defaultWorkerPool = 20              // Default concurrent event processors
+	defaultWorkerPool = 8               // Default concurrent event processors
 )
 
 // perfTuning resolves the "performance" section of config.yaml into the
@@ -54,6 +54,98 @@ func clampInt(v, lo, hi int) int {
 	return v
 }
 
+// markNewEvents returns the events whose IDs are not already in seen, marking
+// them so a page overlap or a fast re-poll cannot dispatch the same event twice.
+func markNewEvents(events []*github.Event, seen map[string]bool, mu *sync.Mutex) []*github.Event {
+	out := make([]*github.Event, 0, len(events))
+	mu.Lock()
+	for _, e := range events {
+		if seen[e.GetID()] {
+			continue
+		}
+		seen[e.GetID()] = true
+		out = append(out, e)
+	}
+	mu.Unlock()
+	return out
+}
+
+// conditionalGET issues a GET, sending the resource's previous ETag as
+// If-None-Match. notModified reports a 304 Not Modified, which GitHub does not
+// count against the primary rate limit. go-github v17 offers no way to pass a
+// header through its list helpers, so the request is built by hand.
+func conditionalGET(ctx context.Context, client *GitHubClientWrapper, urlStr, etag string, v interface{}) (*github.Response, bool, error) {
+	req, err := client.NewRequest("GET", urlStr, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+	resp, err := client.Do(ctx, req, v)
+	// CheckResponse turns a 304 into a *github.ErrorResponse. That is the
+	// conditional request succeeding, not a failure.
+	if resp != nil && resp.StatusCode == http.StatusNotModified {
+		return resp, true, nil
+	}
+	return resp, false, err
+}
+
+// listEventsPage fetches one page of the public events feed. Pages are numbered
+// explicitly and 1-based because go-github's ListOptions omits a zero page,
+// which made the previous loop fetch page 1 twice per cycle.
+func listEventsPage(ctx context.Context, client *GitHubClientWrapper, perPage, page int, etag string) ([]*github.Event, *github.Response, bool, error) {
+	var events []*github.Event
+	resp, notModified, err := conditionalGET(ctx, client,
+		fmt.Sprintf("events?per_page=%d&page=%d", perPage, page), etag, &events)
+	return events, resp, notModified, err
+}
+
+// Repository metadata is fetched once per PushEvent, but the same repository
+// pushes many times: an uncached GetByID is the largest consumer of the API
+// budget. The cache is short lived because stars and size do change.
+const (
+	repoCacheTTL     = 15 * time.Minute
+	repoCacheMaxSize = 5000
+)
+
+type repoCacheEntry struct {
+	repo *github.Repository
+	at   time.Time
+}
+
+var (
+	repoCacheMu sync.Mutex
+	repoCache   = map[int64]repoCacheEntry{}
+)
+
+func cachedRepository(id int64) (*github.Repository, bool) {
+	repoCacheMu.Lock()
+	defer repoCacheMu.Unlock()
+	e, ok := repoCache[id]
+	if !ok || time.Since(e.at) > repoCacheTTL {
+		return nil, false
+	}
+	return e.repo, true
+}
+
+func cacheRepository(id int64, repo *github.Repository) {
+	repoCacheMu.Lock()
+	defer repoCacheMu.Unlock()
+	if len(repoCache) >= repoCacheMaxSize {
+		for k, e := range repoCache {
+			if time.Since(e.at) > repoCacheTTL {
+				delete(repoCache, k)
+			}
+		}
+		// Still full of live entries: drop it rather than grow without bound.
+		if len(repoCache) >= repoCacheMaxSize {
+			repoCache = map[int64]repoCacheEntry{}
+		}
+	}
+	repoCache[id] = repoCacheEntry{repo: repo, at: time.Now()}
+}
+
 // isUnauthorized reports whether a GitHub API call was rejected with HTTP 401
 // (bad credentials — revoked or expired token). The raw *github.Response is
 // checked first, then the wrapped *github.ErrorResponse, because some callers
@@ -68,21 +160,10 @@ func isUnauthorized(err error, resp *github.Response) bool {
 	return false
 }
 
-// RateLimitManager tracks and manages rate limits across tokens
-type RateLimitManager struct {
-	sync.Mutex
-	limits map[string]*RateLimit
-}
-
-type RateLimit struct {
-	Remaining int
-	Reset     time.Time
-	LastCheck time.Time
-}
-
-var rateLimitMgr = &RateLimitManager{
-	limits: make(map[string]*RateLimit),
-}
+// RateLimitManager and its rate-limit bookkeeping were removed: nothing ever
+// read the tracked limits (the field and its manager var were both dead), and
+// per-token pacing is handled by the RateLimitedUntil field on
+// GitHubClientWrapper and the rotation in GetClient.
 
 func GetRepositories(session *Session) {
 	localCtx, cancel := context.WithCancel(session.Context)
@@ -92,25 +173,40 @@ func GetRepositories(session *Session) {
 
 	observedKeys := map[string]bool{}
 	var observedKeysMutex sync.Mutex
-	pageCount := 0
+	// seenRepos dedupes clones. The public events feed is dominated by repeated
+	// pushes to the same repository, and cloning + scanning it once per
+	// PushEvent is the most expensive way to re-learn nothing.
+	// scanning.rescan_repositories restores the old per-push behaviour.
+	seenRepos := map[int64]bool{}
+	var seenReposMutex sync.Mutex
+	rescanRepositories := session.Config != nil &&
+		session.Config.Scanning.Bool(session.Config.Scanning.RescanRepositories, false)
 	noDataCount := 0
-	tokenIndex := 0
+	// One ETag per page. Sending it back as If-None-Match makes an unchanged
+	// page answer 304 Not Modified, which GitHub does not count against the
+	// primary rate limit.
+	etags := make([]string, maxPages+1)
 
-	for c := time.Tick(sleep); ; {
-		opt := &github.ListOptions{PerPage: perPage}
-
-		for {
-			if pageCount >= maxPages {
-				break
-			}
-
+	ticker := time.NewTicker(sleep)
+	defer ticker.Stop()
+	for {
+		// page advances only after a page is handled, so the error paths below
+		// retry the same page (as the original loop did) rather than skipping it.
+		for page := 1; page <= maxPages; {
 			// Rotate through tokens to distribute rate limit usage
 			client := session.GetClient()
 
 			// Add timeout to API call
-			ctx, cancel := context.WithTimeout(localCtx, 10*time.Second)
-			events, resp, err := client.Activity.ListEvents(ctx, opt)
-			cancel()
+			ctx, cancelCall := context.WithTimeout(localCtx, 10*time.Second)
+			events, resp, notModified, err := listEventsPage(ctx, client, perPage, page, etags[page])
+			cancelCall()
+
+			if notModified {
+				// Nothing newer than the last poll; older pages are older still.
+				session.FreeClient(client)
+				noDataCount = 0
+				break
+			}
 
 			if err != nil {
 				// A revoked/expired token is dropped from config.yaml and the
@@ -122,10 +218,12 @@ func GetRepositories(session *Session) {
 				}
 
 				if _, ok := err.(*github.RateLimitError); ok {
-					client.RateLimitedUntil = resp.Rate.Reset.Time
+					if resp != nil {
+						client.RateLimitedUntil = resp.Rate.Reset.Time
+						RecordAPIRate(0, resp.Rate.Reset.Time)
+					}
 					session.FreeClient(client)
 					session.Progress.IncrementRateLimited()
-					tokenIndex++
 					continue
 				}
 
@@ -158,13 +256,22 @@ func GetRepositories(session *Session) {
 			session.FreeClient(client)
 			noDataCount = 0
 
-			if opt.Page == 0 {
-				tokenMessage := fmt.Sprintf("[?] Token %s[..] has %d/%d calls remaining.", MaskToken(client.Token), resp.Rate.Remaining, resp.Rate.Limit)
+			if resp != nil {
+				RecordAPIRate(resp.Rate.Remaining, resp.Rate.Reset.Time)
+				// Remember this page's ETag so the next cycle can ask "has it
+				// changed?" for free.
+				if tag := resp.Header.Get("ETag"); tag != "" {
+					etags[page] = tag
+				}
 
-				if resp.Rate.Remaining < 50 {
-					session.Log.Warn("%s", tokenMessage)
-				} else {
-					session.Log.Debug("%s", tokenMessage)
+				if page == 1 {
+					tokenMessage := fmt.Sprintf("[?] Token %s[..] has %d/%d calls remaining.", MaskToken(client.Token), resp.Rate.Remaining, resp.Rate.Limit)
+
+					if resp.Rate.Remaining < 50 {
+						session.Log.Warn("%s", tokenMessage)
+					} else {
+						session.Log.Debug("%s", tokenMessage)
+					}
 				}
 			}
 
@@ -172,40 +279,39 @@ func GetRepositories(session *Session) {
 				break
 			}
 
-			newEvents := make([]*github.Event, 0, len(events))
+			newEvents := markNewEvents(events, observedKeys, &observedKeysMutex)
 
-			// remove duplicates
-			observedKeysMutex.Lock()
-			for _, e := range events {
-				if observedKeys[*e.ID] {
-					continue
-				}
-
-				newEvents = append(newEvents, e)
+			if len(newEvents) == 0 {
+				// This page held only events already dispatched; older pages are
+				// older still, so stop paging instead of spending quota.
+				break
 			}
-			observedKeysMutex.Unlock()
 
 			// Process events concurrently
 			processBatch := func(events []*github.Event) {
 				for _, e := range events {
-					if *e.Type == "PushEvent" {
-						observedKeysMutex.Lock()
-						observedKeys[*e.ID] = true
-						observedKeysMutex.Unlock()
-
+					if e.GetType() == "PushEvent" {
 						dst := &github.PushEvent{}
 						json.Unmarshal(e.GetRawPayload(), dst)
+						id := e.GetRepo().GetID()
+						// An id of 0 means the payload carried no repository;
+						// do not let every such event collapse into one.
+						if !rescanRepositories && id != 0 {
+							seenReposMutex.Lock()
+							dup := seenRepos[id]
+							seenRepos[id] = true
+							seenReposMutex.Unlock()
+							if dup {
+								continue
+							}
+						}
 						session.Repositories <- GitResource{
-							Id:   e.GetRepo().GetID(),
+							Id:   id,
 							Type: GITHUB_SOURCE,
 							Url:  e.GetRepo().GetURL(),
 							Ref:  dst.GetRef(),
 						}
-					} else if *e.Type == "IssueCommentEvent" {
-						observedKeysMutex.Lock()
-						observedKeys[*e.ID] = true
-						observedKeysMutex.Unlock()
-
+					} else if e.GetType() == "IssueCommentEvent" {
 						dst := &github.IssueCommentEvent{}
 						json.Unmarshal(e.GetRawPayload(), dst)
 
@@ -247,13 +353,11 @@ func GetRepositories(session *Session) {
 				go processBatch(newEvents[i:end])
 			}
 
-			pageCount++
-			opt.Page++
+			page++
 		}
 
 		select {
-		case <-c:
-			pageCount = 0 // Reset page count for next cycle
+		case <-ticker.C:
 			continue
 		case <-localCtx.Done():
 			cancel()
@@ -272,13 +376,17 @@ func GetGists(session *Session) {
 	opt := &github.GistListOptions{}
 
 	var client *GitHubClientWrapper
-	for c := time.Tick(sleep); ; {
+	ticker := time.NewTicker(sleep)
+	defer ticker.Stop()
+	for {
 		if client != nil {
 			session.FreeClient(client)
 		}
 
 		client = session.GetClient()
-		gists, resp, err := client.Gists.ListAll(localCtx, opt)
+		callCtx, cancelCall := context.WithTimeout(localCtx, 10*time.Second)
+		gists, resp, err := client.Gists.ListAll(callCtx, opt)
+		cancelCall()
 
 		if err != nil {
 			if isUnauthorized(err, resp) {
@@ -295,7 +403,9 @@ func GetGists(session *Session) {
 			// rest of the run. The client is deliberately NOT freed here: the top
 			// of the loop does that, and freeing twice would double-fill the pool.
 			if _, ok := err.(*github.RateLimitError); ok {
-				client.RateLimitedUntil = resp.Rate.Reset.Time
+				if resp != nil {
+					client.RateLimitedUntil = resp.Rate.Reset.Time
+				}
 				session.Progress.IncrementRateLimited()
 				continue
 			}
@@ -311,9 +421,13 @@ func GetGists(session *Session) {
 			session.Log.Warn("Error getting GitHub Gists: %s ... trying again", err)
 		}
 
+		if resp != nil {
+			RecordAPIRate(resp.Rate.Remaining, resp.Rate.Reset.Time)
+		}
+
 		newGists := make([]*github.Gist, 0, len(gists))
 		for _, e := range gists {
-			if observedKeys[*e.ID] {
+			if observedKeys[e.GetID()] {
 				continue
 			}
 
@@ -321,14 +435,16 @@ func GetGists(session *Session) {
 		}
 
 		for _, e := range newGists {
-			observedKeys[*e.ID] = true
-			session.Gists <- *e.GitPullURL
+			observedKeys[e.GetID()] = true
+			if u := e.GetGitPullURL(); u != "" {
+				session.Gists <- u
+			}
 		}
 
 		opt.Since = time.Now()
 
 		select {
-		case <-c:
+		case <-ticker.C:
 			continue
 		case <-localCtx.Done():
 			cancel()
@@ -338,6 +454,13 @@ func GetGists(session *Session) {
 }
 
 func GetRepository(session *Session, id int64) (*github.Repository, error) {
+	// The same repository generates many events; skip the API call for one seen
+	// recently. This is the single biggest saving on the API budget, which is
+	// otherwise one GetByID per PushEvent.
+	if repo, ok := cachedRepository(id); ok {
+		return repo, nil
+	}
+
 	client := session.GetClient()
 	defer session.FreeClient(client)
 
@@ -350,10 +473,15 @@ func GetRepository(session *Session, id int64) (*github.Repository, error) {
 		return nil, err
 	}
 
-	if resp.Rate.Remaining <= 1 {
-		client.RateLimitedUntil = resp.Rate.Reset.Time
-		session.Progress.IncrementRateLimited()
+	if resp != nil {
+		if resp.Rate.Remaining <= 1 {
+			client.RateLimitedUntil = resp.Rate.Reset.Time
+			session.Progress.IncrementRateLimited()
+		}
+		RecordAPIRate(resp.Rate.Remaining, resp.Rate.Reset.Time)
 	}
+
+	cacheRepository(id, repo)
 
 	return repo, nil
 }

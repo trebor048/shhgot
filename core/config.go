@@ -3,7 +3,6 @@ package core
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -46,11 +45,32 @@ type PerformanceConfig struct {
 	WorkerPoolSize       *int `yaml:"worker_pool_size,omitempty"`
 	QueueBufferSize      *int `yaml:"queue_buffer_size,omitempty"`
 	MaxFileCount         *int `yaml:"max_file_count,omitempty"`
+
+	// Web dashboard ring-buffer caps. Lowering them trims resident memory on a
+	// long scan; each defaults to a value tuned for a small workstation.
+	MaxMatches      *int `yaml:"max_matches,omitempty"`
+	MaxLogLines     *int `yaml:"max_log_lines,omitempty"`
+	MaxTokenResults *int `yaml:"max_token_results,omitempty"`
+	MaxFileDetails  *int `yaml:"max_file_details,omitempty"`
+	MaxFileDetailKB *int `yaml:"max_file_detail_kb,omitempty"`
+
+	// LowImpact trades throughput for a usable machine: it halves the worker
+	// count and drops the process to below-normal CPU priority.
+	LowImpact *bool `yaml:"low_impact,omitempty"`
 }
 
 // Int returns the configured value, or def when the key is absent or <= 0.
 func (p PerformanceConfig) Int(v *int, def int) int {
 	if v != nil && *v > 0 {
+		return *v
+	}
+	return def
+}
+
+// Bool returns the configured value, or def when the key is absent. An explicit
+// false is meaningful, so unlike Int there is no "<= 0" case.
+func (p PerformanceConfig) Bool(v *bool, def bool) bool {
+	if v != nil {
 		return *v
 	}
 	return def
@@ -75,6 +95,20 @@ type ScanningConfig struct {
 	ScanTimeoutSecs  *int  `yaml:"scan_timeout_seconds,omitempty"`
 	SkipForks        *bool `yaml:"skip_forks,omitempty"`
 	SkipArchived     *bool `yaml:"skip_archived,omitempty"`
+	// UseNativeGit prefers a git binary on PATH over the pure-Go clone. Defaults
+	// to true; set false to force the built-in implementation.
+	UseNativeGit *bool `yaml:"use_native_git,omitempty"`
+	// ScanBinary re-enables scanning binary files. Defaults to false: text
+	// signatures cannot match them, so reading them is wasted I/O, but a project
+	// that embeds secrets in binaries can set this true.
+	ScanBinary *bool `yaml:"scan_binary,omitempty"`
+	// RescanRepositories restores per-push cloning: by default a repository is
+	// cloned and scanned at most once per run (the events feed repeats the same
+	// pushes constantly). Set true if you must re-scan every pushed commit.
+	RescanRepositories *bool `yaml:"rescan_repositories,omitempty"`
+	// MaxScanMB bounds the bytes read per repository (0 = no limit). Wall-clock
+	// limits are unpredictable under load; a byte budget is not.
+	MaxScanMB *int `yaml:"max_scan_mb,omitempty"`
 }
 
 // Int returns the configured value, or def when the key is absent or <= 0.
@@ -175,12 +209,12 @@ type CleanupConfig struct {
 
 // WebhookQueueCfg configures webhook delivery with deduplication and rate limiting
 type WebhookQueueCfg struct {
-	Enabled           bool   `yaml:"enabled,omitempty"`
-	QueueSize         int    `yaml:"queue_size,omitempty"`
-	RateLimitMS       int64  `yaml:"rate_limit_ms,omitempty"`
-	DedupeWindowSec   int    `yaml:"dedupe_window_sec,omitempty"`
-	OutputFilePath    string `yaml:"output_file_path,omitempty"`
-	FileOutputEnabled bool   `yaml:"file_output_enabled,omitempty"`
+	QueueSize       int   `yaml:"queue_size,omitempty"`
+	RateLimitMS     int64 `yaml:"rate_limit_ms,omitempty"`
+	DedupeWindowSec int   `yaml:"dedupe_window_sec,omitempty"`
+	// BatchSize coalesces up to this many queued Discord findings into a single
+	// message (Discord allows ten embeds per message). 1 disables batching.
+	BatchSize int `yaml:"batch_size,omitempty"`
 }
 
 type ConfigSignature struct {
@@ -208,19 +242,21 @@ func ParseConfig(options *Options) (*Config, error) {
 	)
 
 	if len(*options.ConfigPath) > 0 {
-		data, err = ioutil.ReadFile(path.Join(*options.ConfigPath, "config.yaml"))
+		data, err = os.ReadFile(path.Join(*options.ConfigPath, "config.yaml"))
 		if err != nil {
 			return config, fmt.Errorf("no config.yaml found in %s (copy config.yaml.example there and fill in a GitHub token, or drop --config-path to search the default locations): %w", *options.ConfigPath, err)
 		}
 	} else {
 		// Trying to first find the configuration next to executable
 		// Helps e.g. with Drone where workdir is different than shhgit dir
-		ex, err := os.Executable()
+		// A failing os.Executable only means dir becomes "." and the read below
+		// falls through to the working-directory attempt anyway.
+		ex, _ := os.Executable()
 		dir := filepath.Dir(ex)
-		data, err = ioutil.ReadFile(path.Join(dir, "config.yaml"))
+		data, err = os.ReadFile(path.Join(dir, "config.yaml"))
 		if err != nil {
 			dir, _ = os.Getwd()
-			data, err = ioutil.ReadFile(path.Join(dir, "config.yaml"))
+			data, err = os.ReadFile(path.Join(dir, "config.yaml"))
 			if err != nil {
 				return config, fmt.Errorf("no config.yaml found next to the binary or in the working directory (copy config.yaml.example to config.yaml and fill in a GitHub token): %w", err)
 			}
@@ -250,7 +286,7 @@ func ParseConfig(options *Options) (*Config, error) {
 		// Validate webhook URL based on the service
 		if strings.Contains(config.Webhook, "discord.com/api/webhooks") {
 			if !ValidateDiscordWebhook(config.Webhook) {
-				return config, errors.New("Discord webhook validation failed. Please check the webhook URL and permissions.")
+				return config, errors.New("discord webhook validation failed; check the webhook URL and permissions")
 			}
 		} else if strings.Contains(config.Webhook, "api.telegram.org") || strings.HasPrefix(config.Webhook, "TELEGRAM_BOT_TOKEN:") {
 			// Extract bot token from webhook URL or config
@@ -259,7 +295,7 @@ func ParseConfig(options *Options) (*Config, error) {
 				botToken = strings.TrimPrefix(config.Webhook, "TELEGRAM_BOT_TOKEN:")
 			}
 			if botToken != "" && !ValidateTelegramWebhook(botToken) {
-				return config, errors.New("Telegram webhook validation failed. Please check the bot token and webhook configuration.")
+				return config, errors.New("telegram webhook validation failed; check the bot token and webhook configuration")
 			}
 		}
 	}

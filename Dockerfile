@@ -8,6 +8,29 @@
 # ===========================================================================
 
 ARG GO_VERSION=1.26
+ARG NODE_VERSION=20
+
+# ---------------------------------------------------------------------------
+# Stage 1: build the React dashboard.
+#
+# The UI under cmd/shhgit/web is embedded into the Go binary with go:embed. A
+# committed bundle lets `go build` work with no Node toolchain, but the image
+# always rebuilds it from source so a release cannot ship a stale UI.
+# ---------------------------------------------------------------------------
+FROM node:${NODE_VERSION}-alpine AS web
+
+WORKDIR /web
+
+# Copy the manifests first so editing sources does not invalidate the npm layer.
+COPY cmd/shhgit/web/package.json cmd/shhgit/web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY cmd/shhgit/web/ ./
+RUN npm run build
+
+# ---------------------------------------------------------------------------
+# Stage 2: build the static Go binary, embedding the dashboard built above.
+# ---------------------------------------------------------------------------
 FROM golang:${GO_VERSION}-alpine AS builder
 
 WORKDIR /src
@@ -19,7 +42,10 @@ RUN go mod download
 
 COPY . .
 
-# Static binary — no cgo, no libc, runs on a bare alpine runtime.
+# Overwrite whatever bundle is in the build context with the freshly built one.
+COPY --from=web /web/dist ./cmd/shhgit/web/dist
+
+# Static binary - no cgo, no libc, runs on a bare alpine runtime.
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/shhgit ./cmd/shhgit
 
 # ---------------------------------------------------------------------------
