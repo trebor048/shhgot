@@ -17,6 +17,7 @@ type Config struct {
 	Webhook                      string            `yaml:"webhook,omitempty"`
 	WebhookPayload               string            `yaml:"webhook_payload,omitempty"`
 	WebhookQueue                 WebhookQueueCfg   `yaml:"webhook_queue,omitempty"`
+	WebhookDiscordUserID         string            `yaml:"webhook_discord_user_id,omitempty"`
 	BlacklistedStrings           []string          `yaml:"blacklisted_strings"`
 	BlacklistedExtensions        []string          `yaml:"blacklisted_extensions"`
 	BlacklistedPaths             []string          `yaml:"blacklisted_paths"`

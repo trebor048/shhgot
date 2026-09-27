@@ -568,8 +568,8 @@ func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, m
 	// Check if we should ping for this match (AI keys, DB connection strings)
 	shouldPing := shouldPingForMatch(signature)
 	userMention := ""
-	if shouldPing {
-		userMention = "<@995923917594173440>\n"
+	if shouldPing && session != nil && session.Config != nil && session.Config.WebhookDiscordUserID != "" {
+		userMention = "<@" + session.Config.WebhookDiscordUserID + ">\n"
 	}
 
 	// Enhanced message format with clear signature match display
@@ -653,19 +653,21 @@ func sendDiscordMatchWebhook(webhookURL string, url string, signature string, fi
 	// Check if we should ping for this match (AI keys, DB connection strings)
 	shouldPing := shouldPingForMatch(signature)
 	userMention := ""
-	if shouldPing {
-		userMention = "<@995923917594173440>\n"
+	if shouldPing && session != nil && session.Config != nil && session.Config.WebhookDiscordUserID != "" {
+		userMention = "<@" + session.Config.WebhookDiscordUserID + ">\n"
 	}
 
 	// Create Discord embed payload
+	// Ensure fields array is never nil (Discord rejects nil fields)
 	fields := []map[string]interface{}{}
 
 	// Add signature match section with clear formatting
 	if len(matchesStr) == 0 || matchesStr == "" {
 		// For filename-based matches (like .env files), show the filename
 		fields = append(fields, map[string]interface{}{
-			"name":  "📄 Matched File",
-			"value": fmt.Sprintf("`%s`", file),
+			"name":   "📄 Matched File",
+			"value":  fmt.Sprintf("`%s`", file),
+			"inline": false,
 		})
 	} else {
 		// Show the actual matched content in a code block

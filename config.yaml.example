@@ -38,6 +38,7 @@ ai_tokens:
 # One webhook endpoint receives every finding. Works with Discord, Slack,
 # Mattermost, Telegram and custom JSON endpoints.
 webhook: '$SHHGIT_DISCORD_WEBHOOK'
+webhook_discord_user_id: ''  # Optional: Discord user ID to ping for critical findings (AI keys, DB strings)
 webhook_payload: |
   {
     "text": "%s"
@@ -119,6 +120,7 @@ match_log_enabled: true
 blacklisted_strings:
   # Common placeholder/example values
   - AKIAIOSFODNN7EXAMPLE
+  - AKIAAABAAAAAAAAAAAAA
   - ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef1234
   - AGBBOTSEN7CEF5CNOFTS
   - XXXXXXXX-enter_your_key_here-XXXXXXXX
