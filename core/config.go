@@ -24,6 +24,8 @@ type Config struct {
 	BlacklistedEntropyExtensions []string          `yaml:"blacklisted_entropy_extensions"`
 	Signatures                   []ConfigSignature `yaml:"signatures"`
 	LogFormat                    string            `yaml:"logFormat,omitempty"`
+	TypewriterEffect             bool              `yaml:"typewriter_effect,omitempty"`
+	TypewriterDelayMS            int               `yaml:"typewriter_delay_ms,omitempty"`
 	Performance                  PerformanceConfig `yaml:"performance,omitempty"`
 	Scanning                     ScanningConfig    `yaml:"scanning,omitempty"`
 	Cleanup                      CleanupConfig     `yaml:"cleanup,omitempty"`

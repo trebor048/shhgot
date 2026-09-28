@@ -62,6 +62,10 @@ webhook_queue:
 # minimal | fancy | ultra fancy | even more fancy | neon
 logFormat: "fancy"
 
+# Typewriter effect: slowly type out logs character by character (disabled by default)
+typewriter_effect: false
+typewriter_delay_ms: 1  # Milliseconds per character (1 = fast, 10 = slow)
+
 performance:
   # Threads for cloning/scanning repositories. 8 keeps a laptop responsive;
   # raise it deliberately if you have cores to spare.

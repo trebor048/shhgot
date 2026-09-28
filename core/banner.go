@@ -146,3 +146,27 @@ func splitLines(text string) []string {
 
 	return lines
 }
+
+// TypePrint prints text with typing animation if enabled in config
+func TypePrint(text string) {
+	if session == nil || session.Config == nil || !session.Config.TypewriterEffect {
+		// Typewriter disabled, print normally
+		fmt.Print(text)
+		return
+	}
+
+	delay := time.Millisecond * 1
+	if session.Config.TypewriterDelayMS > 0 {
+		delay = time.Duration(session.Config.TypewriterDelayMS) * time.Millisecond
+	}
+
+	for _, char := range text {
+		fmt.Print(string(char))
+		time.Sleep(delay)
+	}
+}
+
+// TypePrintln prints text with typing animation and newline
+func TypePrintln(text string) {
+	TypePrint(text + "\n")
+}

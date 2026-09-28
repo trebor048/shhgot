@@ -172,7 +172,28 @@ func emitLocked(s string) {
 	if liveTerminal(os.Stdout) {
 		s = carriageReturnLines(s)
 	}
-	fmt.Print(s)
+	
+	// Use typewriter effect if enabled (skip separator lines)
+	if getSession() != nil && getSession().Config != nil && getSession().Config.TypewriterEffect {
+		// Check if this is a separator line (all dashes, equals, or box chars)
+		isSeparator := true
+		for _, r := range s {
+			if r != '─' && r != '━' && r != '═' && r != '-' && r != '=' && r != '\n' && r != '\r' && r != ' ' {
+				isSeparator = false
+				break
+			}
+		}
+		
+		if isSeparator {
+			// Print separator instantly
+			fmt.Print(s)
+		} else {
+			// Type out character by character
+			core.TypePrint(s)
+		}
+	} else {
+		fmt.Print(s)
+	}
 }
 
 // lockWrite emits one pre-built block as a single write under the shared

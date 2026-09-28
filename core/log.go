@@ -140,11 +140,15 @@ var ConsoleWriter func(format string, args ...interface{})
 
 // Say prints a console diagnostic, funneled through ConsoleWriter when set.
 func Say(format string, args ...interface{}) {
+	text := fmt.Sprintf(format, args...)
+	
 	if ConsoleWriter != nil {
 		ConsoleWriter(format, args...)
 		return
 	}
-	fmt.Printf(format, args...)
+	
+	// Use typewriter effect if enabled
+	TypePrint(text)
 }
 
 func (l *Logger) SetDebug(d bool) {
