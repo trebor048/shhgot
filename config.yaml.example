@@ -121,6 +121,8 @@ blacklisted_strings:
   # Common placeholder/example values
   - AKIAIOSFODNN7EXAMPLE
   - AKIAAABAAAAAAAAAAAAA
+  - AIDAQEBAAAAAAAAAAAAA
+  - ASIA4W24O3EONQWOERZ5
   - ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef1234
   - AGBBOTSEN7CEF5CNOFTS
   - XXXXXXXX-enter_your_key_here-XXXXXXXX
@@ -173,6 +175,10 @@ blacklisted_strings:
   - SECRET_KEY = 'xxx'
   - private_key = 'fake'
   - public_key = 'placeholder'
+  # Ethereum test addresses
+  - '0x000000000000000000000000000000000000dead'
+  - '0x0000000000000000000000000000000000000000'
+  - '0xDeadDeAddeAddEAddeadDEaDDEAdDeaDDeAD0000'
   # --- Additional placeholder / false-positive markers -------------------------
   # Case-insensitive substring match: a finding containing any of these is
   # dropped. Kept specific so a genuine key is never swallowed.

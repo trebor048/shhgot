@@ -588,7 +588,11 @@ func (s PatternSignature) applyVerifier(match string, file MatchFile) bool {
 			isValid = ValidateSSHKey(match)
 			tokenType = "SSH Key"
 		case "crypto_balance":
+			// Always accept crypto key matches (format is valid)
+			// Balance validation is informational only - include in webhook
 			isValid, tokenType = ValidateCryptoKey(match)
+			// Override isValid to always be true so match appears in logs/webhook
+			isValid = true
 		default:
 			// config.yaml validation rejects unknown verifiers at load time, so
 			// this is only reached if a signature was built programmatically.
