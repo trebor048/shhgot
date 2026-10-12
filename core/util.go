@@ -21,7 +21,10 @@ func GetTempDir(suffix string) string {
 	// writes a file into it and ignored the failure, so those comments were never
 	// scanned.
 	os.RemoveAll(dir)
-	os.MkdirAll(dir, os.ModePerm)
+	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+		// Surface the failure instead of returning a path that does not exist.
+		LogIfError("Could not create temp directory "+dir, err)
+	}
 
 	return dir
 }

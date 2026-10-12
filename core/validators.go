@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,10 +18,6 @@ import (
 )
 
 var (
-	httpClient = &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
 	// Global webhook queue for rate limiting and retry
 	globalWebhookQueue *WebhookQueue
 	webhookQueueOnce   sync.Once
@@ -78,6 +75,17 @@ func GetWebhookQueue() *WebhookQueue {
 	return globalWebhookQueue
 }
 
+// DrainWebhookQueue closes the singleton queue and waits up to timeout for
+// the buffered alerts to go out, so a one-shot run neither loses findings nor
+// skips their persist-on-confirm. Nil-safe (no queue was ever used) and
+// reports whether the queue emptied in time.
+func DrainWebhookQueue(timeout time.Duration) bool {
+	if globalWebhookQueue == nil {
+		return true
+	}
+	return globalWebhookQueue.Drain(timeout)
+}
+
 // validateDiscordTokenFormat checks a Discord bot token's shape without any
 // network call: 59 characters, [MN] prefix, and three dot-separated segments
 // where the second is 6 characters and the third is 27.
@@ -126,13 +134,13 @@ func ValidateDiscordToken(token string) bool {
 	}
 
 	// API validation (optional, can be disabled for performance)
-	req, err := http.NewRequest("GET", "https://discord.com/api/v10/users/@me", nil)
+	req, err := http.NewRequest("GET", discordAPIBase+"/users/@me", nil)
 	if err != nil {
 		return false
 	}
 
 	req.Header.Set("Authorization", "Bot "+token)
-	resp, err := httpClient.Do(req)
+	resp, err := validatorHTTPDoer().Do(req)
 	if err != nil {
 		return false
 	}
@@ -176,8 +184,12 @@ func ValidateTelegramToken(token string) bool {
 	}
 
 	// API validation (optional, can be disabled for performance)
-	url := "https://api.telegram.org/bot" + token + "/getMe"
-	resp, err := httpClient.Get(url)
+	url := telegramAPIBase + "/bot" + token + "/getMe"
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := validatorHTTPDoer().Do(req)
 	if err != nil {
 		return false
 	}
@@ -232,9 +244,16 @@ func ValidateDiscordWebhook(webhookURL string) bool {
 		return false
 	}
 
-	// httpClient carries a 10s timeout; http.DefaultClient has none, so a hung
-	// Discord endpoint used to stall startup (this runs from ParseConfig).
-	resp, err := httpClient.Post(webhookURL, "application/json", strings.NewReader(string(jsonData)))
+	// The shared client carries a bounded timeout; http.DefaultClient has none,
+	// so a hung Discord endpoint used to stall startup (this runs from
+	// ParseConfig).
+	req, err := http.NewRequest("POST", webhookURL, strings.NewReader(string(jsonData)))
+	if err != nil {
+		Say("[ERROR] Discord webhook request failed: %v\n", err)
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := validatorHTTPDoer().Do(req)
 	if err != nil {
 		Say("[ERROR] Discord webhook POST failed: %v\n", err)
 		return false
@@ -286,8 +305,12 @@ func ValidateTelegramWebhook(botToken string) bool {
 	}
 
 	// Check webhook info
-	url := "https://api.telegram.org/bot" + botToken + "/getWebhookInfo"
-	resp, err := httpClient.Get(url)
+	url := telegramAPIBase + "/bot" + botToken + "/getWebhookInfo"
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := validatorHTTPDoer().Do(req)
 	if err != nil {
 		return false
 	}
@@ -311,6 +334,30 @@ func ValidateTelegramWebhook(botToken string) bool {
 	}
 
 	return true
+}
+
+// jsonEscapeForTemplate returns s encoded as a JSON string with the surrounding
+// quotes removed, so it can be substituted into a JSON payload template such as
+// {"text": "%s"}. Scanned content (a matched secret, a file name, a repository
+// URL) can carry a quote, backslash or newline; embedding it raw produced
+// invalid JSON and let repo content inject fields into the operator's endpoint.
+func jsonEscapeForTemplate(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return ""
+	}
+	return string(b[1 : len(b)-1])
+}
+
+// buildWebhookPayload renders a webhook payload template with message, escaping
+// message as a JSON string first. An empty template falls back to the Slack
+// style {"text": "%s"} default. The escaped message is passed to Sprintf as an
+// argument, so a "%" inside it is never reinterpreted as a format verb.
+func buildWebhookPayload(template, message string) string {
+	if template == "" {
+		template = `{"text": "%s"}`
+	}
+	return fmt.Sprintf(template, jsonEscapeForTemplate(message))
 }
 
 // SendValidationWebhook sends a webhook notification about token validation results
@@ -337,20 +384,34 @@ func SendValidationWebhook(webhookURL, webhookPayload, tokenType, token, reposit
 	var payload string
 	if strings.Contains(webhookURL, "discord.com/api/webhooks") {
 		// Discord format
-		payload = fmt.Sprintf(`{"content": "%s"}`, message)
+		b, err := json.Marshal(map[string]string{"content": message})
+		if err != nil {
+			return
+		}
+		payload = string(b)
 	} else {
 		// Default format (Slack, MatterMost, etc.)
-		payload = fmt.Sprintf(webhookPayload, message)
+		payload = buildWebhookPayload(webhookPayload, message)
 	}
 
 	// Send webhook notification through the bounded client so a slow endpoint
 	// cannot hold the goroutine indefinitely.
-	resp, err := httpClient.Post(webhookURL, "application/json", strings.NewReader(payload))
+	req, err := http.NewRequest("POST", webhookURL, strings.NewReader(payload))
+	if err != nil {
+		// Silently fail to avoid infinite loops
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := SharedHTTPClient().Do(req)
 	if err != nil {
 		// Silently fail to avoid infinite loops
 		return
 	}
 	defer resp.Body.Close()
+	// Drain so the connection can be reused; the status is intentionally not
+	// treated as fatal (this notification is fire-and-forget), but leaving the
+	// body unread disabled keep-alive for the shared client.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 }
 
 // maskToken masks a token for logging purposes
@@ -528,13 +589,22 @@ func isWIFKeyFormat(s string) bool {
 // rich Discord embed for Discord endpoints and falls back to the generic
 // webhook_payload template (Slack, Mattermost, custom) otherwise. Unlike the
 // original high-priority-only helper it fires for every match.
-func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, matches []string, color string, priority int, fileContent string) {
+// severity is the finding's dynamic severity; when non-empty it overrides the
+// signature colour as the Discord embed accent, so the alert colour reflects the
+// verified impact rather than the rule's static priority. An empty severity (a
+// record written before Slice 6, or a verifier that did not run) keeps color.
+//
+// onDelivery is forwarded to the webhook queue and fires once with the final
+// delivery outcome, so the caller can record a cross-run dedupe fingerprint
+// only when the alert actually went out. It may be nil.
+func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, matches []string, color string, priority int, fileContent string, severity string, onDelivery func(ok bool)) {
 	if webhookURL == "" {
+		notifyDelivery(onDelivery, true)
 		return
 	}
 
 	if strings.Contains(webhookURL, "discord.com/api/webhooks") {
-		sendDiscordMatchWebhook(webhookURL, url, signature, file, matches, color, priority, fileContent)
+		sendDiscordMatchWebhook(webhookURL, url, signature, file, matches, color, priority, fileContent, severity, onDelivery)
 		return
 	}
 
@@ -542,7 +612,7 @@ func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, m
 	// template from config (defaults to a Slack-style {"text": "..."}).
 	matchesStr := strings.Join(matches, ", ")
 	if len(matchesStr) > 1000 {
-		matchesStr = matchesStr[:997] + "..."
+		matchesStr = truncateForWebhook(matchesStr, 997)
 	}
 
 	// For filename-based matches, show the filename if no content matches
@@ -590,15 +660,12 @@ func SendMatchWebhook(webhookURL, webhookPayload, url, signature, file string, m
 		message += "\n**📄 .env File Content:**\n```env\n" + truncateEnvContent(fileContent, maxEnvEmbedChars) + "\n```"
 	}
 
-	if webhookPayload == "" {
-		webhookPayload = `{"text": "%s"}`
-	}
-	payload := fmt.Sprintf(webhookPayload, message)
+	payload := buildWebhookPayload(webhookPayload, message)
 
 	// Deliver through the shared queue so a generic endpoint gets the same
 	// deduplication, spacing and retry as Discord. This used to POST inline,
 	// which meant Slack or a custom endpoint had none of that.
-	GetWebhookQueue().Enqueue(webhookURL, payload)
+	GetWebhookQueue().Enqueue(webhookURL, payload, onDelivery)
 }
 
 // shouldPingForMatch returns true if the signature should trigger a Discord mention
@@ -640,14 +707,15 @@ func shouldPingForMatch(signature string) bool {
 }
 
 // sendDiscordMatchWebhook sends a match alert as a rich Discord embed via the webhook queue.
-func sendDiscordMatchWebhook(webhookURL string, url string, signature string, file string, matches []string, color string, priority int, fileContent string) {
-	// Convert color hex to decimal for Discord embed
-	colorInt := parseColorHex(color)
+func sendDiscordMatchWebhook(webhookURL string, url string, signature string, file string, matches []string, color string, priority int, fileContent string, severity string, onDelivery func(ok bool)) {
+	// The finding's severity, when known, wins over the signature colour so the
+	// embed accent tracks the verified impact.
+	colorInt := EmbedColor(severity, color)
 
 	// Truncate matches if too long
 	matchesStr := strings.Join(matches, ", ")
 	if len(matchesStr) > 2048 {
-		matchesStr = matchesStr[:2045] + "..."
+		matchesStr = truncateForWebhook(matchesStr, 2045)
 	}
 
 	// Check if we should ping for this match (AI keys, DB connection strings)
@@ -673,7 +741,7 @@ func sendDiscordMatchWebhook(webhookURL string, url string, signature string, fi
 		// Show the actual matched content in a code block
 		matchDisplay := fmt.Sprintf("```\n%s\n```", matchesStr)
 		if len(matchDisplay) > 1024 {
-			matchDisplay = fmt.Sprintf("```\n%s\n```", matchesStr[:900]+"...")
+			matchDisplay = fmt.Sprintf("```\n%s\n```", truncateForWebhook(matchesStr, 900))
 		}
 		fields = append(fields, map[string]interface{}{
 			"name":   "🔍 Signature Match",
@@ -762,12 +830,24 @@ func sendDiscordMatchWebhook(webhookURL string, url string, signature string, fi
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
 		Say("[ERROR] Failed to marshal Discord webhook payload: %v\n", err)
+		notifyDelivery(onDelivery, false)
 		return
 	}
 
 	// Use webhook queue for rate limiting and retry logic
 	queue := GetWebhookQueue()
-	queue.Enqueue(webhookURL, string(jsonPayload))
+	queue.Enqueue(webhookURL, string(jsonPayload), onDelivery)
+}
+
+// truncateForWebhook caps s at max bytes without splitting a multibyte rune,
+// appending an ellipsis when it had to cut. The webhook fields carry scanned
+// content which may be UTF-8; a raw byte slice could cut a rune in half and put
+// invalid UTF-8 into the JSON body.
+func truncateForWebhook(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return truncateToRuneBoundary(s, max) + "..."
 }
 
 // maxEnvEmbedChars bounds how much .env file content is embedded in a generic
@@ -777,29 +857,45 @@ func sendDiscordMatchWebhook(webhookURL string, url string, signature string, fi
 // realistic .env; truncateEnvContent marks anything it had to cut.
 const maxEnvEmbedChars = 3500
 
+// envTruncationMarker is appended by truncateEnvContent when it cuts content.
+const envTruncationMarker = "\n... (truncated)"
+
 // truncateEnvContent caps s at max bytes without splitting a multi-byte UTF-8
-// rune, appending a marker when it had to cut. max <= 0 means no cap.
+// rune, appending a marker when it had to cut. max <= 0 means no cap. The
+// marker is budgeted into max: appending it after slicing at max returned
+// max+len(marker) bytes, which let the .env chunker emit more chunks than the
+// section's field budget allowed.
 func truncateEnvContent(s string, max int) string {
 	if max <= 0 || len(s) <= max {
 		return s
 	}
-	cut := max
+	cut := max - len(envTruncationMarker)
+	if cut <= 0 {
+		// No room for the marker within the cap; honour the cap alone.
+		return truncateToRuneBoundary(s, max)
+	}
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
-	return s[:cut] + "\n... (truncated)"
+	return s[:cut] + envTruncationMarker
 }
 
-// chunkString splits a string into chunks of max size
+// chunkString splits a string into chunks of at most maxSize bytes, cutting on
+// rune boundaries so a multibyte character is never split between chunks.
 func chunkString(s string, maxSize int) []string {
-	if len(s) <= maxSize {
+	if maxSize <= 0 || len(s) <= maxSize {
 		return []string{s}
 	}
 
 	var chunks []string
 	for len(s) > maxSize {
-		chunks = append(chunks, s[:maxSize])
-		s = s[maxSize:]
+		chunk := truncateToRuneBoundary(s, maxSize)
+		if chunk == "" {
+			// A single rune longer than maxSize would otherwise stall the loop.
+			chunk = s[:maxSize]
+		}
+		chunks = append(chunks, chunk)
+		s = s[len(chunk):]
 	}
 	if len(s) > 0 {
 		chunks = append(chunks, s)
@@ -875,10 +971,12 @@ func parseColorHex(hexColor string) int {
 		return 15158332 // Red
 	}
 
-	// Convert hex to int
-	var colorInt int
-	if _, err := fmt.Sscanf(hexColor, "%x", &colorInt); err != nil {
+	// Convert hex to int. ParseUint rejects a trailing non-hex character (which
+	// fmt.Sscanf("%x") silently ignored, parsing "12GH45" as 0x12), so a
+	// malformed colour falls back to red instead of a partial value.
+	colorInt, err := strconv.ParseUint(hexColor, 16, 24)
+	if err != nil {
 		return 15158332 // Red
 	}
-	return colorInt
+	return int(colorInt)
 }

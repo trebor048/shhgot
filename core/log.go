@@ -141,12 +141,12 @@ var ConsoleWriter func(format string, args ...interface{})
 // Say prints a console diagnostic, funneled through ConsoleWriter when set.
 func Say(format string, args ...interface{}) {
 	text := fmt.Sprintf(format, args...)
-	
+
 	if ConsoleWriter != nil {
 		ConsoleWriter(format, args...)
 		return
 	}
-	
+
 	// Use typewriter effect if enabled
 	TypePrint(text)
 }
@@ -191,6 +191,12 @@ func postWebhook(url, payload string) {
 	resp.Body.Close()
 }
 
+// logWebhookSlots bounds concurrent log-triggered webhook deliveries so a
+// sustained error condition cannot spawn unbounded goroutines. A full set of
+// slots means alerts are already in flight; further non-fatal alerts are
+// dropped rather than queued.
+var logWebhookSlots = make(chan struct{}, 8)
+
 func (l *Logger) Log(level int, format string, args ...interface{}) {
 	l.Lock()
 	// The flags are read under the same lock the setters use; reading them
@@ -227,8 +233,22 @@ func (l *Logger) Log(level int, format string, args ...interface{}) {
 	// network call, and the scanner must not wait on it.
 	if level > WARN && session != nil && session.Config != nil && session.Config.Webhook != "" {
 		text := colorStrip(fmt.Sprintf(format, args...))
-		payload := fmt.Sprintf(session.Config.WebhookPayload, text)
-		go postWebhook(session.Config.Webhook, payload)
+		payload := buildWebhookPayload(session.Config.WebhookPayload, text)
+		if level == FATAL {
+			// Deliver synchronously: the os.Exit below would otherwise discard
+			// the goroutine before the alert left the process.
+			postWebhook(session.Config.Webhook, payload)
+		} else {
+			select {
+			case logWebhookSlots <- struct{}{}:
+				go func(url, body string) {
+					defer func() { <-logWebhookSlots }()
+					postWebhook(url, body)
+				}(session.Config.Webhook, payload)
+			default:
+				// Bounded concurrency: drop rather than grow goroutines without limit.
+			}
+		}
 	}
 
 	if level == FATAL {

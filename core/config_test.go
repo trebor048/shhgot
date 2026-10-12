@@ -1,8 +1,13 @@
 package core
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -138,6 +143,61 @@ github_access_tokens:
 	}
 	if got := s.Int(intPtr(-5), 42); got != 42 {
 		t.Errorf("non-positive int fallback = %d, want 42", got)
+	}
+}
+
+// The documented Telegram webhook form is
+// https://api.telegram.org/bot<token>/... but ParseConfig only extracted a token
+// from the "TELEGRAM_BOT_TOKEN:" prefix, so the URL form was never validated.
+func TestParseConfigValidatesTelegramURLForm(t *testing.T) {
+	var requests int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&requests, 1)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	old := telegramAPIBase
+	telegramAPIBase = srv.URL
+	defer func() { telegramAPIBase = old }()
+
+	dir := t.TempDir()
+	botToken := strings.Repeat("1", 10) + ":" + strings.Repeat("a", 35)
+	cfg := "webhook: \"https://api.telegram.org/bot" + botToken + "/sendMessage\"\ngithub_access_tokens:\n  - 'ghp_placeholder'\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfg), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	threads := 4
+	opts := &Options{ConfigPath: &dir, Threads: &threads, Local: strPtr("/tmp")}
+	if _, err := ParseConfig(opts); err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if got := atomic.LoadInt64(&requests); got == 0 {
+		t.Fatal("telegram URL-form webhook was not validated (no request reached the bot API)")
+	}
+}
+
+func TestTelegramTokenFromWebhookURL(t *testing.T) {
+	token := "1234567890:" + strings.Repeat("a", 35)
+	cases := []struct {
+		name    string
+		webhook string
+		want    string
+	}{
+		{"sendMessage", "https://api.telegram.org/bot" + token + "/sendMessage", token},
+		{"getMe", "https://api.telegram.org/bot" + token + "/getMe", token},
+		{"bare bot path", "https://api.telegram.org/bot" + token, token},
+		{"no bot segment", "https://api.telegram.org/foo", ""},
+		{"empty", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := telegramTokenFromWebhookURL(c.webhook); got != c.want {
+				t.Errorf("telegramTokenFromWebhookURL(%q) = %q, want %q", c.webhook, got, c.want)
+			}
+		})
 	}
 }
 

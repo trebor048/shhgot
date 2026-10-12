@@ -379,7 +379,7 @@ var providers = []Provider{
 		ID: "ollama", DisplayName: "Ollama (local)", Category: "Local",
 		BaseURL: "http://localhost:11434", CheckPath: "/api/tags", CheckMethod: "GET",
 		AuthType: AuthBearer, AuthHeader: "Authorization", AuthPrefix: "Bearer ",
-		EnvVars: []string{"OLLAMA_HOST", "OLLAMA_API_KEY"},
+		EnvVars: []string{"OLLAMA_API_KEY"},
 	},
 	{
 		ID: "lmstudio", DisplayName: "LM Studio (local)", Category: "Local",
@@ -427,20 +427,21 @@ func discoverKeys() map[string][]string {
 			if k == "" {
 				continue
 			}
-			matched := false
+			// Choose the longest matching prefix across all providers, not the
+			// first provider that matches: "sk-" (OpenAI) is a prefix of
+			// "sk-ant-"/"sk-or-v1-", so first-match misattributed every
+			// Anthropic/OpenRouter/DeepSeek key to OpenAI.
+			bestID, bestLen := "", 0
 			for _, p := range providers {
 				for _, prefix := range p.KeyPrefixes {
-					if strings.HasPrefix(k, prefix) {
-						keys[p.ID] = appendIfUnique(keys[p.ID], k)
-						matched = true
-						break
+					if len(prefix) > bestLen && strings.HasPrefix(k, prefix) {
+						bestID, bestLen = p.ID, len(prefix)
 					}
 				}
-				if matched {
-					break
-				}
 			}
-			if !matched {
+			if bestID != "" {
+				keys[bestID] = appendIfUnique(keys[bestID], k)
+			} else {
 				keys["unknown"] = appendIfUnique(keys["unknown"], k)
 			}
 		}
@@ -653,7 +654,7 @@ func (c *Checker) checkKey(ctx context.Context, p Provider, key string) CheckRes
 	case AuthBearer:
 		req.Header.Set(p.AuthHeader, p.AuthPrefix+key)
 	case AuthAPIKey:
-		req.Header.Set(p.AuthHeader, key)
+		req.Header.Set(p.AuthHeader, p.AuthPrefix+key)
 	case AuthXAPIKey:
 		req.Header.Set(p.AuthHeader, key)
 	case AuthToken:
@@ -805,7 +806,12 @@ func (c *Checker) checkKey(ctx context.Context, p Provider, key string) CheckRes
 func truncate(s string, max int) string {
 	s = strings.TrimSpace(s)
 	if len(s) > max {
-		return s[:max] + "..."
+		// Truncate on runes so a multi-byte character is not split, which would
+		// emit invalid UTF-8 in a provider error message.
+		r := []rune(s)
+		if len(r) > max {
+			return string(r[:max]) + "..."
+		}
 	}
 	return s
 }

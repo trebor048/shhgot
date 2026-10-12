@@ -89,6 +89,8 @@ scanning:
   max_file_size_mb: 2
   max_repo_size_mb: 1000
   clone_depth: 1
+  # context_lines captures N lines around a match for display/AI review; 0 = off.
+  context_lines: 0
   clone_timeout_seconds: 60
   scan_timeout_seconds: 120
   # Byte budget per repository (0 = no limit). Predictable where a wall-clock
@@ -147,13 +149,11 @@ blacklisted_strings:
   - sk-test-1234567890abcdefghijklmnop
   - sk-fake-1234567890abcdefghijklmnopqrstuvwxyz
   - eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
-  - PLACEHOLDER
-  - FAKE
-  - DUMMY
-  - MOCK
-  - SAMPLE
-  - EXAMPLE
-  - TODO
+  # NOTE: bare placeholder words (TODO, FAKE, DUMMY, MOCK, SAMPLE, EXAMPLE,
+  # PLACEHOLDER) are intentionally NOT listed here. They are suppressed in code
+  # (placeholderRe in core/signatures.go), where the same guard also covers a
+  # drifted live config. Re-adding them here would suppress any match merely
+  # containing those letters.
   - CHANGEME
   - CHANGE_ME
   - REPLACE_ME
@@ -199,7 +199,6 @@ blacklisted_strings:
   - 'not_a_real'
   - 'not-real'
   - 'redacted'
-  - 'placeholder'
   - 'changeme'
   - 'change-me'
   - 'replace_me'
@@ -350,15 +349,11 @@ blacklisted_paths:
   - .next{sep}
   - .nuxt{sep}
   - .svelte-kit{sep}
-  # Docker / Containers
-  - .docker{sep}
-  - docker-compose.yml
-  - Dockerfile
-  # CI/CD
-  - .github{sep}workflows{sep}
-  - .gitlab-ci.yml
-  - .circleci{sep}
-  - .travis.yml
+  # NOTE: Dockerfile, docker-compose.yml, .docker/, .github/workflows/,
+  # .gitlab-ci.yml, .circleci/ and .travis.yml are intentionally NOT skipped.
+  # They are prime secret locations (ENV/ARG passwords, env: blocks, registry
+  # auth); their template noise (${...}, YOUR_KEY) is handled by the
+  # placeholder guard in core/signatures.go instead of by skipping the files.
   # Documentation
   - docs{sep}
   - doc{sep}
@@ -429,6 +424,179 @@ blacklisted_entropy_extensions:
   - .ini
   - .toml
 
+# ── Shared outbound HTTP client ──────────────────────────────
+http:
+  retries: 3
+  backoff_initial_ms: 250
+  backoff_max_ms: 30000
+  jitter: true
+  timeout_seconds: 15
+  breaker_failure_threshold: 5
+  breaker_cooldown_seconds: 60
+  breaker_half_open_probes: 3
+  # protected_hosts: ["api.openai.com", "api.anthropic.com"]
+  # Outbound proxy. proxy_url is a single proxy; proxies rotates one per
+  # request and takes precedence. proxy_ban_after benches a rotating member
+  # after that many consecutive failures (default 3). Schemes: http, https,
+  # socks5, socks5h.
+  # proxy_url: "socks5://127.0.0.1:1080"
+  # proxies: ["http://proxy1:8080", "http://proxy2:8080"]
+  # proxy_ban_after: 3
+
+# ── In-process metrics (on by default) ──────────────────────
+metrics:
+  enabled: true
+
+# ── Persistent findings store (off by default) ──────────────
+storage:
+  enabled: false
+  path: shhgit-findings.jsonl
+  dedupe_ttl_seconds: 86400
+  max_dedupe_entries: 100000
+  compact_after: 1000
+
+# ── GitHub code search (off by default) ─────────────────────
+search:
+  enabled: false
+  per_page: 100
+  max_pages: 1
+  max_results: 1000
+  sleep_ms: 2000
+  min_stars: 0
+  # queries: ['"sk-proj-" in:file NOT test NOT example']
+  # query_file: search-queries.txt
+
+# ── AI false-positive filter (off by default; Ollama preferred) ─
+ai_filter:
+  enabled: false
+  quick_filter: true
+  provider: ollama
+  model: ""
+  base_url: ""
+  workers: 2
+  cache_entries: 1000
+  cache_ttl_seconds: 3600
+
+# ── Extra alert channels and delivery policy ────────────────
+notify:
+  test_on_start: false
+  quiet_hours:
+    enabled: false
+    start: "23:00"
+    end: "07:00"
+  # channels:
+  #   - type: slack
+  #     url: "https://hooks.slack.com/services/..."
+  #     min_severity: high
+  #   - type: email
+  #     min_severity: critical
+  #   # Feishu (Lark) custom bot: url is the bot webhook.
+  #   - type: feishu
+  #     url: "https://open.feishu.cn/open-apis/bot/v2/hook/<token>"
+  #   # DingTalk custom robot: secret enables HMAC-SHA256 signed delivery.
+  #   - type: dingtalk
+  #     url: "https://oapi.dingtalk.com/robot/send?access_token=<token>"
+  #     secret: "SEC..."
+  #   # Bark (iOS): the device key alone, or https://<relay>/<device-key>.
+  #   - type: bark
+  #     url: "<device-key>"
+  #   # ServerChan: the SendKey alone, or https://sctapi.ftqq.com/<key>.send.
+  #   - type: serverchan
+  #     url: "<sendkey>"
+  #   # PushPlus: the account token.
+  #   - type: pushplus
+  #     url: "<token>"
+  #   # WxPusher: "<appToken>|<uid1>,<uid2>" (or appToken + secret UID list).
+  #   - type: wxpusher
+  #     url: "<appToken>|<uid1>,<uid2>"
+
+# ── Non-GitHub discovery sources ────────────────────────────
+# Tokenless sources default ON (no key needed): gitlab snippets, searchcode,
+# sourcegraph (anonymous; token only raises the rate limit), grepapp, psbdmp.
+# Token/paid-gated ones default OFF: gitlab blobs (Premium + token),
+# github_commits / github_issues / search (GitHub token), pastebin (Pro + IP
+# whitelist), bitbucket (needs a workspace list).
+sources:
+  gitlab:
+    # GitLab public snippets: https://gitlab.com/api/v4/snippets/public
+    enabled: true
+    per_page: 50
+    interval_seconds: 300
+    # Authenticated blobs (code search) source. Needs a Premium/Ultimate
+    # instance with advanced (exact code) search, plus a token below.
+    search_enabled: false
+    token: ""
+  github_commits:
+    # GitHub commit search: https://api.github.com/search/commits
+    # Uses the first github_access_tokens entry; queries default to the
+    # signature anchors when empty.
+    enabled: false
+    queries: []
+    max_results: 100
+    interval_seconds: 300
+  github_issues:
+    # GitHub issue/PR search: https://api.github.com/search/issues
+    # Uses the first github_access_tokens entry; queries default to the
+    # signature anchors when empty.
+    enabled: false
+    queries: []
+    max_results: 100
+    interval_seconds: 300
+  pastebin:
+    # Pastebin Scraping API: https://scrape.pastebin.com/api_scraping.php
+    # Needs a Pastebin Pro account with this host's IP whitelisted; api_key only
+    # gates the source on/off (the scrape endpoint is not key-authenticated).
+    enabled: false
+    api_key: ""
+    limit: 100
+    interval_seconds: 30
+  searchcode:
+    # searchcode.com code search: https://searchcode.com/api/codesearch_I/
+    enabled: true
+    queries: []
+    per_page: 100
+    max_pages: 3
+    interval_seconds: 300
+  sourcegraph:
+    # Sourcegraph stream search: https://sourcegraph.com/.api/search/stream
+    # Anonymous works; token only raises the rate limit.
+    enabled: true
+    queries: []
+    max_results: 100
+    interval_seconds: 300
+    token: ""
+  grepapp:
+    # grep.app code search: https://grep.app/api/search
+    # Queries default to the signature anchors when empty.
+    enabled: true
+    queries: []
+    max_results: 100
+    interval_seconds: 300
+  psbdmp:
+    # psbdmp.ws Pastebin dump search: https://psbdmp.ws/api/v3/search/
+    # Queries default to the signature anchors when empty.
+    enabled: true
+    queries: []
+    max_results: 100
+    interval_seconds: 300
+  bitbucket:
+    # Bitbucket Cloud workspaces: https://api.bitbucket.org/2.0/repositories
+    # Bitbucket has no public discovery endpoint, so list the workspaces to walk.
+    enabled: false
+    workspaces: []
+    max_repos: 50
+    max_files: 500
+    interval_seconds: 300
+
+# ── Live credential validation ──────────────────────────────
+validators:
+  cache_enabled: false
+  cache_ttl_seconds: 3600
+  cache_max_entries: 10000
+  domain_cooldown_seconds: 1800
+  max_concurrency: 8
+  min_interval_ms: 1200
+
 signatures:
   # ================================================================
   # CREDENTIALS / SENSITIVE FILES
@@ -451,27 +619,31 @@ signatures:
     priority: 3
     color: '#e83d56'
   - part: contents
-    regex: bearer_[A-Za-z0-9]{40}
+    regex: '\bbearer_[A-Za-z0-9]{40,}\b'
     name: Bearer Token
     priority: 3
     color: '#ff5c7a'
   - part: contents
     regex: (database_url|db_url|db_connection|connection_string|conn_string)\s*[:=]\s*["\x27]([^\"\x27]{20,})["\x27]
+    not_regex: '(?i)localhost|127\.0\.0\.1|::1'
     name: Database Connection String in Quotes
     priority: 3
     color: '#ff3b5c'
   - part: contents
-    regex: '(postgres(ql)?|cockroachdb|mysql|mariadb|mongodb(\+srv)?|rediss?|amqps?|mssql|sqlserver|clickhouse|neo4j)://[^\s:@/]*:[^\s:@/]+@'
+    regex: '(postgres(ql)?|cockroachdb|mysql|mariadb|mongodb(\+srv)?|rediss?|amqps?|mssql|sqlserver|clickhouse|neo4j)://[^\s:@/]+:[^\s:@/]+@[^\s"\x27\),;]+'
+    not_regex: '(?i)localhost|127\.0\.0\.1|::1'
     name: Database Connection String with Credentials
     priority: 3
     color: '#ff3b5c'
   - part: contents
-    regex: 'jdbc:[a-z0-9]+://[^\s:@/]*:[^\s:@/]+@'
+    regex: 'jdbc:[a-z0-9]+://[^\s:@/]*:[^\s:@/]+@[^\s"\x27]+'
+    not_regex: '(?i)localhost|127\.0\.0\.1|::1'
     name: JDBC Connection String with Credentials
     priority: 3
     color: '#ff3b5c'
   - part: contents
-    regex: '(?i)(Data Source|Server)=tcp:[^;]+;[^;]*(Password|Pwd)='
+    regex: '(?i)(Data Source|Server)=(tcp:)?[^;]+;[^;]*(Password|Pwd)='
+    not_regex: '(?i)localhost|127\.0\.0\.1|::1'
     name: ADO.NET Connection String
     priority: 3
     color: '#ff3b5c'
@@ -491,7 +663,7 @@ signatures:
     priority: 3
     color: '#ff5c7a'
   - part: contents
-    regex: ya29\.[0-9A-Za-z_-]{20,40}
+    regex: '\bya29\.[0-9A-Za-z_-]{20,}\b'
     name: Google OAuth Token
     priority: 3
     color: '#ff3b5c'
@@ -548,7 +720,7 @@ signatures:
     priority: 2
     color: '#ff5c7a'
   - part: filename
-    regex: (dump|logs)\.sql
+    regex: '^(.*[_.-])?(dump|logs)\.sql$'
     name: SQL database dump/logs
     priority: 3
     color: '#ff3b5c'
@@ -564,7 +736,7 @@ signatures:
     priority: 2
     color: '#e83d56'
   - part: contents
-    regex: (username|user|login)\s*[:=]\s*["\x27]([^\"\x27]{3,})["\x27].*?(password|passwd|pwd)\s*[:=]\s*["\x27]([^\"\x27]{3,})["\x27]
+    regex: '\b(username|user|login)\b\s*[:=]\s*["\x27]([^\"\x27]{4,})["\x27].*?\b(password|passwd|pwd)\b\s*[:=]\s*["\x27]([^\"\x27]{4,})["\x27]'
     name: Username and Password Pair
     priority: 3
     color: '#ff5c7a'
@@ -596,7 +768,7 @@ signatures:
     priority: 1
     color: '#ff3b5c'
   - part: filename
-    regex: ^\.?(netrc|git-credentials|npmrc)
+    regex: ^\.?(netrc|git-credentials)
     name: Sensitive configuration files
     priority: 2
     color: '#ff4f6d'
@@ -727,11 +899,6 @@ signatures:
     name: AWS Secret Key in Config
     priority: 3
     color: '#3d72d5'
-  - part: contents
-    regex: (A3T[A-Z0-9]|AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASCA)[A-Z0-9]{16}
-    name: AWS Access Key ID
-    priority: 3
-    color: '#3da9d5'
   - part: contents
     regex: (azure_key|azurekey|azure-key|azure_secret|azuresecret|azure-secret)\s*[:=]\s*["\x27]([^\"\x27]{20,})["\x27]
     name: Azure Credentials in Quotes
@@ -1000,12 +1167,12 @@ signatures:
     priority: 3
     color: '#6c7fe8'
   - part: contents
-    regex: key-[a-f0-9]{32}
+    regex: '\bkey-[a-f0-9]{32}\b'
     name: Mailgun API Key
     priority: 3
     color: '#4aa3df'
   - part: contents
-    regex: '[a-f0-9]{32}-us[0-9]{1,2}'
+    regex: '\b[a-f0-9]{32}-us[0-9]{1,2}\b'
     name: Mailchimp API Key
     priority: 3
     color: '#4aa3df'
@@ -1040,7 +1207,7 @@ signatures:
     priority: 3
     color: '#5b7cfa'
   - part: contents
-    regex: '[0-9]{8,12}:[A-Za-z0-9_-]{35,50}'
+    regex: '\b[0-9]{8,12}:[A-Za-z0-9_-]{35,}\b'
     name: Telegram Bot Token
     verifier: telegram
     priority: 3
@@ -1232,6 +1399,75 @@ signatures:
     color: '#76B900'
 
   # ================================================================
+  # FINANCIAL / BANKING
+  # ================================================================
+  - part: contents
+    regex: '(?i)\b(?:credit[\s_-]?card|card[\s_-]?(?:number|no|num)|cc[\s_-]?(?:num|number)|pan)\b["\x27]?\s*[:=]\s*["\x27]?[0-9](?:[ -]?[0-9]){12,18}'
+    name: Payment Card Number (labelled)
+    priority: 3
+    color: '#ff4500'
+  - part: contents
+    regex: '%B[0-9]{13,19}\^'
+    name: Magnetic Stripe Track Data
+    priority: 3
+    color: '#ff4500'
+  - part: contents
+    regex: '(?i)\b(?:cvv|cvc|cvv2|cvc2|csc)\b\s*[:=]\s*["\x27]?[0-9]{3,4}\b'
+    name: Card Security Code (CVV)
+    priority: 2
+    color: '#ffa500'
+  - part: contents
+    regex: '(?i)\biban\b["\x27]?\s*[:=]\s*["\x27]?[A-Z]{2}[0-9]{2}(?:[ ]?[A-Z0-9]{4}){3,7}(?:[ ]?[A-Z0-9]{1,3})?'
+    name: IBAN
+    priority: 3
+    color: '#ff0000'
+  - part: contents
+    regex: '\b(?:DE[0-9]{20}|GB[0-9]{2}[A-Z]{4}[0-9]{14}|FR[0-9]{2}[0-9]{10}[A-Z0-9]{11}[0-9]{2}|NL[0-9]{2}[A-Z]{4}[0-9]{10}|ES[0-9]{2}[0-9]{20}|IT[0-9]{2}[A-Z][0-9]{10}[A-Z0-9]{12}|IE[0-9]{2}[A-Z]{4}[0-9]{14}|CH[0-9]{2}[0-9]{5}[A-Z0-9]{12}|AT[0-9]{2}[0-9]{16}|BE[0-9]{2}[0-9]{12}|PL[0-9]{2}[0-9]{24})\b'
+    name: IBAN (country format)
+    priority: 3
+    color: '#ff0000'
+  - part: contents
+    regex: '(?i:\b(?:swift|bic)(?:[_-]?code)?)["\x27]?\s*[:=]\s*["\x27]?[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b'
+    name: SWIFT / BIC Code
+    priority: 2
+    color: '#ffa500'
+  - part: contents
+    regex: '(?i)\b(?:routing|aba)[\s_-]*(?:number|no|#)?["\x27]?\s*[:=]\s*["\x27]?[0-9]{9}\b'
+    name: Bank Routing / ABA Number
+    priority: 2
+    color: '#ffa500'
+  - part: contents
+    regex: '(?i)\b(?:account|acct)[\s_-]*(?:number|no|num|#)["\x27]?\s*[:=]\s*["\x27]?[0-9]{6,17}\b'
+    name: Bank Account Number
+    priority: 2
+    color: '#ffa500'
+  - part: contents
+    regex: '(?i)\b(?:sort[_-]?code|bsb)["\x27]?\s*[:=]\s*["\x27]?(?:[0-9]{2}[- ]?[0-9]{2}[- ]?[0-9]{2}|[0-9]{3}[- ]?[0-9]{3})\b'
+    name: Bank Sort Code / BSB
+    priority: 2
+    color: '#ffa500'
+  - part: contents
+    regex: '(?i:\bifsc\b)["\x27]?\s*[:=]\s*["\x27]?[A-Z]{4}0[A-Z0-9]{6}\b'
+    name: Indian IFSC Code
+    priority: 2
+    color: '#ffa500'
+  - part: contents
+    regex: '(?i:\bclabe\b)["\x27]?\s*[:=]\s*["\x27]?[0-9]{18}\b'
+    name: Mexican CLABE
+    priority: 3
+    color: '#ff0000'
+  - part: contents
+    regex: 'access-(?:sandbox|development|production)-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    name: Plaid Access Token
+    priority: 3
+    color: '#00b4d8'
+  - part: contents
+    regex: 'FLWSECK-[A-Za-z0-9_-]{20,}'
+    name: Flutterwave Secret Key
+    priority: 3
+    color: '#f4a300'
+
+  # ================================================================
   # CRYPTO WALLET PRIVATE KEYS & SEEDS (ACTUAL ACCESS)
   # ================================================================
   # BIP39 Seed Phrases (12-24 words) - WORKS FOR MOST BLOCKCHAINS
@@ -1249,12 +1485,6 @@ signatures:
   - part: contents
     regex: '(?i)(private_key|privatekey|private-key|secret_key|secretkey|secret-key)\s*[:=]\s*0x[a-fA-F0-9]{64}'
     name: Ethereum Private Key (in variable)
-    priority: 3
-    color: '#ff0000'
-  - part: contents
-    regex: 0x[a-fA-F0-9]{64}
-    name: Ethereum Private Key (Standalone)
-    verifier: crypto_balance
     priority: 3
     color: '#ff0000'
   - part: contents
@@ -1517,6 +1747,7 @@ signatures:
     color: '#9ca3af'
   - part: contents
     regex: 'DefaultEndpointsProtocol=https?;AccountName=[a-z0-9]+;AccountKey=[A-Za-z0-9+/=]{88}'
+    not_regex: '(?i)localhost|127\.0\.0\.1|::1'
     name: Azure Storage Connection String
     priority: 3
     color: '#9ca3af'
@@ -1545,3 +1776,534 @@ signatures:
     name: Docker configuration file
     priority: 1
     color: '#9ca3af'
+
+  # ---------------------------------------------------------------------------
+  # Restored provider signatures
+  #
+  # Prefix-anchored rules recovered from the full signature set: each one keys
+  # on a provider-specific literal (AKIA-style prefixes, oy2, rpa_, EAA, IGQV,
+  # dynatrace dt0c01., etc.) rather than a context-free name[:=]value match, so
+  # it stays quiet on code and prose. Deliberately excluded: bare AWS access-key
+  # IDs and the generic 'cloud provider name[:=]value' corpus.
+  # ---------------------------------------------------------------------------
+  - part: 'contents'
+    regex: '\bsk-svcacct-[a-zA-Z0-9_-]{48,}'
+    name: 'OpenAI Service Account Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bcsk-[A-Za-z0-9_-]{20,}'
+    name: 'Cerebras / Cerebras Cloud API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\brpa_[A-Za-z0-9]{20,}'
+    name: 'RunPod API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bjina_[A-Za-z0-9]{20,}\b'
+    name: 'Jina AI API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bsk_car_[A-Za-z0-9_-]{20,}'
+    name: 'Cartesia API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\btpuf_[A-Za-z0-9]{20,}'
+    name: 'Turbopuffer API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bAWS:[A-Za-z0-9+/=]{20,}'
+    name: 'AWS ECR Authorization Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: 'X-Amz-(?:Credential|Signature|Security-Token)=[A-Za-z0-9%&=/_+.-]{16,}'
+    name: 'AWS S3 Presigned URL Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bAIza[0-9A-Za-z_-]{35}'
+    name: 'Google API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b\d{10,}-[a-z0-9]{20,}\.apps\.googleusercontent\.com\b'
+    name: 'Google OAuth Client ID'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '\b1//0[0-9A-Za-z_-]{20,}'
+    name: 'Google Cloud Refresh Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bAAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}'
+    name: 'Firebase Cloud Messaging Server Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bSCW[A-Z0-9]{17}\b'
+    name: 'Scaleway Secret Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bocid1\.[a-z0-9.]{20,}'
+    name: 'Oracle Cloud OCID Credential'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '\bLTAI[A-Za-z0-9]{12,}\b'
+    name: 'Alibaba Cloud Access Key ID'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bAKID[A-Za-z0-9]{13,}\b'
+    name: 'Tencent Cloud Secret ID'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\brubygems_[a-f0-9]{48}\b'
+    name: 'RubyGems API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\boy2[a-zA-Z0-9+/=]{40,}'
+    name: 'NuGet API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bAKCp[A-Za-z0-9]{60,}'
+    name: 'JFrog Artifactory API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bbkua_[a-f0-9]{40}\b'
+    name: 'Buildkite API Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bpat\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}'
+    name: 'Harness Personal Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bnfp_[a-zA-Z0-9]{40}\b'
+    name: 'Netlify Personal Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\brnd_[A-Za-z0-9]{20,}\b'
+    name: 'Render API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bFlyV1 [A-Za-z0-9_=.-]{20,}'
+    name: 'Fly.io API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bHRKU-AA[0-9a-zA-Z_-]{58}'
+    name: 'Heroku API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bsgp_[a-zA-Z0-9]{40,}\b'
+    name: 'Sourcegraph Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)oracle://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: '(?i)localhost|127\.0\.0\.1|::1|0\.0\.0\.0|://(?:example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@'
+    name: 'Oracle Database Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)yugabyte(?:db)?://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: '(?i)localhost|127\.0\.0\.1|::1|0\.0\.0\.0|://(?:example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@'
+    name: 'YugabyteDB Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)tidb://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: '(?i)localhost|127\.0\.0\.1|::1|0\.0\.0\.0|://(?:example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@'
+    name: 'TiDB Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bnapi_[a-zA-Z0-9_-]{20,}'
+    name: 'Neon API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)cassandra://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: '(?i)localhost|127\.0\.0\.1|::1|0\.0\.0\.0|://(?:example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@'
+    name: 'Cassandra Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)scylla(?:db)?://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: '(?i)localhost|127\.0\.0\.1|::1|0\.0\.0\.0|://(?:example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@'
+    name: 'ScyllaDB Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)https?://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']*(?:couchdb|5984)[^\\s\"']*"
+    name: 'CouchDB Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)couchbase://[^:\\s\"']+:[^@\\s\"']+@[^\\s\"']+"
+    not_regex: '(?i)localhost|127\.0\.0\.1|::1|0\.0\.0\.0|://(?:example|test|demo|user:pass)|:(?:password|passwd|pass|secret|changeme|change_me|postgres|root|admin|guest|redis|pwd|test|123456)@'
+    name: 'Couchbase Connection String with Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bfnA[A-Za-z0-9_-]{20,}\b'
+    name: 'FaunaDB Secret Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bxau_[a-zA-Z0-9]{20,}\b'
+    name: 'Xata API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\baccess_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}\b'
+    name: 'PayPal / Braintree Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bA21AA[A-Za-z0-9_-]{40,}\b'
+    name: 'PayPal REST Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bEAAA[A-Za-z0-9_-]{60,}\b'
+    name: 'Square Application Secret'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\brzp_(?:live|test)_[a-zA-Z0-9]{14,}\b'
+    name: 'Razorpay Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b(?:APP_USR|TEST)-[0-9a-f-]{36}\b'
+    name: 'Mercado Pago Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bCG-[A-Za-z0-9]{20,}\b'
+    name: 'CoinGecko API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)https?://[a-z0-9.-]*solana[^\\s\"']*[?&](?:api[-_]?key|apikey)=[A-Za-z0-9_-]{20,}"
+    name: 'Solana RPC Endpoint with API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bmlsn\.[a-f0-9]{40}\b'
+    name: 'MailerSend API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: 'https://[a-z0-9-]+\.webhook\.office\.com/webhookb2/[A-Za-z0-9@/.-]{40,}'
+    name: 'Microsoft Teams Webhook URL'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bsyt_[A-Za-z0-9_-]{20,}'
+    name: 'Matrix Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b(?:pub|sub)-c-[0-9a-f-]{36}\b'
+    name: 'PubNub Publish / Subscribe Key'
+    priority: 2
+    color: '#FFA500'
+
+  - part: 'contents'
+    regex: '\bNRAA-[A-Za-z0-9]{27}\b'
+    name: 'New Relic Ingest API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bx(?:aat|ait)-[A-Za-z0-9_-]{20,}'
+    name: 'Axiom API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bdt0c01\.[A-Z0-9]{24}\.[A-Z0-9]{64}\b'
+    name: 'Dynatrace API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bdp\.(?:pt|st)\.[A-Za-z0-9_-]{40,}'
+    name: 'Doppler Personal / Service Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bapify_api_[A-Za-z0-9]{20,}'
+    name: 'Apify API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bbb_live_[A-Za-z0-9]{20,}'
+    name: 'Browserbase API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\btvly-[A-Za-z0-9]{20,}\b'
+    name: 'Tavily API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bBSA[A-Za-z0-9_-]{20,}\b'
+    name: 'Brave Search API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bprj_(?:live|test)_[A-Za-z0-9]{20,}'
+    name: 'Radar API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: 'cloudinary://[0-9]{10,}:[A-Za-z0-9_-]{20,}@[a-z0-9-]+'
+    name: 'Cloudinary API Credential URL'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bK00[A-Za-z0-9]{22,}\b'
+    name: 'Backblaze B2 Application Key ID'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bghost-admin-api-key[:\s]+[a-f0-9]{24}:[a-f0-9]{64}\b'
+    name: 'Ghost Admin API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bCFPAT-[A-Za-z0-9_-]{40,}'
+    name: 'Contentful Personal Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bpat-[a-z0-9-]{30,}\b'
+    name: 'HubSpot Private App Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bpk_[0-9]{6,}_[A-Z0-9]{20,}\b'
+    name: 'ClickUp API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bsl\.[A-Za-z0-9_-]{80,}'
+    name: 'Dropbox Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\btskey-[A-Za-z0-9_-]{20,}'
+    name: 'Tailscale Auth Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bory_[A-Za-z0-9_-]{20,}'
+    name: 'Ory API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\btoken-[a-z0-9]{5}:[A-Za-z0-9]{20,}\b'
+    name: 'Rancher API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b(?:pk1|sk1)_[a-f0-9]{20,}'
+    name: 'Porkbun API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bAAAAAAAAAAAAAAAAAAAAA[A-Za-z0-9%_-]{20,}'
+    name: 'X / Twitter Bearer Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bEAA[A-Za-z0-9]{60,}\b'
+    name: 'Facebook Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bIGQV[A-Za-z0-9_-]{40,}\b'
+    name: 'Instagram Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bp(?:ina|int)_[A-Za-z0-9_-]{20,}'
+    name: 'Pinterest API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bRGAPI-[a-f0-9-]{36}\b'
+    name: 'Riot Games API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bduffel_(?:test|live)_[A-Za-z0-9_-]{20,}'
+    name: 'Duffel API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bn8n_api_[A-Za-z0-9_-]{20,}'
+    name: 'n8n API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\btr_(?:dev|prod)_[A-Za-z0-9]{20,}'
+    name: 'Trigger.dev API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\b(?:signkey|evtkey)-(?:prod|test)-[A-Za-z0-9]{20,}'
+    name: 'Inngest Signing / Event Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\btfp_[A-Za-z0-9_-]{20,}'
+    name: 'Typeform Personal Access Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bEZAK[a-zA-Z0-9]{40,}\b'
+    name: 'EasyPost API Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\baio_[A-Za-z0-9]{20,}\b'
+    name: 'Adafruit IO Key'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: '\bBBFF-[A-Za-z0-9_-]{20,}'
+    name: 'Ubidots API Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)Authorization:\\s*Bearer\\s+[A-Za-z0-9_\\-.=]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|replace|xxxx|dummy|sample|test|demo)"
+    name: 'HTTP Authorization: Bearer Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)Authorization:\\s*Basic\\s+[A-Za-z0-9+/=]{20,}"
+    not_regex: "(?i)(?:dXNlcjpwYXNz|dXNlcm5hbWU6cGFzc3dvcmQ=)"
+    name: 'HTTP Authorization: Basic Credentials'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)Authorization:\\s*Token\\s+[A-Za-z0-9_\\-.=]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|replace|xxxx|dummy|sample|test|demo)"
+    name: 'HTTP Authorization: Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)Authorization:\\s*OAuth\\s+[A-Za-z0-9_\\-.=]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|replace|xxxx|dummy|sample|test|demo)"
+    name: 'HTTP Authorization: OAuth Token'
+    priority: 3
+    color: '#FF0000'
+
+  - part: 'contents'
+    regex: "(?i)X-(?:API|Api|Auth|Access|Client|Secret)-(?:Key|Token|Secret):\\s*[A-Za-z0-9_\\-.=]{20,}"
+    not_regex: "(?i)(?:your|example|placeholder|changeme|replace|xxxx|dummy|sample|test|demo)"
+    name: 'HTTP X-API-Key / X-Auth-Token / X-Client-Secret Header'
+    priority: 3
+    color: '#FF0000'
+

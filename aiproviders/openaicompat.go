@@ -106,7 +106,10 @@ func (c *openAICompatClient) chat(ctx context.Context, msgs []Message, maxTokens
 
 	var out chatResponse
 	if err := json.Unmarshal(data, &out); err != nil {
-		return "", fmt.Errorf("%s: decode response: %w (body: %s)", c.name, err, snippet(data))
+		// No body echo: a 200 reply that is not JSON comes from the
+		// operator's own gateway/proxy, which may echo the reviewed
+		// finding; that text is stored as the review error and broadcast.
+		return "", fmt.Errorf("%s: decode response (%d bytes): %w", c.name, len(data), err)
 	}
 	if len(out.Choices) == 0 {
 		return "", fmt.Errorf("%s: response contained no choices", c.name)
@@ -175,7 +178,8 @@ func (c *openAICompatClient) Stream(ctx context.Context, msgs []Message, onDelta
 
 		var chunk chatStreamChunk
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-			return fmt.Errorf("%s: decode stream chunk: %w (data: %s)", c.name, err, snippet([]byte(payload)))
+			// No payload echo, same reason as the non-streaming path above.
+			return fmt.Errorf("%s: decode stream chunk (%d bytes): %w", c.name, len(payload), err)
 		}
 		if len(chunk.Choices) > 0 && chunk.Choices[0].FinishReason != "" {
 			// A non-empty finish reason ("stop", "length", ...) is a valid end of

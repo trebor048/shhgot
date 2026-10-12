@@ -1,9 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +22,10 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/trebor048/shhgot/core"
+	"github.com/trebor048/shhgot/core/httpclient"
+	"github.com/trebor048/shhgot/core/notify"
+	"github.com/trebor048/shhgot/core/store"
+	"github.com/trebor048/shhgot/core/verifiers"
 	"golang.org/x/term"
 )
 
@@ -92,6 +98,49 @@ func isSignatureExcludedInMode(signature core.Signature, mode string) bool {
 	return false
 }
 
+// currentRunMode names the active run mode for signature exclude_in_modes: a
+// --local scan is "local", otherwise the selected integrated mode, defaulting to
+// "terminal". It was previously compared against the log-format preset, which
+// made the documented `exclude_in_modes: ['local']` a no-op.
+func currentRunMode() string {
+	if o := getSession().Options; o != nil && o.Local != nil && strings.TrimSpace(*o.Local) != "" {
+		return "local"
+	}
+	if modeConfig != nil {
+		switch modeConfig.Mode {
+		case ModeWeb:
+			return "web"
+		case ModeTUI:
+			return "tui"
+		}
+	}
+	return "terminal"
+}
+
+// containsWord reports whether needle occurs in haystack delimited by
+// non-alphanumeric characters (or the string boundaries) on both sides.
+func containsWord(haystack, needle string) bool {
+	if needle == "" {
+		return false
+	}
+	for start := 0; ; {
+		i := strings.Index(haystack[start:], needle)
+		if i < 0 {
+			return false
+		}
+		beg := start + i
+		end := beg + len(needle)
+		if (beg == 0 || !isAlnumByte(haystack[beg-1])) && (end == len(haystack) || !isAlnumByte(haystack[end])) {
+			return true
+		}
+		start = beg + 1
+	}
+}
+
+func isAlnumByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+}
+
 // isSignatureExcludedInMode checks if a signature should be excluded in the current mode
 
 // ── stdout serialization helpers (prevents progress-area corruption) ──
@@ -108,6 +157,13 @@ var webLogCapture bool
 // live frame and corrupt it. It is only set once the UI is known to be able to
 // take over the terminal.
 var tuiScreenActive bool
+
+// tuiActive reports whether the interactive TUI owns this run. The TUI buffer
+// (tuiState) is never nil, so its presence cannot be used as the mode test;
+// this consults the selected mode instead.
+func tuiActive() bool {
+	return modeConfig != nil && modeConfig.Mode == ModeTUI
+}
 
 func lockPrintf(format string, args ...interface{}) {
 	outputMu.Lock()
@@ -172,9 +228,17 @@ func emitLocked(s string) {
 	if liveTerminal(os.Stdout) {
 		s = carriageReturnLines(s)
 	}
-	
-	// Use typewriter effect if enabled (skip separator lines)
-	if getSession() != nil && getSession().Config != nil && getSession().Config.TypewriterEffect {
+
+	// Use typewriter effect if enabled (skip separator lines).
+	//
+	// Read the package-level session directly instead of getSession(): this runs
+	// under routeEarlyOutput's ConsoleWriter, which is installed before the
+	// session exists. core.GetSession's init calls ParseConfig -> Say (webhook
+	// validation) -> ConsoleWriter -> here, so triggering the lazy initializer
+	// from this path re-entered core.GetSession and blocked forever on its
+	// non-reentrant sync.Once. Before init the session is simply absent, and the
+	// typewriter is cosmetic, so the nil check below is the correct fallback.
+	if session != nil && session.Config != nil && session.Config.TypewriterEffect {
 		// Check if this is a separator line (all dashes, equals, or box chars)
 		isSeparator := true
 		for _, r := range s {
@@ -183,7 +247,7 @@ func emitLocked(s string) {
 				break
 			}
 		}
-		
+
 		if isSeparator {
 			// Print separator instantly
 			fmt.Print(s)
@@ -492,9 +556,12 @@ func isAITokenSignature(sig string) bool {
 		return false
 	}
 
-	// Check if signature contains any AI provider
+	// Check if signature contains any AI provider. The match is word-bounded:
+	// short provider names ("exa", "yi", "ocr", "xai") otherwise matched
+	// unrelated signature names ("example", "paying", ...) and sent non-AI
+	// secrets through the token validator.
 	for _, provider := range aiProviders {
-		if strings.Contains(sigLower, provider) {
+		if containsWord(sigLower, provider) {
 			return true
 		}
 	}
@@ -571,9 +638,57 @@ func localFileURL(root, filePath string, line int) string {
 	return u.String()
 }
 
+// gistFileURL builds the canonical gist web URL for a finding, or ok=false when
+// rawURL is not a gist. A gist is addressed by its id plus a lowercased,
+// dot-to-dash anchor for the file ("#file-hello_world-py"), not by the GitHub
+// repository "blob" path.
+func gistFileURL(rawURL, filePath string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || !strings.EqualFold(u.Hostname(), "gist.github.com") {
+		return "", false
+	}
+	id := strings.TrimSuffix(strings.Trim(u.Path, "/"), ".git")
+	if id == "" || strings.Contains(id, "/") {
+		return "", false
+	}
+	base := "https://gist.github.com/" + id
+	if filePath == "" {
+		return base, true
+	}
+	return base + "#file-" + gistAnchor(filePath), true
+}
+
+// gistAnchor renders a file name as GitHub's gist anchor slug: lowercased, with
+// every character that is not a letter, digit or underscore replaced by a dash.
+func gistAnchor(name string) string {
+	name = strings.ToLower(filepath.Base(oneLine(name)))
+	var b strings.Builder
+	b.Grow(len(name))
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	return b.String()
+}
+
 // getEnhancedLinkInfo returns enhanced repo info with user/repo display and file links.
 // Thread-safe as it only works with local variables and calls thread-safe functions.
 func getEnhancedLinkInfo(url, filePath, branch string, line int) (userRepo string, repoLink string, fileLink string) {
+	// A gist has no /blob/<branch>/<path> form: its file is addressed by a
+	// lowercased dotted anchor ("#file-<name>"). GitHub's code search returns
+	// gist hits as host-prefixed slugs, so handle that shape before the
+	// owner/repo blob builder, which would otherwise emit a bogus
+	// "https://github.com/gist.github.com/<id>/blob/..." link.
+	if link, ok := gistFileURL(url, filePath); ok {
+		label := fileLinkLabel(filePath, line)
+		clickable := createClickableLink(link, label)
+		return "gist", clickable, clickable
+	}
+
 	username, repo, repoUrl := extractRepoInfo(url)
 	if username == "" || repo == "" {
 		// Not a GitHub URL - this is a local scan. The link used to be the scanned
@@ -1012,6 +1127,10 @@ type MatchEvent struct {
 	FileContent string
 	Secret      string
 	SecretLine  int
+	// Severity is the finding's dynamic severity, computed by publish() from
+	// the verifier outcome (or the rule priority when none is known) and used
+	// for the webhook embed colour.
+	Severity string
 }
 
 // secretLineNum returns the 1-based line number of the first occurrence of
@@ -1187,11 +1306,18 @@ func processRepositoryOrGist(url string, ref string, stars int, source core.GitR
 
 	dir := core.GetTempDir(core.GetHash(url))
 
+	// Register the checkout as live: temp dirs are deterministic per URL, so
+	// without this a stale "processed" entry lets the disk cleanup RemoveAll
+	// the directory while this scan is standing in it.
+	getSession().CleanupManager.BeginDir(dir)
+	defer getSession().CleanupManager.EndDir(dir)
+
 	activity.StartFetch(url)
 
 	_, err := core.CloneRepository(getSession(), url, ref, dir, nil)
 	if err != nil {
 		getSession().Log.Debug("[%s] Cloning failed: %s", url, err.Error())
+		core.GlobalScanProgress.RecordError()
 		os.RemoveAll(dir)
 		activity.FailRepo(url)
 		return
@@ -1311,13 +1437,29 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 	var scanDeadline time.Time
 	scanTimeoutSecs := cfg.Scanning.Int(cfg.Scanning.ScanTimeoutSecs, 0)
 	if scanTimeoutSecs > 0 {
+		// Cap so the seconds->nanoseconds conversion cannot overflow
+		// time.Duration into a negative (already-passed) deadline.
+		const maxTimeoutSecs = 1 << 31 // ~68 years
+		if scanTimeoutSecs > maxTimeoutSecs {
+			scanTimeoutSecs = maxTimeoutSecs
+		}
 		scanDeadline = time.Now().Add(time.Duration(scanTimeoutSecs) * time.Second)
 	}
 
 	// Optional per-repository byte budget (scanning.max_scan_mb, 0 = no limit).
 	// A wall-clock timeout depends on how loaded the machine is; a byte budget
-	// stops a pathological repository in a predictable amount of work.
-	maxScanBytes := int64(cfg.Scanning.Int(cfg.Scanning.MaxScanMB, 0)) << 20
+	// stops a pathological repository in a predictable amount of work. The
+	// value is capped before the shift so a huge config value cannot overflow
+	// int64 into a negative and silently disable the budget.
+	maxScanMB := int64(cfg.Scanning.Int(cfg.Scanning.MaxScanMB, 0))
+	var maxScanBytes int64
+	if maxScanMB > 0 {
+		const maxScanMBValue = int64(1) << 42 // (1<<42)<<20 stays below MaxInt64
+		if maxScanMB > maxScanMBValue {
+			maxScanMB = maxScanMBValue
+		}
+		maxScanBytes = maxScanMB << 20
+	}
 	var bytesScanned int64
 
 	// One walk of the tree yields both the scannable files and the total count
@@ -1332,7 +1474,7 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 
 	// CRITICAL PERFORMANCE FIX: Pre-compile search query regex ONCE outside the file loop
 	var queryRegex *regexp.Regexp
-	if q := *getSession().Options.SearchQuery; q != "" {
+	if q := strOpt(getSession().Options.SearchQuery); q != "" {
 		re, err := regexp.Compile(q)
 		if err != nil {
 			// MustCompile here panicked on a malformed query - "(" was enough - and
@@ -1348,20 +1490,6 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 	// the right denominator for the progress percentage. fileCount above is the
 	// size guard and counts every file, including the blacklisted ones.
 	core.GlobalScanProgress.SetTotalFiles(len(files))
-
-	// The entropy scan compares the blacklist case-insensitively against every
-	// high-entropy line. Lowering the entries once here (and the line once per
-	// line below) replaces two ToLower calls per entry per line with one per
-	// line, which on a large repository is the difference between tens of
-	// thousands of allocations and a handful. Empty entries are dropped: they
-	// would make strings.Contains true for every line and silently disable the
-	// entropy scan.
-	lowerBlacklist := make([]string, 0, len(getSession().Config.BlacklistedStrings))
-	for _, b := range getSession().Config.BlacklistedStrings {
-		if b != "" {
-			lowerBlacklist = append(lowerBlacklist, strings.ToLower(b))
-		}
-	}
 
 	for i, file := range files {
 		// Checked per file so a runaway scan stops within one file rather than
@@ -1397,16 +1525,6 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 				return matchedAny
 			}
 		}
-		// Share one lowercased buffer across the per-signature copies, so a
-		// case-insensitive prefilter lowers the file once, not once per rule.
-		// GetContents returns empty for a binary file, so no rule can match it.
-		file.EnableLowerCache()
-
-		// Attach the repository to the file so verifier webhooks can name it;
-		// applyVerifier used to hardcode "unknown" because MatchFile carried
-		// no repo context.
-		file.Repo = url
-
 		// Env files whose only assignments are public VITE_* variables (Vite
 		// client-side envs ship to the browser by design) are not findings.
 		if isViteOnlyEnvFile(file) {
@@ -1468,111 +1586,15 @@ func checkSignatures(dir string, url string, ref string, stars int, source core.
 				getSession().WriteToCsv([]string{url, searchSignatureName, relativeFileName, m})
 				getSession().LogMatch(searchSignatureName, url, relativeFileName, matches)
 			}
-		} else {
-			for _, signature := range getSession().Signatures {
-				// Check if signature should be excluded in current mode
-				currentMode := getLogFormat()
-				if isSignatureExcludedInMode(signature, currentMode) {
-					continue
-				}
-
-				if matched, part := signature.Match(file); matched {
-					if part == core.PartContents {
-						if matches = signature.GetContentsMatches(file); len(matches) > 0 {
-							// Test fixtures (e.g. backend/tests/*) overwhelmingly
-							// contain fake placeholder passwords — skip them.
-							if isPasswordFamilySignature(signature.Name()) && isTestFixturePath(relativeFileName) {
-								continue
-							}
-							// AI-agent skill/instruction files are documentation:
-							// any secret shown inside them is an example, not a finding.
-							if isDocSkillPath(relativeFileName) {
-								continue
-							}
-							// A PEM header with no closing footer is a doc fragment,
-							// not a key (e.g. "-----BEGIN PRIVATE KEY-----" in a tutorial).
-							if strings.HasPrefix(matches[0], "-----BEGIN") && !hasCompletePemBlock(string(file.Contents)) {
-								continue
-							}
-							count := len(matches)
-							m := strings.Join(matches, ", ")
-
-							// Capture the full file and the first raw secret so
-							// the web dashboard can render "view file" with
-							// syntax highlighting and the secret highlighted.
-							// Cloned repos are deleted after scanning, so the
-							// content must be captured here.
-							fileContent := string(file.Contents)
-							secret := matches[0]
-							// Walked once: this scans the whole file, and it used
-							// to run twice per finding (publish and logSecret).
-							secretLine := secretLineNum(file.Contents, secret)
-
-							publish(&MatchEvent{Source: source, Url: url, Matches: matches, Signature: signature.Name(), File: relativeFileName, Stars: stars, Priority: signature.GetPriority(), Color: signature.GetColor(), FileContent: fileContent, Secret: secret, SecretLine: secretLine})
-							matchedAny = true
-							fileMatched = true
-							logSecret(count, url, signature.Name(), relativeFileName, m, ref, secretLine, stars)
-							getSession().WriteToCsv([]string{url, signature.Name(), relativeFileName, m})
-							getSession().LogMatch(signature.Name(), url, relativeFileName, matches)
-
-							// Add GitHub tokens to session for dynamic fetching
-							if signature.IsTokenType() {
-								for _, token := range matches {
-									getSession().AddGitHubToken(token)
-								}
-							}
-
-							// Test tokens if this is an AI token signature
-							sigName := strings.ToLower(signature.Name())
-							if isAITokenSignature(sigName) {
-								getSession().TokenValidator.TestMatchedTokens(matches, signature.GetColor())
-							}
-						}
-					} else {
-						if *getSession().Options.PathChecks {
-							publish(&MatchEvent{Source: source, Url: url, Matches: matches, Signature: signature.Name(), File: relativeFileName, Stars: stars, Priority: signature.GetPriority(), Color: signature.GetColor(), FileContent: string(file.Contents)})
-							matchedAny = true
-							fileMatched = true
-							logFile(url, signature.Name(), relativeFileName, ref, stars)
-							getSession().WriteToCsv([]string{url, signature.Name(), relativeFileName, ""})
-							getSession().LogMatch(signature.Name(), url, relativeFileName, []string{relativeFileName})
-						}
-						if *getSession().Options.EntropyThreshold > 0 && file.CanCheckEntropy() {
-							scanner := bufio.NewScanner(bytes.NewReader(file.Contents))
-							lineNo := 0
-							for scanner.Scan() {
-								lineNo++
-								line := scanner.Text()
-								if len(line) > 6 && len(line) < 100 {
-									entropy := core.GetEntropy(line)
-									if entropy >= *getSession().Options.EntropyThreshold {
-										blacklistedMatch := false
-										lowerLine := strings.ToLower(line)
-										for _, blacklistedString := range lowerBlacklist {
-											if strings.Contains(lowerLine, blacklistedString) {
-												blacklistedMatch = true
-												break
-											}
-										}
-										if !blacklistedMatch {
-											publish(&MatchEvent{Source: source, Url: url, Matches: []string{line}, Signature: entropySignatureName, File: relativeFileName, Stars: stars, Priority: 0, Color: "", FileContent: string(file.Contents), Secret: line, SecretLine: lineNo})
-											matchedAny = true
-											fileMatched = true
-											logEntropy(url, relativeFileName, line, ref, lineNo, stars)
-											getSession().WriteToCsv([]string{url, entropySignatureName, relativeFileName, line})
-											getSession().LogMatch(entropySignatureName, url, relativeFileName, []string{line})
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			}
+		} else if scanContents(url, ref, relativeFileName, "", stars, file.Contents, source) {
+			matchedAny = true
+			fileMatched = true
 		}
 
-		if !fileMatched && len(*getSession().Options.Local) <= 0 {
-			os.Remove(file.Path)
+		if !fileMatched && len(strOpt(getSession().Options.Local)) <= 0 {
+			if err := os.Remove(file.Path); err != nil {
+				getSession().Log.Debug("cleanup: could not remove scanned temp file %s: %s", file.Path, err)
+			}
 		}
 	}
 	return
@@ -1593,6 +1615,22 @@ func sourceName(s core.GitResourceType) string {
 		return "bitbucket"
 	case core.GITLAB_SOURCE:
 		return "gitlab"
+	case core.GITHUB_SEARCH_SOURCE:
+		return "github-search"
+	case core.PASTEBIN_SOURCE:
+		return "pastebin"
+	case core.SEARCHCODE_SOURCE:
+		return "searchcode"
+	case core.SOURCEGRAPH_SOURCE:
+		return "sourcegraph"
+	case core.GITHUB_COMMITS_SOURCE:
+		return "github-commits"
+	case core.GITHUB_ISSUES_SOURCE:
+		return "github-issues"
+	case core.GREPAPP_SOURCE:
+		return "grepapp"
+	case core.PSBDMP_SOURCE:
+		return "psbdmp"
 	default:
 		return "unknown"
 	}
@@ -1614,13 +1652,35 @@ func newMatchID() string {
 
 // liveHTTPClient bounds the optional --live POST. http.DefaultClient has no
 // timeout, so one hung endpoint could otherwise hold a goroutine forever.
-var liveHTTPClient = &http.Client{Timeout: 10 * time.Second}
+// It also rejects cross-origin redirects to prevent SSRF via redirect chains.
+var liveHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) == 0 {
+			return nil
+		}
+		origin := via[0].URL
+		if req.URL.Scheme != origin.Scheme || req.URL.Host != origin.Host {
+			return fmt.Errorf("live: refusing redirect from %s://%s to %s://%s",
+				origin.Scheme, origin.Host, req.URL.Scheme, req.URL.Host)
+		}
+		// SSRF guard on redirect target
+		if err := httpclient.SafeURL(req.URL.String()); err != nil {
+			return fmt.Errorf("live: refusing redirect to %s: %w", req.URL, err)
+		}
+		return nil
+	},
+}
 
 // postLive delivers one match to the configured --live endpoint. It runs on its
 // own goroutine and drains a bounded amount of the response so the connection
 // can be reused; delivery failures are intentionally silent, exactly as the
 // inline send was.
 func postLive(url string, body []byte) {
+	// SSRF guard: validate the target URL before any request is made.
+	if err := httpclient.SafeURL(url); err != nil {
+		return
+	}
 	resp, err := liveHTTPClient.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return
@@ -1629,15 +1689,1349 @@ func postLive(url string, body []byte) {
 	resp.Body.Close()
 }
 
+// findingFingerprint derives the cross-run dedupe key for an event. It mirrors
+// store.Fingerprint's contract: signature + source + match + repo + file. The
+// "match" component is the raw secret when one was captured, otherwise the
+// joined match list, so the same finding in the same file is stable across runs.
+func findingFingerprint(event *MatchEvent) string {
+	match := event.Secret
+	if match == "" && len(event.Matches) > 0 {
+		match = strings.Join(event.Matches, ",")
+	}
+	return store.Fingerprint(event.Signature, sourceName(event.Source), match, event.Url, event.File)
+}
+
+// boolOpt dereferences an optional bool flag, treating nil as false.
+func boolOpt(p *bool) bool { return p != nil && *p }
+
+// strOpt dereferences an optional string flag, treating nil as "".
+func strOpt(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+// uintOpt dereferences an optional uint flag, treating nil as 0.
+func uintOpt(p *uint) uint {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+// floatOpt dereferences an optional float64 flag, treating nil as 0.
+func floatOpt(p *float64) float64 {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+// boolPtr returns a pointer to b. It is how an optional "known" tri-state is
+// represented on the wire: nil means "no verifier outcome", false/true mean a
+// verifier rejected/accepted the secret.
+func boolPtr(b bool) *bool { return &b }
+
+type cachedOutcome struct {
+	provider string
+	outcome  verifiers.Outcome
+}
+
+// outcomeCache holds the verifier outcomes resolved during this run, keyed by
+// the masked token form the OnOutcome callback carries. It lets publish() set a
+// finding's severity immediately when the same secret was verified earlier in
+// the run: TestAndLogToken caches its own verdict and does not fire OnOutcome a
+// second time, so the callback alone would miss those repeats.
+//
+// The key is the 17-char masked prefix because the callback deliberately never
+// carries the full secret. Two distinct secrets sharing a prefix therefore
+// share an entry (last write wins); in practice same-prefix secrets share an
+// issuer, provider and status, so this cannot mis-severitise a finding. Keying
+// by a full-secret hash would require passing full secrets through the
+// callback layer, which is worse than the collision it would fix.
+//
+// It is bounded: a long scan over a repository of many distinct secrets would
+// otherwise keep every verdict resident for the life of the process.
+const maxOutcomeCache = 10000
+
+var (
+	outcomeCacheMu sync.RWMutex
+	outcomeCache   = map[string]cachedOutcome{}
+	// outcomeCacheOrder records insertion order for the map above. Its length
+	// always matches len(outcomeCache): a key is appended only when first
+	// stored, and eviction removes it from both.
+	outcomeCacheOrder []string
+)
+
+// maskedOutcomeKey reproduces the masking core.TokenValidator applies before it
+// invokes OnOutcome: the first 17 characters plus an ellipsis for a long token,
+// otherwise the token unchanged.
+func maskedOutcomeKey(secret string) string {
+	if secret == "" {
+		return ""
+	}
+	if len(secret) > 20 {
+		return secret[:17] + "..."
+	}
+	return secret
+}
+
+// rememberOutcome records a resolved verifier outcome and its provider against
+// the masked token key.
+func rememberOutcome(token string, provider string, o verifiers.Outcome) {
+	key := maskedOutcomeKey(token)
+	if key == "" {
+		return
+	}
+	outcomeCacheMu.Lock()
+	if _, exists := outcomeCache[key]; !exists {
+		outcomeCacheOrder = append(outcomeCacheOrder, key)
+		for len(outcomeCacheOrder) > maxOutcomeCache {
+			oldest := outcomeCacheOrder[0]
+			outcomeCacheOrder = outcomeCacheOrder[1:]
+			delete(outcomeCache, oldest)
+		}
+	}
+	outcomeCache[key] = cachedOutcome{provider: provider, outcome: o}
+	outcomeCacheMu.Unlock()
+}
+
+// cachedFor returns the outcome and provider recorded for secret, if any.
+func cachedFor(secret string) (verifiers.Outcome, string, bool) {
+	key := maskedOutcomeKey(secret)
+	if key == "" {
+		return verifiers.Outcome{}, "", false
+	}
+	outcomeCacheMu.RLock()
+	entry, ok := outcomeCache[key]
+	outcomeCacheMu.RUnlock()
+	if !ok {
+		return verifiers.Outcome{}, "", false
+	}
+	return entry.outcome, entry.provider, true
+}
+
+// outcomeForSecret returns the verifier outcome recorded for secret, or nil when
+// it was never verified. publish() passes the result to core.Classify, so nil
+// falls back to the signature-priority mapping.
+func outcomeForSecret(secret string) *verifiers.Outcome {
+	o, _, ok := cachedFor(secret)
+	if !ok {
+		return nil
+	}
+	return &o
+}
+
+// installOutcomeRecorder installs the shared OnOutcome sink on the session
+// validator unless a caller (web/TUI) already installed one. Web/TUI install a
+// callback that composes the shared recorder with their UI enrichment, so this
+// only ever fills the gap for terminal mode: without it terminal-mode findings
+// kept the priority fallback even for verified keys, so the webhook, dashboard
+// and findings store disagreed with web/TUI.
+func installOutcomeRecorder() {
+	if tv := getSession().TokenValidator; tv != nil && tv.OnOutcome == nil {
+		tv.OnOutcome = rememberOutcome
+	}
+}
+
+// ──────────────────────────────────────────────────────────────
+//
+//	NOTIFICATIONS (Slice 9)
+//
+// ──────────────────────────────────────────────────────────────
+//
+// notifyDispatcher is built once at scanner start from notify.channels and
+// kept for the life of the process. Delivery is IN ADDITION to the webhook
+// queue, never a replacement: a finding reaches both unless a channel's own
+// severity floor or the quiet-hours policy suppresses it. Everything is
+// best-effort: a delivery failure is logged and marks the notification path
+// degraded, but never interrupts the scan.
+var (
+	notifyDispatcher *notify.Dispatcher
+
+	notifyMu       sync.Mutex
+	notifyChannels []string
+	notifyDegraded bool
+)
+
+// initNotifications builds the process-wide dispatcher from the notify config
+// and runs the opt-in startup test delivery. It is called from executeScanner,
+// which all three modes (terminal, web, tui) funnel through, so the dispatcher
+// exists before any worker can publish a finding.
+func initNotifications() {
+	cfg := getSession().Config
+	d, _, ok := cfg.NotifySetup()
+	if !ok {
+		notifyMu.Lock()
+		notifyDispatcher, notifyChannels, notifyDegraded = nil, nil, false
+		notifyMu.Unlock()
+		return
+	}
+
+	names := make([]string, 0, len(cfg.Notify.Channels))
+	for _, ch := range cfg.NotifyChannels() {
+		names = append(names, ch.Name())
+	}
+	notifyMu.Lock()
+	notifyDispatcher = d
+	notifyChannels = names
+	notifyDegraded = false
+	notifyMu.Unlock()
+
+	maybeTestNotifications()
+}
+
+// notifyDispatcherRef returns the process-wide dispatcher. The read is guarded
+// because the GitLab/search source goroutines can publish while scanner start
+// is still installing the dispatcher.
+func notifyDispatcherRef() *notify.Dispatcher {
+	notifyMu.Lock()
+	defer notifyMu.Unlock()
+	return notifyDispatcher
+}
+
+// maybeTestNotifications sends one synthetic critical event to every configured
+// channel when notify.test_on_start is explicitly true (default false). It is
+// deliberately off by default so an existing operator's channels are never
+// pinged just by starting a scan. Every result is routed through the session
+// logger, never raw stdout, so web and TUI capture it like any other log line.
+func maybeTestNotifications() {
+	d := notifyDispatcherRef()
+	if d == nil {
+		return
+	}
+	cfg := getSession().Config
+	if cfg == nil || !boolOpt(cfg.Notify.TestOnStart) {
+		return
+	}
+	log := getSession().Log
+	failed := false
+	for _, ch := range cfg.NotifyChannels() {
+		if err := d.TestDeliver(ch); err != nil {
+			log.Warn("[notify] channel %q test delivery failed: %s", ch.Name(), err)
+			failed = true
+			continue
+		}
+		log.Info("[notify] channel %q test delivery ok", ch.Name())
+	}
+	if failed {
+		setNotifyDegraded(true)
+	}
+}
+
+// notifyStatusSnapshot returns the configured channel names and whether the
+// most recent delivery attempt failed. Both are read under notifyMu because a
+// delivery worker updates the flag while the dashboard's /health may read it.
+func notifyStatusSnapshot() (names []string, degraded bool) {
+	notifyMu.Lock()
+	defer notifyMu.Unlock()
+	names = make([]string, len(notifyChannels))
+	copy(names, notifyChannels)
+	return names, notifyDegraded
+}
+
+// setNotifyDegraded records the notification path's health for /health.
+func setNotifyDegraded(v bool) {
+	notifyMu.Lock()
+	notifyDegraded = v
+	notifyMu.Unlock()
+}
+
+// recordNotifyResults logs per-channel delivery failures and updates the
+// degraded flag. A run in which every channel succeeded clears it. The logger
+// is passed in rather than read from the session so a delivery goroutine that
+// outlives a test cannot race the package-level session swap.
+func recordNotifyResults(results []notify.DeliveryResult, log *core.Logger) {
+	failed := false
+	for _, r := range results {
+		if r.Err == nil {
+			continue
+		}
+		failed = true
+		if log != nil {
+			log.Debug("[notify] channel %q delivery failed: %s", r.Channel, r.Err)
+		}
+	}
+	setNotifyDegraded(failed)
+}
+
+// notifySeverityFromString converts a finding's wire severity name back to the
+// notify package's rank. Unknown values fall to low, matching the channel floor
+// default.
+func notifySeverityFromString(s string) notify.Severity {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "critical":
+		return notify.SevCritical
+	case "high":
+		return notify.SevHigh
+	case "medium":
+		return notify.SevMedium
+	default:
+		return notify.SevLow
+	}
+}
+
+// notifyEventFromMatch converts a published finding into the transport-neutral
+// notify.Event. The raw secret is carried through: every channel masks it when
+// it renders the payload.
+func notifyEventFromMatch(event *MatchEvent, provider string, outcome *verifiers.Outcome) notify.Event {
+	secret := event.Secret
+	if secret == "" && len(event.Matches) > 0 {
+		secret = event.Matches[0]
+	}
+	ev := notify.Event{
+		Signature: event.Signature,
+		Secret:    secret,
+		URL:       event.Url,
+		Repo:      event.Url,
+		File:      event.File,
+		Line:      event.SecretLine,
+		Priority:  event.Priority,
+		Severity:  notifySeverityFromString(event.Severity),
+		Provider:  provider,
+	}
+	if outcome != nil {
+		ev.Tier = outcome.Tier
+		ev.Balance = outcome.Balance
+		ev.Identity = outcome.Identity
+	}
+	return ev
+}
+
+// ──────────────────────────────────────────────────────────────
+//  DAILY DIGEST (Slice 9)
+// ──────────────────────────────────────────────────────────────
+
+// digestInterval is how often the findings digest runs. Production uses a day;
+// it is a var so tests can shorten it without a real wait.
+var digestInterval = 24 * time.Hour
+
+// startDailyDigest launches the findings digest goroutine. It reports whether
+// the goroutine started. When findings storage is disabled or degraded there is
+// nothing to read, so it logs one note and does not start: the operator should
+// know the digest will not fire.
+func startDailyDigest() bool {
+	st := getSession().Store
+	if !getSession().Config.StoreEnabled() || st == nil || st.Degraded() {
+		// Debug rather than Info: storage is off by default, so a note at Info
+		// would add a line to every existing operator's scan output.
+		getSession().Log.Debug("[digest] disabled: findings storage is not enabled")
+		return false
+	}
+	go func() {
+		ticker := time.NewTicker(digestInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			logDigest(st)
+		}
+	}()
+	return true
+}
+
+// logDigest summarises the findings recorded in the last digestInterval through
+// the session logger and then delivers the same summary to every configured
+// alert channel and to the main webhook. Delivery is best-effort: each failure
+// is logged and never interrupts the scan or the digest loop.
+func logDigest(st store.Store) {
+	recs, err := st.List(store.Filter{Since: time.Now().Add(-digestInterval)})
+	if err != nil {
+		getSession().Log.Warn("[digest] could not read findings store: %s", err)
+		return
+	}
+	summary := formatDigest(recs, digestInterval)
+	getSession().Log.Info("[digest] %s", summary)
+	deliverDigest(recs, summary)
+}
+
+// deliverDigest sends the daily summary to the extra alert channels (one
+// synthetic event per severity bucket, so a channel's own severity floor still
+// applies) and to the main webhook. The webhook is skipped when none is
+// configured, exactly like the per-finding path.
+func deliverDigest(recs []store.Record, summary string) {
+	log := getSession().Log
+	if d := notifyDispatcherRef(); d != nil {
+		for _, ev := range digestEvents(recs, summary) {
+			recordNotifyResults(d.Deliver(ev), log)
+		}
+	}
+	cfg := getSession().Config
+	if cfg != nil && strings.TrimSpace(cfg.Webhook) != "" {
+		core.SendMatchWebhook(cfg.Webhook, cfg.WebhookPayload, "", "shhgit daily digest", "", []string{summary}, "", 0, "", digestSeverity(recs), nil)
+	}
+}
+
+// digestEvents builds one synthetic event per non-empty severity bucket so a
+// channel configured with a min_severity floor only receives a digest when that
+// bucket has findings. The rendered summary rides in the Repository field, the
+// free-text slot the shared channel renderers always print.
+func digestEvents(recs []store.Record, summary string) []notify.Event {
+	counts := map[string]int{}
+	for _, r := range recs {
+		sev := strings.ToLower(strings.TrimSpace(r.Severity))
+		if sev == "" {
+			sev = "unclassified"
+		}
+		counts[sev]++
+	}
+	order := []struct {
+		name string
+		rank notify.Severity
+	}{
+		{"critical", notify.SevCritical},
+		{"high", notify.SevHigh},
+		{"medium", notify.SevMedium},
+		{"low", notify.SevLow},
+	}
+	var events []notify.Event
+	for _, b := range order {
+		n := counts[b.name]
+		if n == 0 {
+			continue
+		}
+		events = append(events, notify.Event{
+			Signature: fmt.Sprintf("shhgit daily digest: %d %s finding(s)", n, b.name),
+			Repo:      summary,
+			Severity:  b.rank,
+		})
+	}
+	return events
+}
+
+// digestSeverity returns the highest severity present in the window, or "low"
+// when the records carry no recognised severity, for the webhook's embed accent.
+func digestSeverity(recs []store.Record) string {
+	rank := map[string]int{"low": 1, "medium": 2, "high": 3, "critical": 4}
+	best, bestRank := "", 0
+	for _, r := range recs {
+		s := strings.ToLower(strings.TrimSpace(r.Severity))
+		if rank[s] > bestRank {
+			best, bestRank = s, rank[s]
+		}
+	}
+	if best == "" {
+		return "low"
+	}
+	return best
+}
+
+// formatDigest renders a one-line summary of records over a window: the total,
+// a per-severity breakdown and the most frequent signature.
+func formatDigest(recs []store.Record, window time.Duration) string {
+	if len(recs) == 0 {
+		return fmt.Sprintf("no findings in the last %s", humanDuration(window))
+	}
+	bySeverity := map[string]int{}
+	bySignature := map[string]int{}
+	for _, r := range recs {
+		sev := r.Severity
+		if sev == "" {
+			sev = "unclassified"
+		}
+		bySeverity[sev]++
+		bySignature[r.Signature]++
+	}
+	top, topN := "", 0
+	for s, n := range bySignature {
+		if n > topN || (n == topN && s < top) {
+			top, topN = s, n
+		}
+	}
+	return fmt.Sprintf("%d findings in the last %s (critical %d, high %d, medium %d, low %d); top: %s (%d)",
+		len(recs), humanDuration(window),
+		bySeverity["critical"], bySeverity["high"], bySeverity["medium"], bySeverity["low"],
+		top, topN)
+}
+
+// humanDuration renders the common whole-hour/day durations compactly.
+func humanDuration(d time.Duration) string {
+	switch {
+	case d >= 24*time.Hour && d%(24*time.Hour) == 0:
+		return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
+	case d%time.Hour == 0:
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	case d%time.Minute == 0:
+		return fmt.Sprintf("%dm", int(d/time.Minute))
+	default:
+		return d.String()
+	}
+}
+
+// ──────────────────────────────────────────────────────────────
+//  REMOTE DISCOVERY SOURCES (GitLab, Pastebin, searchcode, Sourcegraph)
+// ──────────────────────────────────────────────────────────────
+
+// Source seams. Tests point the APIs and transports at httptest servers;
+// production leaves them empty/nil, which selects the public hosts and the
+// shared resilient client.
+var (
+	gitLabBaseURL string
+	gitLabDoer    core.Doer
+
+	pastebinBaseURL   string
+	pastebinRawBase   string
+	pastebinPublicRaw string
+	pastebinDoer      core.Doer
+
+	searchCodeBaseURL string
+	searchCodeDoer    core.Doer
+
+	sourcegraphBaseURL string
+	sourcegraphDoer    core.Doer
+
+	// gitHubSearchBaseURL/gitHubSearchDoer are shared by the commit- and
+	// issue-search sources, which hit the same API host.
+	gitHubSearchBaseURL string
+	gitHubSearchDoer    core.Doer
+
+	grepAppBaseURL string
+	grepAppDoer    core.Doer
+
+	psbdmpBaseURL string
+	psbdmpDoer    core.Doer
+
+	bitbucketBaseURL string
+	bitbucketDoer    core.Doer
+)
+
+// sourceStartBlocked reports whether a background remote source must not start
+// for this run: a --local scan needs no network source, and the one-shot
+// store/token commands never publish, so starting a polling source for them
+// would be pure waste and could make a token command unexpectedly hit the
+// network. Every remote source shares this guard so they cannot drift.
+func sourceStartBlocked() bool {
+	o := getSession().Options
+	if strings.TrimSpace(*o.Local) != "" {
+		return true
+	}
+	return boolOpt(o.TestTokens) || strings.TrimSpace(strOpt(o.ScanKeys)) != "" ||
+		boolOpt(o.Export) || boolOpt(o.Stats) ||
+		(o.ExportEncrypted != nil && *o.ExportEncrypted != "") ||
+		(o.Decrypt != nil && *o.Decrypt != "")
+}
+
+// startGitLab launches the GitLab public-snippet source in the background when
+// sources.gitlab.enabled is true. Like code search it is a remote-scan feature:
+// a --local scan or a one-shot store/token command must not start it. It polls
+// at the configured interval until the process exits.
+func startGitLab() {
+	if !getSession().Config.GitLabEnabled() {
+		return
+	}
+	if sourceStartBlocked() {
+		return
+	}
+	_, interval := getSession().Config.GitLabValues()
+	go func() {
+		for {
+			runGitLab()
+			if interval <= 0 {
+				return
+			}
+			time.Sleep(time.Duration(interval) * time.Second)
+		}
+	}()
+}
+
+// runGitLab performs one polling pass: list the public snippets, download each
+// allowlisted raw body and feed it to the shared scanContents engine, so a
+// GitLab finding is produced by exactly the same signatures and suppression
+// rules as a cloned repository. A listing or download failure is logged and
+// skipped; one bad snippet never stops the pass.
+func runGitLab() {
+	log := getSession().Log
+	perPage, _ := getSession().Config.GitLabValues()
+	doer := gitLabDoer
+	if doer == nil {
+		doer = core.SharedHTTPClient()
+	}
+	client := &core.GitLabClient{Doer: doer, BaseURL: gitLabBaseURL, PerPage: perPage}
+
+	snippets, err := client.PublicSnippets(0)
+	if err != nil {
+		log.Warn("[gitlab] snippet listing failed: %s", err)
+		return
+	}
+	for _, sn := range snippets {
+		if core.IsSkippableFile(sn.FileName) {
+			continue
+		}
+		body, err := client.SnippetContent(sn.RawURL)
+		if err != nil {
+			log.Debug("[gitlab] skipping snippet %d: %s", sn.ID, err)
+			continue
+		}
+		displayURL := sn.WebURL
+		if displayURL == "" {
+			displayURL = sn.RawURL
+		}
+		scanContents(displayURL, "", sn.FileName, displayURL, -1, body, core.GITLAB_SOURCE)
+	}
+}
+
+// startPastebin launches the Pastebin Scraping API source when
+// sources.pastebin.enabled is true. It is a remote-scan feature with the same
+// --local / one-shot guard as GitLab, and polls at the configured interval.
+func startPastebin() {
+	if !getSession().Config.PastebinEnabled() {
+		return
+	}
+	if sourceStartBlocked() {
+		return
+	}
+	_, _, interval := getSession().Config.PastebinValues()
+	go func() {
+		for {
+			runPastebin()
+			if interval <= 0 {
+				return
+			}
+			time.Sleep(time.Duration(interval) * time.Second)
+		}
+	}()
+}
+
+// runPastebin performs one polling pass: list the most recent public pastes and
+// download each body, feeding it to the shared scanContents engine so a
+// Pastebin finding is produced by exactly the same signatures and suppression
+// rules as a cloned repository. api_key selects the Scraping API item endpoint
+// over the public raw endpoint; a listing or download failure is logged and
+// skipped, never aborting the pass.
+func runPastebin() {
+	log := getSession().Log
+	apiKey, limit, _ := getSession().Config.PastebinValues()
+	doer := pastebinDoer
+	if doer == nil {
+		doer = core.SharedHTTPClient()
+	}
+	client := core.NewPastebinClient(doer, pastebinBaseURL)
+	if pastebinRawBase != "" {
+		client.RawBase = pastebinRawBase
+	}
+	if pastebinPublicRaw != "" {
+		client.PublicRaw = pastebinPublicRaw
+	}
+
+	pastes, err := client.ListRecent(limit)
+	if err != nil {
+		log.Warn("[pastebin] paste listing failed: %s", err)
+		return
+	}
+	useScrapeAPI := strings.TrimSpace(apiKey) != ""
+	for _, paste := range pastes {
+		body, err := client.PasteContent(paste.Key, useScrapeAPI)
+		if err != nil {
+			log.Debug("[pastebin] skipping %s: %s", paste.Key, err)
+			continue
+		}
+		scanContents(paste.URL, "", paste.URL, paste.URL, -1, body, core.PASTEBIN_SOURCE)
+	}
+}
+
+// startSearchCode launches the searchcode.com source when
+// sources.searchcode.enabled is true, with the same remote-scan guard.
+func startSearchCode() {
+	if !getSession().Config.SearchCodeEnabled() {
+		return
+	}
+	if sourceStartBlocked() {
+		return
+	}
+	_, _, _, interval := getSession().Config.SearchCodeValues()
+	go func() {
+		for {
+			runSearchCode()
+			if interval <= 0 {
+				return
+			}
+			time.Sleep(time.Duration(interval) * time.Second)
+		}
+	}()
+}
+
+// runSearchCode performs one polling pass: for each configured query it walks
+// the pages, then scans every result's reconstructed content with the shared
+// scanContents engine and tags the finding SEARCHCODE_SOURCE. An empty query
+// list falls back to core.SearchCodeKeywords. A query failure is logged and the
+// next query is still attempted.
+func runSearchCode() {
+	log := getSession().Log
+	queries, perPage, maxPages, _ := getSession().Config.SearchCodeValues()
+	if len(queries) == 0 {
+		queries = core.SearchCodeKeywords
+	}
+	doer := searchCodeDoer
+	if doer == nil {
+		doer = core.SharedHTTPClient()
+	}
+	client := core.NewSearchCodeClient(doer, searchCodeBaseURL)
+	client.PerPage = perPage
+
+	for _, query := range queries {
+		results, err := client.SearchKeyword(query, maxPages)
+		if err != nil {
+			log.Warn("[searchcode] query %q failed: %s", query, err)
+		}
+		for _, result := range results {
+			content := result.Content()
+			if content == "" {
+				continue
+			}
+			displayURL := strings.TrimSpace(result.URL)
+			if displayURL == "" {
+				displayURL = strings.TrimSpace(result.Repo)
+			}
+			displayPath := strings.TrimSpace(result.Filename)
+			if displayPath == "" {
+				displayPath = displayURL
+			}
+			scanContents("", "", displayPath, displayURL, -1, []byte(content), core.SEARCHCODE_SOURCE)
+		}
+	}
+}
+
+// startSourcegraph launches the Sourcegraph stream-search source when
+// sources.sourcegraph.enabled is true, with the same remote-scan guard.
+func startSourcegraph() {
+	if !getSession().Config.SourcegraphEnabled() {
+		return
+	}
+	if sourceStartBlocked() {
+		return
+	}
+	_, _, interval, _ := getSession().Config.SourcegraphValues()
+	go func() {
+		for {
+			runSourcegraph()
+			if interval <= 0 {
+				return
+			}
+			time.Sleep(time.Duration(interval) * time.Second)
+		}
+	}()
+}
+
+// runSourcegraph performs one polling pass: for each configured query it scans
+// the matched preview lines with the shared scanContents engine, tagged
+// SOURCEGRAPH_SOURCE and linked to the Sourcegraph blob URL. An empty query
+// list falls back to a small default list derived from the loaded signature
+// anchors; when none are derivable the pass does nothing. A query failure is
+// logged and the next query is still attempted.
+func runSourcegraph() {
+	log := getSession().Log
+	queries, maxResults, _, token := getSession().Config.SourcegraphValues()
+	if len(queries) == 0 {
+		queries = core.DefaultSourcegraphQueries(core.SignatureAnchors(getSession().Signatures), 0)
+	}
+	if len(queries) == 0 {
+		log.Warn("[sourcegraph] no queries configured and no signature anchors to derive them from")
+		return
+	}
+	doer := sourcegraphDoer
+	if doer == nil {
+		doer = core.SharedHTTPClient()
+	}
+	client := core.NewSourcegraphClient(doer, sourcegraphBaseURL)
+	client.Token = token
+
+	for _, query := range queries {
+		matches, err := client.Search(query, maxResults)
+		if err != nil {
+			log.Warn("[sourcegraph] query %q failed: %s", query, err)
+		}
+		for _, m := range matches {
+			if strings.TrimSpace(m.Preview) == "" {
+				continue
+			}
+			repo := strings.Trim(strings.TrimSpace(m.Repository), "/")
+			path := strings.Trim(strings.TrimSpace(m.Path), "/")
+			displayURL := "https://sourcegraph.com/" + repo + "/-/blob/" + path
+			displayPath := path
+			if displayPath == "" {
+				displayPath = displayURL
+			}
+			scanContents("", "", displayPath, displayURL, -1, []byte(m.Preview), core.SOURCEGRAPH_SOURCE)
+		}
+	}
+}
+
+// gitLabBlobSearchMaxPages bounds how many 100-blob pages each GitLab blob
+// query walks. Advanced code search is the most expensive GitLab call.
+const gitLabBlobSearchMaxPages = 3
+
+// startGitHubCommits launches the GitHub commit-search source when
+// sources.github_commits.enabled is true, with the same remote-scan guard and
+// interval polling as the other remote sources.
+func startGitHubCommits() {
+	if !getSession().Config.GitHubCommitsEnabled() {
+		return
+	}
+	if sourceStartBlocked() {
+		return
+	}
+	_, _, interval := getSession().Config.GitHubCommitsValues()
+	go func() {
+		for {
+			runGitHubCommits()
+			if interval <= 0 {
+				return
+			}
+			time.Sleep(time.Duration(interval) * time.Second)
+		}
+	}()
+}
+
+// runGitHubCommits performs one polling pass: for each configured (or derived)
+// query it scans the returned commit messages with the shared scanContents
+// engine, tagged GITHUB_COMMITS_SOURCE and linked to the commit HTML URL. A
+// missing token skips the pass, since commit search is authenticated.
+func runGitHubCommits() {
+	log := getSession().Log
+	queries, maxResults, _ := getSession().Config.GitHubCommitsValues()
+	if len(queries) == 0 {
+		queries = core.DefaultSourceQueries(core.SignatureAnchors(getSession().Signatures), 0)
+	}
+	if len(queries) == 0 {
+		log.Warn("[github-commits] no queries configured and no signature anchors to derive them from")
+		return
+	}
+	token := firstGitHubToken()
+	if token == "" {
+		log.Warn("[github-commits] enabled but no GitHub access token is configured; commit search requires a token")
+		return
+	}
+	doer := gitHubSearchDoer
+	if doer == nil {
+		doer = core.SharedHTTPClient()
+	}
+	client := core.NewGitHubSearchClient(doer, gitHubSearchBaseURL, token)
+
+	for _, query := range queries {
+		hits, err := client.SearchCommits(query, maxResults)
+		if err != nil {
+			log.Warn("[github-commits] query %q failed: %s", query, err)
+		}
+		for _, hit := range hits {
+			if strings.TrimSpace(hit.Message) == "" {
+				continue
+			}
+			scanContents("", "", hit.HTMLURL, hit.HTMLURL, -1, []byte(hit.Message), core.GITHUB_COMMITS_SOURCE)
+		}
+	}
+}
+
+// startGitHubIssues launches the GitHub issue-search source when
+// sources.github_issues.enabled is true, with the same guard as the other
+// remote sources.
+func startGitHubIssues() {
+	if !getSession().Config.GitHubIssuesEnabled() {
+		return
+	}
+	if sourceStartBlocked() {
+		return
+	}
+	_, _, interval := getSession().Config.GitHubIssuesValues()
+	go func() {
+		for {
+			runGitHubIssues()
+			if interval <= 0 {
+				return
+			}
+			time.Sleep(time.Duration(interval) * time.Second)
+		}
+	}()
+}
+
+// runGitHubIssues performs one polling pass: for each configured (or derived)
+// query it scans each issue/PR title and body with the shared scanContents
+// engine, tagged GITHUB_ISSUES_SOURCE and linked to the issue HTML URL.
+func runGitHubIssues() {
+	log := getSession().Log
+	queries, maxResults, _ := getSession().Config.GitHubIssuesValues()
+	if len(queries) == 0 {
+		queries = core.DefaultSourceQueries(core.SignatureAnchors(getSession().Signatures), 0)
+	}
+	if len(queries) == 0 {
+		log.Warn("[github-issues] no queries configured and no signature anchors to derive them from")
+		return
+	}
+	token := firstGitHubToken()
+	if token == "" {
+		log.Warn("[github-issues] enabled but no GitHub access token is configured; issue search requires a token")
+		return
+	}
+	doer := gitHubSearchDoer
+	if doer == nil {
+		doer = core.SharedHTTPClient()
+	}
+	client := core.NewGitHubSearchClient(doer, gitHubSearchBaseURL, token)
+
+	for _, query := range queries {
+		hits, err := client.SearchIssues(query, maxResults)
+		if err != nil {
+			log.Warn("[github-issues] query %q failed: %s", query, err)
+		}
+		for _, hit := range hits {
+			body := hit.Title + "\n" + hit.Body
+			if strings.TrimSpace(body) == "" {
+				continue
+			}
+			scanContents("", "", hit.HTMLURL, hit.HTMLURL, -1, []byte(body), core.GITHUB_ISSUES_SOURCE)
+		}
+	}
+}
+
+// startGitLabBlobs launches the GitLab blobs (code search) source when
+// sources.gitlab.search_enabled is true. It stops permanently once GitLab
+// refuses the scope as a Premium/Ultimate feature.
+func startGitLabBlobs() {
+	if !getSession().Config.GitLabBlobsEnabled() {
+		return
+	}
+	if sourceStartBlocked() {
+		return
+	}
+	_, interval := getSession().Config.GitLabBlobValues()
+	go func() {
+		for {
+			if !runGitLabBlobs() {
+				return
+			}
+			if interval <= 0 {
+				return
+			}
+			time.Sleep(time.Duration(interval) * time.Second)
+		}
+	}()
+}
+
+// runGitLabBlobs performs one polling pass over signature-derived queries. It
+// returns false when the source should stop for good: no query is derivable, no
+// token is configured, or GitLab refused the blobs scope as an advanced-search
+// (Premium/Ultimate) feature.
+func runGitLabBlobs() bool {
+	log := getSession().Log
+	token, _ := getSession().Config.GitLabBlobValues()
+	if strings.TrimSpace(token) == "" {
+		log.Warn("[gitlab] blob search is enabled but sources.gitlab.token is empty; blob search requires a token")
+		return false
+	}
+	queries := core.DefaultSourceQueries(core.SignatureAnchors(getSession().Signatures), 0)
+	if len(queries) == 0 {
+		log.Warn("[gitlab] blob search is enabled but no signature anchors are available to derive queries from")
+		return false
+	}
+	doer := gitLabDoer
+	if doer == nil {
+		doer = core.SharedHTTPClient()
+	}
+	perPage, _ := getSession().Config.GitLabValues()
+	client := &core.GitLabClient{Doer: doer, BaseURL: gitLabBaseURL, PerPage: perPage, Token: token}
+	projects := map[int]string{}
+
+	for _, query := range queries {
+		blobs, err := client.SearchBlobsAll(query, gitLabBlobSearchMaxPages)
+		if errors.Is(err, core.ErrGitLabSearchUnavailable) {
+			log.Warn("[gitlab] blob search unavailable (%s); disabling the GitLab blob source", err)
+			return false
+		}
+		if err != nil {
+			log.Warn("[gitlab] blob query %q failed: %s", query, err)
+		}
+		for _, b := range blobs {
+			if strings.TrimSpace(b.Data) == "" {
+				continue
+			}
+			project := gitLabProjectPath(doer, gitLabBaseURL, token, b.ProjectID, projects)
+			displayURL := gitLabBlobWebURL(gitLabBaseURL, project, b.Ref, b.Path)
+			scanContents("", b.Ref, b.Path, displayURL, -1, []byte(b.Data), core.GITLAB_SOURCE)
+		}
+	}
+	return true
+}
+
+// gitLabProjectPath resolves a GitLab project id to its path_with_namespace for
+// the blob web URL, caching results for the life of one pass. On any failure it
+// returns "" so the caller falls back to the raw blob path.
+func gitLabProjectPath(doer core.Doer, base, token string, id int, cache map[int]string) string {
+	if id <= 0 {
+		return ""
+	}
+	if path, ok := cache[id]; ok {
+		return path
+	}
+	root := strings.TrimRight(strings.TrimSpace(base), "/")
+	if root == "" {
+		root = "https://gitlab.com"
+	}
+	req, err := http.NewRequest(http.MethodGet, root+"/api/v4/projects/"+strconv.Itoa(id), nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "shhgit2")
+	req.Header.Set("Accept", "application/json")
+	if token != "" {
+		req.Header.Set("PRIVATE-TOKEN", token)
+	}
+	resp, err := doer.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var payload struct {
+		PathWithNamespace string `json:"path_with_namespace"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+		return ""
+	}
+	path := strings.TrimSpace(payload.PathWithNamespace)
+	cache[id] = path
+	return path
+}
+
+// gitLabBlobWebURL builds the human-facing blob URL. When the project path
+// could not be resolved it falls back to the raw path under the instance root.
+func gitLabBlobWebURL(base, projectPath, ref, path string) string {
+	root := strings.TrimRight(strings.TrimSpace(base), "/")
+	if root == "" {
+		root = "https://gitlab.com"
+	}
+	projectPath = strings.Trim(projectPath, "/")
+	ref = strings.Trim(ref, "/")
+	path = strings.TrimLeft(path, "/")
+	if projectPath == "" {
+		return root + "/" + path
+	}
+	return root + "/" + projectPath + "/-/blob/" + ref + "/" + path
+}
+
+// startGrepApp launches the grep.app source when sources.grepapp.enabled is
+// true, with the same guard as the other remote sources.
+func startGrepApp() {
+	if !getSession().Config.GrepAppEnabled() {
+		return
+	}
+	if sourceStartBlocked() {
+		return
+	}
+	_, _, interval := getSession().Config.GrepAppValues()
+	go func() {
+		for {
+			runGrepApp()
+			if interval <= 0 {
+				return
+			}
+			time.Sleep(time.Duration(interval) * time.Second)
+		}
+	}()
+}
+
+// runGrepApp performs one polling pass: for each configured (or derived) query
+// it scans the matched code snippets with the shared scanContents engine,
+// tagged GREPAPP_SOURCE and linked to the GitHub blob URL.
+func runGrepApp() {
+	log := getSession().Log
+	queries, maxResults, _ := getSession().Config.GrepAppValues()
+	if len(queries) == 0 {
+		queries = core.DefaultSourceQueries(core.SignatureAnchors(getSession().Signatures), 0)
+	}
+	if len(queries) == 0 {
+		log.Warn("[grepapp] no queries configured and no signature anchors to derive them from")
+		return
+	}
+	doer := grepAppDoer
+	if doer == nil {
+		doer = core.SharedHTTPClient()
+	}
+	client := core.NewGrepAppClient(doer, grepAppBaseURL)
+
+	for _, query := range queries {
+		hits, err := client.Search(query, maxResults)
+		if err != nil {
+			log.Warn("[grepapp] query %q failed: %s", query, err)
+		}
+		for _, hit := range hits {
+			if strings.TrimSpace(hit.Code) == "" {
+				continue
+			}
+			scanContents("", hit.Branch, hit.Path, client.BlobURL(hit), -1, []byte(hit.Code), core.GREPAPP_SOURCE)
+		}
+	}
+}
+
+// startPsbdmp launches the psbdmp.ws source when sources.psbdmp.enabled is
+// true, with the same guard as the other remote sources.
+func startPsbdmp() {
+	if !getSession().Config.PsbdmpEnabled() {
+		return
+	}
+	if sourceStartBlocked() {
+		return
+	}
+	_, _, interval := getSession().Config.PsbdmpValues()
+	go func() {
+		for {
+			runPsbdmp()
+			if interval <= 0 {
+				return
+			}
+			time.Sleep(time.Duration(interval) * time.Second)
+		}
+	}()
+}
+
+// runPsbdmp performs one polling pass: for each configured (or derived) query
+// it scans the returned paste bodies with the shared scanContents engine,
+// tagged PSBDMP_SOURCE and linked to the Pastebin URL. A search entry with no
+// inline text is downloaded through the dump endpoint first.
+func runPsbdmp() {
+	log := getSession().Log
+	queries, maxResults, _ := getSession().Config.PsbdmpValues()
+	if len(queries) == 0 {
+		queries = core.DefaultSourceQueries(core.SignatureAnchors(getSession().Signatures), 0)
+	}
+	if len(queries) == 0 {
+		log.Warn("[psbdmp] no queries configured and no signature anchors to derive them from")
+		return
+	}
+	doer := psbdmpDoer
+	if doer == nil {
+		doer = core.SharedHTTPClient()
+	}
+	client := core.NewPsbdmpClient(doer, psbdmpBaseURL)
+
+	for _, query := range queries {
+		pastes, err := client.Search(query, maxResults)
+		if err != nil {
+			log.Warn("[psbdmp] query %q failed: %s", query, err)
+		}
+		for _, paste := range pastes {
+			body := []byte(paste.Text)
+			if len(bytes.TrimSpace(body)) == 0 {
+				dumped, derr := client.Dump(paste.ID)
+				if derr != nil {
+					log.Debug("[psbdmp] skipping %s: %s", paste.ID, derr)
+					continue
+				}
+				body = dumped
+			}
+			if len(bytes.TrimSpace(body)) == 0 {
+				continue
+			}
+			scanContents("", "", paste.URL, paste.URL, -1, body, core.PSBDMP_SOURCE)
+		}
+	}
+}
+
+// startBitbucket launches the Bitbucket workspace source when
+// sources.bitbucket.enabled is true, with the same guard as the other remote
+// sources.
+func startBitbucket() {
+	if !getSession().Config.BitbucketEnabled() {
+		return
+	}
+	if sourceStartBlocked() {
+		return
+	}
+	_, _, _, interval := getSession().Config.BitbucketValues()
+	go func() {
+		for {
+			runBitbucket()
+			if interval <= 0 {
+				return
+			}
+			time.Sleep(time.Duration(interval) * time.Second)
+		}
+	}()
+}
+
+// runBitbucket performs one polling pass: for each configured workspace it
+// lists the repositories, walks each repository's files and scans every file
+// body with the shared scanContents engine, tagged BITBUCKET_SOURCE and linked
+// to the file's raw URL. A workspace or repository failure is logged and the
+// walk continues.
+func runBitbucket() {
+	log := getSession().Log
+	workspaces, maxRepos, maxFiles, _ := getSession().Config.BitbucketValues()
+	if len(workspaces) == 0 {
+		log.Warn("[bitbucket] enabled but no workspaces are configured")
+		return
+	}
+	doer := bitbucketDoer
+	if doer == nil {
+		doer = core.SharedHTTPClient()
+	}
+	client := core.NewBitbucketClient(doer, bitbucketBaseURL)
+
+	for _, workspace := range workspaces {
+		workspace = strings.TrimSpace(workspace)
+		if workspace == "" {
+			continue
+		}
+		repos, err := client.ListRepos(workspace, maxRepos)
+		if err != nil {
+			log.Warn("[bitbucket] workspace %q listing failed: %s", workspace, err)
+		}
+		for _, repo := range repos {
+			files, err := client.ListFiles(workspace, repo.Slug, repo.MainBranch, maxFiles)
+			if err != nil {
+				log.Warn("[bitbucket] %q file listing failed: %s", repo.FullName, err)
+			}
+			for _, f := range files {
+				if core.IsSkippableFile(f.Path) {
+					continue
+				}
+				body, ferr := client.FileContent(f.RawURL)
+				if ferr != nil {
+					log.Debug("[bitbucket] skipping %s: %s", f.Path, ferr)
+					continue
+				}
+				scanContents("", repo.MainBranch, f.Path, f.RawURL, -1, body, core.BITBUCKET_SOURCE)
+			}
+		}
+	}
+}
+
+// deliverWebhook enqueues one finding to the configured webhook. onConfirm is
+// invoked exactly once with the final outcome: true when the endpoint accepted
+// the message (or the item was already delivered inside the queue's dedupe
+// window), false when the item was dropped or every retry failed. It never
+// blocks - the queue sends on its own goroutine - so a slow or dead endpoint
+// cannot throttle the scanner.
+//
+// It is a package variable so tests can simulate an unconfirmed delivery.
+var deliverWebhook = func(event *MatchEvent, onConfirm func(ok bool)) {
+	cfg := getSession().Config
+	// The webhook subsystem's latency spans enqueue to the queue's final
+	// outcome, so it reflects a real delivery rather than an instantaneous
+	// enqueue. A dropped or permanently failed delivery counts as an error.
+	var start time.Time
+	if core.MetricsCollectionEnabled() {
+		start = time.Now()
+	}
+	core.SendMatchWebhook(
+		cfg.Webhook,
+		cfg.WebhookPayload,
+		event.Url,
+		event.Signature,
+		event.File,
+		event.Matches,
+		event.Color,
+		event.Priority,
+		event.FileContent,
+		event.Severity,
+		func(ok bool) {
+			if core.MetricsCollectionEnabled() {
+				core.DefaultMetrics.ObserveLatency(core.SubsystemWebhook, time.Since(start))
+				core.DefaultMetrics.IncOperations(core.SubsystemWebhook)
+				if !ok {
+					core.DefaultMetrics.IncError(core.SubsystemWebhook)
+				}
+			}
+			if onConfirm != nil {
+				onConfirm(ok)
+			}
+		},
+	)
+}
+
 func publish(event *MatchEvent) {
-	// Every finding funnels through here, so this is the one place the scan
-	// progress counter needs to be bumped.
+	// One id for every surface: the web hub, the TUI and the findings store
+	// each minted their own, so the same finding could never be correlated
+	// across them (and the captured file body was stored twice under two
+	// keys). Mint once, share everywhere.
+	id := newMatchID()
+
+	// The finding funnel is also the scan subsystem's hot path: time it end to
+	// end (including any dedupe/AI-filter early return) and count one operation
+	// per finding.
+	if core.MetricsCollectionEnabled() {
+		start := time.Now()
+		defer func() {
+			core.DefaultMetrics.ObserveLatency(core.SubsystemScan, time.Since(start))
+			core.DefaultMetrics.IncOperations(core.SubsystemScan)
+		}()
+	}
+
+	sess := getSession()
+
+	// Cross-run dedupe. The fingerprint is computed before delivery; when the
+	// store already knows it (and --no-dedupe is not set) the finding is a
+	// repeat and is not re-published to any sink. A suppressed finding never
+	// reaches the write below, so it is never persisted.
+	//
+	// The store and dedupe are gated separately: --no-dedupe must only skip the
+	// Seen read, not persistence. Gating both on the same bool meant a
+	// --no-dedupe run appended nothing, so --export always came back empty.
+	storeEnabled := sess.Store != nil && sess.Config != nil && sess.Config.StoreEnabled()
+	dedupe := storeEnabled && !boolOpt(sess.Options.NoDedupe)
+	var fingerprint string
+	if storeEnabled {
+		fingerprint = findingFingerprint(event)
+	}
+	if dedupe && sess.Store.Seen(fingerprint) {
+		return
+	}
+
+	// Dynamic severity (Slice 6): derived from the verifier outcome when one is
+	// already known, otherwise from the rule priority. It is computed once here
+	// and shared by the dashboard, TUI, webhook and findings store so the four
+	// surfaces cannot disagree.
+	outcome := outcomeForSecret(event.Secret)
+	_, providerName, _ := cachedFor(event.Secret)
+	severity := core.Classify(event.Priority, outcome).String()
+	event.Severity = severity
+
+	// Bounded context and base-URL extraction (Slice 4). Both are opt-in:
+	// scanning.context_lines defaults to 0, so an existing scan captures nothing
+	// extra until the operator turns it on.
+	var contextText, baseURL string
+	if sess.Config != nil {
+		if lines := sess.Config.Scanning.Int(sess.Config.Scanning.ContextLines, 0); lines > 0 &&
+			event.FileContent != "" && event.SecretLine > 0 {
+			contextText = core.ExtractContext([]byte(event.FileContent), event.SecretLine, lines, maxStoreFileBytes)
+			baseURL, _ = core.ExtractBaseURL([]byte(event.FileContent))
+		}
+	}
+
+	// AI false-positive pre-filter (Slice 8, opt-in). It runs before any sink, so
+	// a suppressed finding reaches neither the dashboard, the TUI, the --live
+	// endpoint, the webhook nor the findings store: it is recorded in the
+	// filter's bounded ring and dropped. The filter fails open, so a timeout, a
+	// full queue or a classifier error keeps the finding.
+	if f := getAIFilter(); f != nil {
+		if verdict := f.Consider(event, contextText); verdict.Suppress {
+			f.Record(event, verdict)
+			return
+		}
+	}
+
+	// matches_found counts findings that reach a sink. It sits below the
+	// dedupe and AI-filter early returns: counting above them inflated the
+	// dashboard with suppressed/duplicates that no sink ever saw.
 	core.GlobalScanProgress.MatchFound()
+
+	// The Tokens-tab row for this secret was pushed by OnOutcome during
+	// matching, before the match existed and its rule priority was known. Now
+	// that severity is computed, copy it onto that row so the two tabs agree.
+	syncTokenSeverity(maskedOutcomeKey(event.Secret), severity)
+
+	// Verified is a tri-state on the wire: nil until a verifier reports, then
+	// true/false for an accepted/rejected secret. A quota-limited credential is
+	// accepted-but-throttled, so it is verified exactly as core's outcomeValid
+	// treats it.
+	var verified *bool
+	if outcome != nil {
+		verified = boolPtr(outcome.Status == verifiers.Valid || outcome.Status == verifiers.QuotaLimited)
+	}
 
 	// Feed the in-process web dashboard (when running with --web).
 	if webHub != nil {
 		m := &Match{
-			ID:        newMatchID(),
+			ID:        id,
 			Timestamp: time.Now(),
 			Source:    sourceName(event.Source),
 			URL:       event.Url,
@@ -1650,6 +3044,10 @@ func publish(event *MatchEvent) {
 			Stars:     event.Stars,
 			Priority:  event.Priority,
 			Color:     event.Color,
+			BaseURL:   baseURL,
+			Context:   contextText,
+			Severity:  severity,
+			Verified:  verified,
 		}
 		// Blocking, deliberately. This used to be a non-blocking send with a
 		// default that discarded the match when the hub's 256-slot buffer was
@@ -1664,9 +3062,10 @@ func publish(event *MatchEvent) {
 		}
 	}
 
-	// Feed the TUI (when running with --tui).
-	if tuiState != nil {
-		id := newMatchID()
+	// Feed the TUI (when running with --tui). tuiState is deliberately never
+	// nil, so its presence is not a mode test: gating on it made every
+	// terminal/web run retain finding records in the TUI buffer forever.
+	if tuiActive() {
 		AddTUIMatch(&TUIMatch{
 			ID:        id,
 			Timestamp: time.Now(),
@@ -1679,6 +3078,7 @@ func publish(event *MatchEvent) {
 			Line:      event.SecretLine,
 			Stars:     event.Stars,
 			Priority:  event.Priority,
+			Severity:  severity,
 		})
 		// Keep the captured file body under the same id the UI sees, so the "v"
 		// key can show the file around the finding exactly like the dashboard's
@@ -1689,7 +3089,7 @@ func publish(event *MatchEvent) {
 		}
 	}
 
-	if len(*getSession().Options.Live) > 0 {
+	if len(strOpt(getSession().Options.Live)) > 0 {
 		// Convert MatchEvent to server Match format
 		match := map[string]interface{}{
 			"timestamp": time.Now().Format(time.RFC3339),
@@ -1703,30 +3103,307 @@ func publish(event *MatchEvent) {
 			"stars":     event.Stars,
 			"priority":  event.Priority,
 			"color":     event.Color,
+			"severity":  severity,
+			"base_url":  baseURL,
+			"context":   contextText,
 		}
 		data, _ := json.Marshal(match)
 		// Off the scanner's goroutine and through a bounded client. This was an
 		// inline http.Post on http.DefaultClient, which has no timeout and whose
 		// response body was never closed: a hung --live endpoint stalled every
 		// worker and leaked the connection.
-		go postLive(*getSession().Options.Live, data)
+		go postLive(strOpt(getSession().Options.Live), data)
 	}
 
-	// Send EVERY match to the main webhook.
-	if len(getSession().Config.Webhook) > 0 {
-		go core.SendMatchWebhook(
-			getSession().Config.Webhook,
-			getSession().Config.WebhookPayload,
-			event.Url,
-			event.Signature,
-			event.File,
-			event.Matches,
-			event.Color,
-			event.Priority,
-			event.FileContent,
-		)
+	// Persist the finding only after its delivery path is confirmed. A failed or
+	// unconfirmed delivery is deliberately left unwritten so the next run
+	// re-alerts it. The record is built up-front because confirmation can arrive
+	// later, on the webhook queue's goroutine, after publish has returned.
+	persist := func() {}
+	if storeEnabled {
+		rec := store.Record{
+			ID:          id,
+			Fingerprint: fingerprint,
+			Timestamp:   time.Now(),
+			Source:      sourceName(event.Source),
+			URL:         event.Url,
+			File:        event.File,
+			Signature:   event.Signature,
+			Matches:     event.Matches,
+			Secret:      event.Secret,
+			Line:        event.SecretLine,
+			Stars:       event.Stars,
+			Priority:    event.Priority,
+			Severity:    severity,
+		}
+		// The verifier metadata is only known when a validation already
+		// completed; it is left empty otherwise, as the store contract allows.
+		if outcome != nil {
+			rec.Provider = providerName
+			rec.Tier = outcome.Tier
+			rec.Balance = outcome.Balance
+		}
+		persist = func() {
+			if err := sess.Store.Append(rec); err != nil {
+				sess.Log.Warn("Findings store append failed; the finding was not persisted: %s", err)
+			}
+		}
 	}
 
+	// Send EVERY match to the main webhook. The queue enqueues without blocking
+	// (the actual HTTP send runs on the queue's goroutine) and reports the final
+	// outcome through onConfirm, so the finding is recorded only once the alert
+	// has actually gone out. A delayed callback can never throttle the scanner.
+	webhookConfigured := sess.Config != nil && len(sess.Config.Webhook) > 0
+	if webhookConfigured {
+		deliverWebhook(event, func(ok bool) {
+			if ok {
+				persist()
+			}
+		})
+	}
+
+	// Extra alert channels (Slice 9). This runs alongside the webhook above, not
+	// instead of it. Delivery is off the scanner's goroutine because a channel
+	// may do real I/O (HTTP, SMTP, file); the dispatcher applies the quiet-hours
+	// policy and each channel's severity floor itself.
+	if d := notifyDispatcherRef(); d != nil {
+		nev := notifyEventFromMatch(event, providerName, outcome)
+		go func() {
+			recordNotifyResults(d.Deliver(nev), sess.Log)
+		}()
+	}
+
+	// A broadcast-only run has no webhook whose delivery to await, so the
+	// finding is confirmed (and recorded) immediately.
+	if !webhookConfigured {
+		persist()
+	}
+}
+
+// ──────────────────────────────────────────────────────────────
+//  FINDINGS STORE CLI (--export / --export-encrypted / --decrypt)
+// ──────────────────────────────────────────────────────────────
+
+// storePassphraseEnv names the environment variable that supplies the export
+// passphrase. A passphrase is never accepted as a command-line argument: argv is
+// visible to other processes and lands in shell history.
+const storePassphraseEnv = "SHHGIT_STORE_PASSPHRASE"
+
+// resolvePassphrase returns the export/decrypt passphrase from the environment,
+// falling back to an interactive terminal prompt. confirm asks for the
+// passphrase a second time (used when creating an encrypted export).
+func resolvePassphrase(confirm bool) (string, error) {
+	if v := os.Getenv(storePassphraseEnv); v != "" {
+		return v, nil
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return "", fmt.Errorf("set %s or run on a terminal to enter a passphrase", storePassphraseEnv)
+	}
+	fmt.Fprint(os.Stderr, "Passphrase: ")
+	first, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return "", err
+	}
+	if len(first) == 0 {
+		return "", errors.New("empty passphrase")
+	}
+	if !confirm {
+		return string(first), nil
+	}
+	fmt.Fprint(os.Stderr, "Confirm passphrase: ")
+	second, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return "", err
+	}
+	if !bytes.Equal(first, second) {
+		return "", errors.New("passphrases do not match")
+	}
+	return string(first), nil
+}
+
+// exportFindings lists every record in the store and writes it in the requested
+// format. An empty/unknown format value falls back to JSONL; anything other
+// than csv/jsonl is rejected so a typo cannot silently emit the wrong format.
+func exportFindings(st store.Store, format string, w io.Writer) error {
+	if st == nil {
+		return errors.New("findings store is unavailable")
+	}
+	recs, err := st.List(store.Filter{})
+	if err != nil {
+		return err
+	}
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "", "jsonl":
+		return store.ExportJSONL(w, recs)
+	case "csv":
+		return store.ExportCSV(w, recs)
+	default:
+		return fmt.Errorf("unknown export format %q (want csv or jsonl)", format)
+	}
+}
+
+// exportFindingsEncrypted writes an AES-256-GCM + scrypt encrypted export of
+// every stored record to path.
+func exportFindingsEncrypted(st store.Store, path, passphrase string) error {
+	if st == nil {
+		return errors.New("findings store is unavailable")
+	}
+	recs, err := st.List(store.Filter{})
+	if err != nil {
+		return err
+	}
+	return store.ExportEncrypted(path, recs, passphrase)
+}
+
+// decryptFindings decrypts an encrypted export and writes the records as JSONL.
+func decryptFindings(path, passphrase string, w io.Writer) error {
+	recs, err := store.DecryptFile(path, passphrase)
+	if err != nil {
+		return err
+	}
+	return store.ExportJSONL(w, recs)
+}
+
+// printStoreStats renders the findings store totals for --stats: the record
+// count, a severity breakdown and the most frequent signatures and providers.
+// It reads the whole store once, like --export.
+func printStoreStats(st store.Store) error {
+	if st == nil {
+		return errors.New("findings store is unavailable")
+	}
+	recs, err := st.List(store.Filter{})
+	if err != nil {
+		return err
+	}
+	lockWrite(formatStoreStats(recs))
+	return nil
+}
+
+// formatStoreStats renders the --stats report for a set of records. It is pure
+// so the output can be asserted without touching stdout.
+func formatStoreStats(recs []store.Record) string {
+	bySeverity := map[string]int{}
+	bySignature := map[string]int{}
+	byProvider := map[string]int{}
+	for _, r := range recs {
+		sev := strings.ToLower(strings.TrimSpace(r.Severity))
+		if sev == "" {
+			sev = "unclassified"
+		}
+		bySeverity[sev]++
+		if r.Signature != "" {
+			bySignature[r.Signature]++
+		}
+		if r.Provider != "" {
+			byProvider[r.Provider]++
+		}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "[*] Findings store totals\n")
+	fmt.Fprintf(&b, "    records:      %d\n", len(recs))
+	fmt.Fprintf(&b, "    by severity:  critical %d, high %d, medium %d, low %d, unclassified %d\n",
+		bySeverity["critical"], bySeverity["high"], bySeverity["medium"], bySeverity["low"], bySeverity["unclassified"])
+	writeTopCounts(&b, "signature", bySignature)
+	writeTopCounts(&b, "provider", byProvider)
+	return b.String()
+}
+
+// writeTopCounts writes the ten most frequent keys of counts, ordering ties by
+// name so the output is stable run to run.
+func writeTopCounts(b *strings.Builder, label string, counts map[string]int) {
+	type kv struct {
+		name  string
+		count int
+	}
+	all := make([]kv, 0, len(counts))
+	for name, count := range counts {
+		all = append(all, kv{name, count})
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].count != all[j].count {
+			return all[i].count > all[j].count
+		}
+		return all[i].name < all[j].name
+	})
+	limit := 10
+	if len(all) < limit {
+		limit = len(all)
+	}
+	fmt.Fprintf(b, "    top %ss:\n", label)
+	if limit == 0 {
+		fmt.Fprintf(b, "      (none)\n")
+		return
+	}
+	for i := 0; i < limit; i++ {
+		fmt.Fprintf(b, "      %2d. %s (%d)\n", i+1, all[i].name, all[i].count)
+	}
+}
+
+// handleStoreCLI runs the one-shot store commands. It returns true when a
+// command ran, so the caller skips the scan. Success exits 0; any failure is
+// reported and exits 1. exitScanner only returns in web/TUI mode, so the caller
+// must also return here to avoid falling through into a full scan.
+func handleStoreCLI() bool {
+	opts := getSession().Options
+	switch {
+	case opts.Decrypt != nil && *opts.Decrypt != "":
+		pass, err := resolvePassphrase(false)
+		if err == nil {
+			err = decryptFindings(*opts.Decrypt, pass, os.Stdout)
+		}
+		if err != nil {
+			lockPrintf("[!] --decrypt failed: %s\n", err)
+			exitScanner(1)
+			return true
+		}
+		exitScanner(0)
+		return true
+
+	case opts.ExportEncrypted != nil && *opts.ExportEncrypted != "":
+		pass, err := resolvePassphrase(true)
+		if err == nil {
+			err = exportFindingsEncrypted(getSession().Store, *opts.ExportEncrypted, pass)
+		}
+		if err != nil {
+			lockPrintf("[!] --export-encrypted failed: %s\n", err)
+			exitScanner(1)
+			return true
+		}
+		lockPrintf("[*] Encrypted findings export written to %s\n", *opts.ExportEncrypted)
+		exitScanner(0)
+		return true
+
+	case opts.Export != nil && *opts.Export:
+		if !getSession().Config.StoreEnabled() {
+			lockPrintf("[!] storage.enabled is false; the export will be empty\n")
+		}
+		if err := exportFindings(getSession().Store, *opts.ExportFormat, os.Stdout); err != nil {
+			lockPrintf("[!] --export failed: %s\n", err)
+			exitScanner(1)
+			return true
+		}
+		exitScanner(0)
+		return true
+
+	case opts.Stats != nil && *opts.Stats:
+		if !getSession().Config.StoreEnabled() {
+			lockPrintf("[!] storage.enabled is false; there are no findings to report\n")
+			exitScanner(0)
+			return true
+		}
+		if err := printStoreStats(getSession().Store); err != nil {
+			lockPrintf("[!] --stats failed: %s\n", err)
+			exitScanner(1)
+			return true
+		}
+		exitScanner(0)
+		return true
+	}
+	return false
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -1770,20 +3447,38 @@ func main() {
 // kill the process: it just returns and the UI keeps serving results. In the
 // plain terminal mode it exits with the scan's status code (1 on a hit, 0
 // clean), which is what CI depends on.
+//
+// webhookDrainTimeout bounds the pre-exit webhook drain: long enough for a
+// burst of findings to go out, short enough that a dead endpoint cannot hang
+// a one-shot run forever.
+const webhookDrainTimeout = 30 * time.Second
+
 func exitScanner(code int) {
 	if modeConfig != nil && (modeConfig.Mode == ModeWeb || modeConfig.Mode == ModeTUI) {
 		return
 	}
+	// Stop the AI filter's worker pool before the process exits. It is a no-op
+	// when the filter is disabled (nil).
+	getAIFilter().Close()
+	// Drain the webhook queue before the store closes and the process exits:
+	// every queued alert still fires its on-confirm callback, so findings are
+	// persisted once their alert goes out instead of being lost with the
+	// process. Bounded so a dead endpoint cannot hang a one-shot run forever.
+	if !core.DrainWebhookQueue(webhookDrainTimeout) {
+		getSession().Log.Warn("Webhook queue did not empty in %s; exiting with alerts undelivered", webhookDrainTimeout)
+	}
+	getSession().CloseStore()
 	os.Exit(code)
 }
 
 // runWebMode starts the web dashboard and runs the scanner in-process,
 // feeding matches and logs into the embedded dark-mode UI.
 func runWebMode() {
+	// First byte of work: force the console visible. See restoreConsole.
+	restoreConsole()
 	initLogFormat()
-	// In --web mode the dashboard is the interface: hide the console window
-	// so only the browser UI is visible (scanner still runs in-process).
-	hideConsole()
+	// The terminal stays open in --web mode: it shows the startup banner and
+	// the scanner log while the dashboard runs in the browser.
 
 	// Initialize the web hub before the scanner starts so no matches are lost.
 	ensureWebHub()
@@ -1814,31 +3509,53 @@ func runWebMode() {
 		getSession().TokenValidator.OnTokenResult = func(token string, valid bool, provider string) {
 			pushTokenResult(token, valid, provider)
 		}
+		// The richer verifier outcome arrives after the basic verdict. Record it
+		// for later publishes of the same secret, enrich the Tokens tab row, and
+		// upgrade any finding still in the hub with its verified severity.
+		getSession().TokenValidator.OnOutcome = func(token string, provider string, o verifiers.Outcome) {
+			rememberOutcome(token, provider, o)
+			// classify with the finding's own priority so the Tokens tab and the
+			// Matches tab cannot disagree.
+			priority := updateHubMatchOutcome(token, o)
+			pushTokenOutcome(token, provider, o, priority)
+		}
 	}
 
 	addr := fmt.Sprintf("http://%s:%s", modeConfig.WebHost, modeConfig.WebPort)
 	fmt.Printf("🌐 Starting web server on %s\n", addr)
-	fmt.Println("   Open browser to view dashboard")
 	fmt.Println()
 
-	// Open the dashboard in the default browser shortly after the server binds.
-	go func() {
-		time.Sleep(800 * time.Millisecond)
-		openBrowser(addr)
-	}()
-
-	// Start scanner in background AND serve the web UI concurrently.
-	go runScanner()
-
-	// Wire the AI security review (settings store + review store) before the
-	// web server starts. It is optional: on failure the dashboard still runs and
-	// the Review and Settings tabs report that it is unavailable.
+	// Wire the AI security review (settings store + review store) BEFORE the
+	// scanner starts. aiSettingsStore is a package global that initAIFilter (run
+	// by runScannerWork) reads; writing it after the goroutine is launched is a
+	// data race under -race. It is optional: on failure the dashboard still runs
+	// and the Review and Settings tabs report that it is unavailable.
 	if err := initAIReview(getSession().Config); err != nil {
 		fmt.Printf("⚠️  AI review unavailable: %v\n", err)
 	}
 
+	// Strict ordering: the full banner (plus startup summary) types out
+	// first, then a beat for the server to bind, then the "opening" message,
+	// then a readable pause so the operator sees it before the browser steals
+	// focus - and only then the browser. The scanner starts last.
+	go func() {
+		printStartupBlock()
+		// Let the web server bind before the browser hits it.
+		time.Sleep(800 * time.Millisecond)
+		fmt.Printf("🌐 Opening dashboard in your browser: %s\n", addr)
+		// Readable pause between the message and the focus steal.
+		time.Sleep(2 * time.Second)
+		_ = openBrowser(addr)
+		runScannerWork()
+	}()
+
 	// Start web server (blocking)
-	if err := modeConfig.SetupIntegratedUI(); err != nil {
+	err := modeConfig.SetupIntegratedUI()
+	if !core.DrainWebhookQueue(webhookDrainTimeout) {
+		getSession().Log.Warn("Webhook queue did not empty in %s; exiting with alerts undelivered", webhookDrainTimeout)
+	}
+	getSession().CloseStore()
+	if err != nil {
 		fmt.Printf("❌ Web server error: %v\n", err)
 		os.Exit(1)
 	}
@@ -1891,6 +3608,12 @@ func runTUIMode() {
 		getSession().TokenValidator.OnTokenResult = func(token string, valid bool, provider string) {
 			AddTUIToken(token, valid, provider)
 		}
+		// Mirror the web path: remember the outcome and refresh the severity
+		// label on any finding for this secret that the TUI already holds.
+		getSession().TokenValidator.OnOutcome = func(token string, provider string, o verifiers.Outcome) {
+			rememberOutcome(token, provider, o)
+			AddTUITokenOutcome(token, o)
+		}
 	}
 
 	// Enable the AI review engine so the "r" key can ask the model about the
@@ -1906,7 +3629,9 @@ func runTUIMode() {
 	// publish(). StartTUI then blocks until the operator quits.
 	go runScanner()
 
-	if err := StartTUI(); err != nil {
+	err := StartTUI()
+	getSession().CloseStore()
+	if err != nil {
 		// Preflight (tuiCanStart) makes this practically unreachable. Do not
 		// reset tuiScreenActive here: it is written once before the scanner
 		// goroutine starts, and writing it again would race with any in-flight
@@ -1923,10 +3648,10 @@ func printStartupBlock() {
 	// Print animated banner FIRST (directly to console, not through lockWrite)
 	// This happens before any other output
 	core.PrintAnimatedBanner()
-	
+
 	// Now build the rest of the startup info
 	var sb strings.Builder
-	
+
 	// Add author info based on format
 	switch getLogFormat() {
 	case LogFormatMinimal:
@@ -1975,9 +3700,80 @@ func printStartupBlock() {
 	lockWrite(sb.String())
 }
 
-// runScanner executes the scanner with UI reporting
+// oneShotCommand reports whether this run is a one-shot store/token command
+// that never publishes a finding, so the AI filter, notification dispatcher and
+// outcome recorder must not be started for it.
+func oneShotCommand() bool {
+	o := getSession().Options
+	if o == nil {
+		return false
+	}
+	if boolOpt(o.TestTokens) || boolOpt(o.Export) || boolOpt(o.Stats) {
+		return true
+	}
+	if o.ScanKeys != nil && strings.TrimSpace(*o.ScanKeys) != "" {
+		return true
+	}
+	if o.ExportEncrypted != nil && *o.ExportEncrypted != "" {
+		return true
+	}
+	return o.Decrypt != nil && *o.Decrypt != ""
+}
+
+// initPublishInfrastructure initialises everything publish() reads before any
+// source goroutine can call it: the AI false-positive filter, the notification
+// dispatcher, the daily digest and the outcome recorder. It must run before
+// startCodeSearch/startGitLab, because both spawn goroutines that publish and
+// validate tokens; installing these afterwards raced those goroutines.
+// It is a no-op for one-shot commands, which never publish.
+func initPublishInfrastructure() {
+	if oneShotCommand() {
+		return
+	}
+	// Start each scan with a clean metrics snapshot so the dashboard and TUI
+	// report this run's numbers rather than a process-lifetime accumulation.
+	if core.MetricsCollectionEnabled() {
+		core.DefaultMetrics.Reset()
+	}
+	setAIFilter(initAIFilter(getSession().Config))
+	initNotifications()
+	startDailyDigest()
+	installOutcomeRecorder()
+}
+
+// runScanner executes the scanner with UI reporting: startup banner first,
+// then the scan work. --web mode needs the banner on its own schedule (it
+// must finish before the browser opens), so the work half lives in
+// runScannerWork and --web drives the two halves in order.
 func runScanner() {
 	printStartupBlock()
+	runScannerWork()
+}
+
+// runScannerWork is everything runScanner does after the startup banner.
+func runScannerWork() {
+
+	// Initialise the publish sinks before starting any source that can publish.
+	initPublishInfrastructure()
+
+	// The opt-in GitHub code-search source runs alongside the events/gist
+	// workers; it is a no-op unless search is enabled and this is a remote scan.
+	startCodeSearch()
+
+	// The opt-in GitLab public-snippet source runs alongside the GitHub workers
+	// for the same reason: it must start under --web/--tui too.
+	startGitLab()
+
+	// The remaining remote discovery sources share the same guard and lifecycle.
+	startPastebin()
+	startSearchCode()
+	startSourcegraph()
+	startGitHubCommits()
+	startGitHubIssues()
+	startGitLabBlobs()
+	startGrepApp()
+	startPsbdmp()
+	startBitbucket()
 
 	// Execute scanner logic
 	executeScanner()
@@ -1997,6 +3793,27 @@ func runScannerCLI() {
 
 	initLogFormat()
 	printStartupBlock()
+
+	// Terminal mode must start the code-search source too: it bypasses
+	// runScanner, so without this --search would only work under --web/--tui.
+	// Initialise the publish sinks before starting any source that can publish.
+	initPublishInfrastructure()
+
+	startCodeSearch()
+
+	// Same for the GitLab source: terminal mode bypasses runScanner.
+	startGitLab()
+
+	// Same for the remaining remote discovery sources.
+	startPastebin()
+	startSearchCode()
+	startSourcegraph()
+	startGitHubCommits()
+	startGitHubIssues()
+	startGitLabBlobs()
+	startGrepApp()
+	startPsbdmp()
+	startBitbucket()
 
 	executeScanner()
 }
@@ -2018,6 +3835,12 @@ func printScanPlan(dir string) {
 
 // executeScanner runs the scanner core logic
 func executeScanner() {
+	// One-shot store commands (--export/--export-encrypted/--decrypt) run
+	// before any network or pruning work so they never need a GitHub token.
+	if handleStoreCLI() {
+		return
+	}
+
 	// ── Auto-prune invalid GitHub tokens from config (every startup) ─────
 	// Also install the runtime hook so a token that starts returning 401
 	// while the scanner runs is removed from config.yaml immediately.
@@ -2046,7 +3869,7 @@ func executeScanner() {
 		}
 
 		// 2. Check github_access_tokens for any AI tokens via provider detection
-		for _, token := range getSession().Config.GitHubAccessTokens {
+		for _, token := range getSession().GitHubTokens() {
 			provider := validator.DetectProvider(token)
 			if isAITokenSignature(provider) {
 				allTokens[token] = provider
@@ -2078,7 +3901,7 @@ func executeScanner() {
 		return
 	}
 
-	if len(*getSession().Options.ScanKeys) > 0 {
+	if len(strOpt(getSession().Options.ScanKeys)) > 0 {
 		lockPrintf("[*] Scanning directory for API keys: %s\n", color.HiYellowString(*getSession().Options.ScanKeys))
 		keyValidator := core.NewKeyValidator(getSession().Log)
 
@@ -2125,8 +3948,12 @@ func executeScanner() {
 		return
 	}
 
-	if len(*getSession().Options.Local) > 0 {
-		if *getSession().Options.DryRun {
+	// The AI filter, notification dispatcher, daily digest and outcome recorder
+	// are installed by initPublishInfrastructure before the sources start (see
+	// runScanner / runScannerCLI), so they are never observed mid-setup.
+
+	if len(strOpt(getSession().Options.Local)) > 0 {
+		if boolOpt(getSession().Options.DryRun) {
 			printScanPlan(*getSession().Options.Local)
 			exitScanner(0)
 			return
@@ -2150,7 +3977,7 @@ func executeScanner() {
 		return
 	}
 
-	if *getSession().Options.SearchQuery != "" {
+	if strOpt(getSession().Options.SearchQuery) != "" {
 		lockPrintf("[*] Search query %s — only returning matching results.\n",
 			color.HiYellowString(*getSession().Options.SearchQuery))
 	}

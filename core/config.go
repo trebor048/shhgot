@@ -3,10 +3,12 @@ package core
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"gopkg.in/yaml.v3"
 )
@@ -32,6 +34,235 @@ type Config struct {
 	MatchLogDir                  string            `yaml:"match_log_dir,omitempty"`
 	MatchLogEnabled              *bool             `yaml:"match_log_enabled,omitempty"`
 	AIReview                     AIReviewConfig    `yaml:"ai_review,omitempty"`
+
+	HTTP       HTTPConfig       `yaml:"http,omitempty"`
+	Storage    StorageConfig    `yaml:"storage,omitempty"`
+	Search     SearchConfig     `yaml:"search,omitempty"`
+	AIFilter   AIFilterConfig   `yaml:"ai_filter,omitempty"`
+	Notify     NotifyConfig     `yaml:"notify,omitempty"`
+	Sources    SourcesConfig    `yaml:"sources,omitempty"`
+	Validators ValidatorsConfig `yaml:"validators,omitempty"`
+	Metrics    MetricsConfig    `yaml:"metrics,omitempty"`
+}
+
+// MetricsConfig gates the in-process metrics collector (core.DefaultMetrics).
+// Metrics are on by default; set enabled: false to skip the per-operation
+// latency/counter bookkeeping entirely.
+type MetricsConfig struct {
+	Enabled *bool `yaml:"enabled,omitempty"`
+}
+
+// MetricsEnabled reports whether metrics collection is on. An absent key
+// defaults to true, so metrics are collected unless explicitly disabled.
+func (c *Config) MetricsEnabled() bool {
+	if c == nil {
+		return true
+	}
+	return boolOr(c.Metrics.Enabled, true)
+}
+
+// metricsEnabled is the process-wide gate read on the hot paths. It mirrors the
+// loaded config and defaults to true so a zero-value setup still collects.
+var metricsEnabled atomic.Bool
+
+func init() { metricsEnabled.Store(true) }
+
+// SetMetricsEnabled turns metric collection on or off process-wide. It is called
+// once at startup from ConfigureSharedHTTPClient after the config is loaded.
+func SetMetricsEnabled(v bool) { metricsEnabled.Store(v) }
+
+// MetricsCollectionEnabled reports whether the hot paths should record metrics.
+func MetricsCollectionEnabled() bool { return metricsEnabled.Load() }
+
+// intOr returns the configured value, or def when the key is absent or <= 0.
+func intOr(v *int, def int) int {
+	if v != nil && *v > 0 {
+		return *v
+	}
+	return def
+}
+
+// boolOr returns the configured value, or def when the key is absent.
+func boolOr(v *bool, def bool) bool {
+	if v != nil {
+		return *v
+	}
+	return def
+}
+
+// HTTPConfig tunes the shared outbound HTTP client (core/httpclient).
+type HTTPConfig struct {
+	Retries                 *int     `yaml:"retries,omitempty"`
+	BackoffInitialMS        *int     `yaml:"backoff_initial_ms,omitempty"`
+	BackoffMaxMS            *int     `yaml:"backoff_max_ms,omitempty"`
+	Jitter                  *bool    `yaml:"jitter,omitempty"`
+	TimeoutSeconds          *int     `yaml:"timeout_seconds,omitempty"`
+	PacingMS                *int     `yaml:"pacing_ms,omitempty"`
+	BreakerFailureThreshold *int     `yaml:"breaker_failure_threshold,omitempty"`
+	BreakerCooldownSeconds  *int     `yaml:"breaker_cooldown_seconds,omitempty"`
+	BreakerHalfOpenProbes   *int     `yaml:"breaker_half_open_probes,omitempty"`
+	ProtectedHosts          []string `yaml:"protected_hosts,omitempty"`
+	// ProxyURL is a single outbound proxy (http, https, socks5 or socks5h) used
+	// for every request. Proxies takes precedence when both are set.
+	ProxyURL string `yaml:"proxy_url,omitempty"`
+	// Proxies rotates one proxy per request; a member that fails
+	// proxy_ban_after times consecutively is benched. When every member is
+	// benched the client falls back to a direct connection.
+	Proxies []string `yaml:"proxies,omitempty"`
+	// ProxyBanAfter overrides the consecutive-failure count that benches a
+	// Proxies member. Absent/zero uses the pool default (3).
+	ProxyBanAfter *int `yaml:"proxy_ban_after,omitempty"`
+}
+
+// StorageConfig controls the persistent findings store (core/store). Disabled by
+// default so an existing operator's output is unchanged until they opt in.
+type StorageConfig struct {
+	Enabled          *bool  `yaml:"enabled,omitempty"`
+	Path             string `yaml:"path,omitempty"`
+	DedupeTTLSeconds *int   `yaml:"dedupe_ttl_seconds,omitempty"`
+	MaxDedupeEntries *int   `yaml:"max_dedupe_entries,omitempty"`
+	CompactAfter     *int   `yaml:"compact_after,omitempty"`
+}
+
+// SearchConfig controls the GitHub code-search discovery source. Off by default.
+type SearchConfig struct {
+	Enabled    *bool    `yaml:"enabled,omitempty"`
+	Queries    []string `yaml:"queries,omitempty"`
+	QueryFile  string   `yaml:"query_file,omitempty"`
+	PerPage    *int     `yaml:"per_page,omitempty"`
+	MaxPages   *int     `yaml:"max_pages,omitempty"`
+	MaxResults *int     `yaml:"max_results,omitempty"`
+	SleepMS    *int     `yaml:"sleep_ms,omitempty"`
+	MinStars   *int     `yaml:"min_stars,omitempty"`
+}
+
+// AIFilterConfig controls the opt-in false-positive pre-filter (core/aifilter).
+type AIFilterConfig struct {
+	Enabled      *bool  `yaml:"enabled,omitempty"`
+	QuickFilter  *bool  `yaml:"quick_filter,omitempty"`
+	Provider     string `yaml:"provider,omitempty"`
+	Model        string `yaml:"model,omitempty"`
+	BaseURL      string `yaml:"base_url,omitempty"`
+	Workers      *int   `yaml:"workers,omitempty"`
+	CacheEntries *int   `yaml:"cache_entries,omitempty"`
+	CacheTTLSecs *int   `yaml:"cache_ttl_seconds,omitempty"`
+}
+
+// NotifyConfig configures extra alert channels and delivery policy.
+type NotifyConfig struct {
+	TestOnStart *bool            `yaml:"test_on_start,omitempty"`
+	QuietHours  QuietHoursConfig `yaml:"quiet_hours,omitempty"`
+	Channels    []ChannelConfig  `yaml:"channels,omitempty"`
+}
+
+// QuietHoursConfig suppresses non-critical notifications in a local time window.
+type QuietHoursConfig struct {
+	Enabled *bool  `yaml:"enabled,omitempty"`
+	Start   string `yaml:"start,omitempty"`
+	End     string `yaml:"end,omitempty"`
+}
+
+// ChannelConfig is one alert destination.
+//
+// The url field carries whatever the channel needs beyond a plain endpoint; the
+// per-type formats are documented on buildNotifyChannel in config_notify.go.
+// Secret is a channel-specific secondary credential: the DingTalk HMAC signing
+// secret, and the WxPusher recipient list (comma-separated UIDs).
+type ChannelConfig struct {
+	Type        string `yaml:"type"`
+	URL         string `yaml:"url,omitempty"`
+	Secret      string `yaml:"secret,omitempty"`
+	MinSeverity string `yaml:"min_severity,omitempty"`
+	Enabled     *bool  `yaml:"enabled,omitempty"`
+}
+
+// SourcesConfig enables non-GitHub discovery sources.
+type SourcesConfig struct {
+	GitLab        GitLabSourceConfig      `yaml:"gitlab,omitempty"`
+	GitHubCommits QuerySourceConfig       `yaml:"github_commits,omitempty"`
+	GitHubIssues  QuerySourceConfig       `yaml:"github_issues,omitempty"`
+	Pastebin      PastebinSourceConfig    `yaml:"pastebin,omitempty"`
+	SearchCode    SearchCodeSourceConfig  `yaml:"searchcode,omitempty"`
+	Sourcegraph   SourcegraphSourceConfig `yaml:"sourcegraph,omitempty"`
+	GrepApp       QuerySourceConfig       `yaml:"grepapp,omitempty"`
+	Psbdmp        QuerySourceConfig       `yaml:"psbdmp,omitempty"`
+	Bitbucket     BitbucketSourceConfig   `yaml:"bitbucket,omitempty"`
+}
+
+// QuerySourceConfig controls a query-driven discovery source: each configured
+// query is issued in turn and results are capped per pass. It is shared by the
+// GitHub commit/issue search, grep.app and psbdmp sources, which have the same
+// shape. Off by default.
+type QuerySourceConfig struct {
+	Enabled    *bool    `yaml:"enabled,omitempty"`
+	Queries    []string `yaml:"queries,omitempty"`
+	MaxResults *int     `yaml:"max_results,omitempty"`
+	Interval   *int     `yaml:"interval_seconds,omitempty"`
+}
+
+// BitbucketSourceConfig controls the Bitbucket workspace source. Bitbucket has
+// no public discovery endpoint, so the operator names the workspaces to walk.
+// Off by default.
+type BitbucketSourceConfig struct {
+	Enabled    *bool    `yaml:"enabled,omitempty"`
+	Workspaces []string `yaml:"workspaces,omitempty"`
+	MaxRepos   *int     `yaml:"max_repos,omitempty"`
+	MaxFiles   *int     `yaml:"max_files,omitempty"`
+	Interval   *int     `yaml:"interval_seconds,omitempty"`
+}
+
+// GitLabSourceConfig controls the GitLab public-snippet source and, when
+// search_enabled is set, the authenticated blobs search source. Off by default.
+type GitLabSourceConfig struct {
+	Enabled  *bool `yaml:"enabled,omitempty"`
+	PerPage  *int  `yaml:"per_page,omitempty"`
+	Interval *int  `yaml:"interval_seconds,omitempty"`
+	// SearchEnabled turns on the blobs (code search) source, which needs a
+	// token and a Premium/Ultimate instance for advanced search.
+	SearchEnabled *bool `yaml:"search_enabled,omitempty"`
+	// Token is the GitLab personal access token sent on blob-search and project
+	// requests.
+	Token string `yaml:"token,omitempty"`
+}
+
+// PastebinSourceConfig controls the Pastebin Scraping API source. Off by
+// default. The Scraping API needs a Pastebin Pro account with the host's IP
+// whitelisted; api_key only gates the source on/off (the endpoint is not
+// key-authenticated).
+type PastebinSourceConfig struct {
+	Enabled  *bool  `yaml:"enabled,omitempty"`
+	APIKey   string `yaml:"api_key,omitempty"`
+	Limit    *int   `yaml:"limit,omitempty"`
+	Interval *int   `yaml:"interval_seconds,omitempty"`
+}
+
+// SearchCodeSourceConfig controls the searchcode.com source. Off by default.
+type SearchCodeSourceConfig struct {
+	Enabled  *bool    `yaml:"enabled,omitempty"`
+	Queries  []string `yaml:"queries,omitempty"`
+	PerPage  *int     `yaml:"per_page,omitempty"`
+	MaxPages *int     `yaml:"max_pages,omitempty"`
+	Interval *int     `yaml:"interval_seconds,omitempty"`
+}
+
+// SourcegraphSourceConfig controls the Sourcegraph public stream-search
+// source. Off by default.
+type SourcegraphSourceConfig struct {
+	Enabled    *bool    `yaml:"enabled,omitempty"`
+	Queries    []string `yaml:"queries,omitempty"`
+	MaxResults *int     `yaml:"max_results,omitempty"`
+	Interval   *int     `yaml:"interval_seconds,omitempty"`
+	Token      string   `yaml:"token,omitempty"`
+}
+
+// ValidatorsConfig tunes live credential validation.
+type ValidatorsConfig struct {
+	CacheEnabled       *bool `yaml:"cache_enabled,omitempty"`
+	CacheTTLSecs       *int  `yaml:"cache_ttl_seconds,omitempty"`
+	CacheMaxEntries    *int  `yaml:"cache_max_entries,omitempty"`
+	DomainCooldownSecs *int  `yaml:"domain_cooldown_seconds,omitempty"`
+	MaxConcurrency     *int  `yaml:"max_concurrency,omitempty"`
+	MinIntervalMS      *int  `yaml:"min_interval_ms,omitempty"`
 }
 
 // PerformanceConfig wires the "performance" section of config.yaml into the
@@ -112,6 +343,9 @@ type ScanningConfig struct {
 	// MaxScanMB bounds the bytes read per repository (0 = no limit). Wall-clock
 	// limits are unpredictable under load; a byte budget is not.
 	MaxScanMB *int `yaml:"max_scan_mb,omitempty"`
+	// ContextLines is the number of lines captured around a match for display
+	// and AI review. 0 (default) disables context capture.
+	ContextLines *int `yaml:"context_lines,omitempty"`
 }
 
 // Int returns the configured value, or def when the key is absent or <= 0.
@@ -278,6 +512,12 @@ func ParseConfig(options *Options) (*Config, error) {
 	for i := 0; i < len(config.GitHubAccessTokens); i++ {
 		config.GitHubAccessTokens[i] = os.ExpandEnv(config.GitHubAccessTokens[i])
 	}
+	// ai_tokens accepts the same "$VAR" form as github_access_tokens. Without
+	// expansion a "$OPENAI_API_KEY" entry reached the token tester literally and
+	// was reported as an invalid token.
+	for i := 0; i < len(config.AITokens); i++ {
+		config.AITokens[i] = os.ExpandEnv(config.AITokens[i])
+	}
 
 	if len(*options.Local) <= 0 && (len(config.GitHubAccessTokens) < 1 || strings.TrimSpace(strings.Join(config.GitHubAccessTokens, "")) == "") {
 		return config, errors.New("config.yaml needs at least one GitHub access token under github_access_tokens (see https://help.github.com/en/articles/creating-a-personal-access-token-for-the-command-line), or pass --local to scan a local directory instead")
@@ -292,10 +532,13 @@ func ParseConfig(options *Options) (*Config, error) {
 				return config, errors.New("discord webhook validation failed; check the webhook URL and permissions")
 			}
 		} else if strings.Contains(config.Webhook, "api.telegram.org") || strings.HasPrefix(config.Webhook, "TELEGRAM_BOT_TOKEN:") {
-			// Extract bot token from webhook URL or config
+			// Extract the bot token from the config prefix or the documented
+			// https://api.telegram.org/bot<token>/... URL form.
 			var botToken string
 			if strings.HasPrefix(config.Webhook, "TELEGRAM_BOT_TOKEN:") {
 				botToken = strings.TrimPrefix(config.Webhook, "TELEGRAM_BOT_TOKEN:")
+			} else {
+				botToken = telegramTokenFromWebhookURL(config.Webhook)
 			}
 			if botToken != "" && !ValidateTelegramWebhook(botToken) {
 				return config, errors.New("telegram webhook validation failed; check the bot token and webhook configuration")
@@ -304,6 +547,26 @@ func ParseConfig(options *Options) (*Config, error) {
 	}
 
 	return config, nil
+}
+
+// telegramTokenFromWebhookURL extracts the bot token from a Telegram API URL of
+// the documented form https://api.telegram.org/bot<token>/<method>. It returns
+// "" when the path carries no bot token, so a misconfigured URL is skipped
+// rather than validated against a bogus value.
+func telegramTokenFromWebhookURL(webhook string) string {
+	u, err := url.Parse(webhook)
+	if err != nil {
+		return ""
+	}
+	const prefix = "/bot"
+	if !strings.HasPrefix(u.Path, prefix) {
+		return ""
+	}
+	token := strings.TrimPrefix(u.Path, prefix)
+	if i := strings.IndexByte(token, '/'); i >= 0 {
+		token = token[:i]
+	}
+	return token
 }
 
 // ConfigFilePath resolves the config.yaml path using the same precedence as

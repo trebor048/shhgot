@@ -4,6 +4,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/trebor048/shhgot/core/httpclient"
 )
 
 // TestValidateDiscordTokenSendsBotScheme proves the regression fix: Discord bot
@@ -26,7 +29,6 @@ func TestValidateDiscordTokenSendsBotScheme(t *testing.T) {
 	defer func() { discordAPIBase = old }()
 
 	tv := NewTokenValidator(nil)
-	tv.minInterval = 0
 
 	valid, provider, _ := tv.ValidateDiscordToken("good-bot-token")
 	if !valid {
@@ -57,7 +59,6 @@ func TestValidateDiscordTokenFallsBackToRawScheme(t *testing.T) {
 	defer func() { discordAPIBase = old }()
 
 	tv := NewTokenValidator(nil)
-	tv.minInterval = 0
 
 	valid, _, _ := tv.ValidateDiscordToken("user-token")
 	if !valid {
@@ -69,8 +70,11 @@ func TestValidateDiscordTokenFallsBackToRawScheme(t *testing.T) {
 }
 
 // TestValidateDiscordTokenStopsOnNonAuthError makes sure a 5xx is not retried
-// under the second scheme.
+// under the second scheme. Client retries are disabled here so the assertion is
+// about the scheme loop, not the shared client's retry policy.
 func TestValidateDiscordTokenStopsOnNonAuthError(t *testing.T) {
+	installSharedHTTPClient(t, httpclient.Config{Timeout: time.Second})
+
 	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -83,7 +87,6 @@ func TestValidateDiscordTokenStopsOnNonAuthError(t *testing.T) {
 	defer func() { discordAPIBase = old }()
 
 	tv := NewTokenValidator(nil)
-	tv.minInterval = 0
 
 	valid, _, _ := tv.ValidateDiscordToken("t")
 	if valid {

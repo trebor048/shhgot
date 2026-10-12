@@ -167,6 +167,54 @@ func TestSettingsSwitchingProviderResetsEndpointAndModel(t *testing.T) {
 	}
 }
 
+// Switching provider without supplying a key must never carry the previous
+// provider's secret over to the new endpoint. The save is rejected (the new
+// provider has no key) and nothing is persisted, rather than sending the
+// DeepSeek key to OpenAI.
+func TestSettingsSwitchingProviderDoesNotReuseStoredKey(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "")
+	store := settingsEnv(t)
+
+	body, _ := json.Marshal(settingsUpdate{Provider: "openai"})
+	rec := httptest.NewRecorder()
+	settingsHandler(rec, localRequest(http.MethodPut, "/api/settings", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s, want 400 (no key for the new provider)", rec.Code, rec.Body.String())
+	}
+	got, err := store.GetStored()
+	if err != nil {
+		t.Fatalf("store get: %v", err)
+	}
+	if got.Provider != "deepseek" || got.APIKey != "sk-super-secret" {
+		t.Fatalf("stored settings changed to provider=%q key=%q", got.Provider, got.APIKey)
+	}
+}
+
+// A self-hosted provider on a non-loopback/LAN host (Ollama on a GPU box, a
+// private gateway) is a documented setup. The removed public-IP guard rejected
+// it, which blocked every save once such a URL was stored.
+func TestSettingsAcceptsNonLoopbackHTTPBaseURL(t *testing.T) {
+	store := settingsEnv(t)
+
+	body, _ := json.Marshal(settingsUpdate{
+		Provider: "custom",
+		BaseURL:  strptr("http://192.168.1.50:11434/v1"),
+		Model:    strptr("llama3"),
+	})
+	rec := httptest.NewRecorder()
+	settingsHandler(rec, localRequest(http.MethodPut, "/api/settings", body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want the LAN endpoint accepted", rec.Code, rec.Body.String())
+	}
+	got, err := store.GetStored()
+	if err != nil {
+		t.Fatalf("store get: %v", err)
+	}
+	if got.BaseURL != "http://192.168.1.50:11434/v1" {
+		t.Fatalf("base url = %q", got.BaseURL)
+	}
+}
+
 func TestSettingsMethodNotAllowed(t *testing.T) {
 	settingsEnv(t)
 
@@ -236,7 +284,10 @@ func TestMergeSettingsKeepsProviderOnRename(t *testing.T) {
 	cur := aiproviders.Settings{Provider: "deepseek", APIKey: "k", BaseURL: "https://api.deepseek.com/v1", Model: "deepseek-chat"}
 
 	// An empty provider in the body must mean "keep the current one".
-	got := mergeSettings(cur, settingsUpdate{BaseURL: strptr(cur.BaseURL), Model: strptr("deepseek-reasoner")})
+	got, err := mergeSettings(cur, settingsUpdate{BaseURL: strptr(cur.BaseURL), Model: strptr("deepseek-reasoner")})
+	if err != nil {
+		t.Fatalf("mergeSettings error: %v", err)
+	}
 	if got.Provider != "deepseek" || got.Model != "deepseek-reasoner" || got.APIKey != "k" {
 		t.Fatalf("merge = %+v", got)
 	}

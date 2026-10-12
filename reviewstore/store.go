@@ -119,6 +119,12 @@ type Store struct {
 	mu    sync.RWMutex
 	index map[string]*Review
 
+	// skipped counts review files load() could not read or parse. Corrupt
+	// files are skipped so one bad file can never fail the whole store, but
+	// the count stays visible through Skipped so lost reviews are not
+	// invisible to the operator.
+	skipped int
+
 	// fileMu serialises every filesystem mutation and is held across each
 	// mutation's whole read-modify-write-persist-commit cycle.
 	fileMu sync.Mutex
@@ -161,6 +167,13 @@ func NewStore(dir string) (*Store, error) {
 	return s, nil
 }
 
+// Skipped reports how many review files load() could not read or parse.
+// It is fixed at open time: a corrupt review never fails the store, but the
+// operator can see that one was lost instead of wondering where it went.
+func (s *Store) Skipped() int {
+	return s.skipped
+}
+
 // load populates the index from dir. It is called once, before the store is
 // shared, so it needs no locking.
 func (s *Store) load() error {
@@ -186,11 +199,13 @@ func (s *Store) load() error {
 		if err != nil {
 			// Unreadable right now (locked, permissions); ignore instead of
 			// failing the whole store.
+			s.skipped++
 			continue
 		}
 		var r Review
 		if err := json.Unmarshal(data, &r); err != nil {
 			// Corrupt, truncated or written by an older schema: skip it.
+			s.skipped++
 			continue
 		}
 		// The file name is authoritative for the id, so a review whose stored
@@ -478,23 +493,20 @@ func (s *Store) Delete(id string) error {
 	defer s.fileMu.Unlock()
 
 	s.mu.Lock()
-	cur, ok := s.index[id]
-	if ok {
-		delete(s.index, id)
-	}
+	_, ok := s.index[id]
 	s.mu.Unlock()
 	if !ok {
 		return lookupErr(id)
 	}
 
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		// The file is the durable record: if it could not be removed, put the
-		// review back so the index keeps matching the disk.
-		s.mu.Lock()
-		s.index[id] = cur
-		s.mu.Unlock()
+		// The file is the durable record: if it could not be removed, leave the
+		// index unchanged so it keeps matching the disk.
 		return fmt.Errorf("reviewstore: delete review %q: %w", id, err)
 	}
+	s.mu.Lock()
+	delete(s.index, id)
+	s.mu.Unlock()
 	return nil
 }
 

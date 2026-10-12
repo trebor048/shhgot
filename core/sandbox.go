@@ -31,6 +31,13 @@ func ApplySandboxToRepo(dir string) {
 			return nil
 		}
 
+		// Never act through a symlink: os.Chmod (and icacls) follow the link, so
+		// a hostile repo containing `ln -s ~/.ssh/id_rsa payload` would have the
+		// scanner chmod a file outside the cloned tree.
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+
 		if info.IsDir() {
 			DenyDirExecute(path)
 			return nil

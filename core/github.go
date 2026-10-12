@@ -54,11 +54,39 @@ func clampInt(v, lo, hi int) int {
 	return v
 }
 
+// eventsCursorName is the store cursor key for the events feed. The payload is
+// a per-page ETag list so a resumed run can replay If-None-Match for free.
+const eventsCursorName = "events"
+
+type eventsCursor struct {
+	ETags []string `json:"etags"`
+}
+
+// maxDedupeIDs bounds the per-run event/repo/gist dedupe maps. They are
+// best-effort: once full, half the entries are dropped (the same effect as a
+// restart) so a scan running for hours cannot grow them without limit.
+const maxDedupeIDs = 100000
+
+// trimDedupeMap keeps a best-effort dedupe map bounded. Callers that share the
+// map across goroutines must hold their mutex while calling it.
+func trimDedupeMap[K comparable](m map[K]bool) {
+	if len(m) < maxDedupeIDs {
+		return
+	}
+	for k := range m {
+		if len(m) <= maxDedupeIDs/2 {
+			break
+		}
+		delete(m, k)
+	}
+}
+
 // markNewEvents returns the events whose IDs are not already in seen, marking
 // them so a page overlap or a fast re-poll cannot dispatch the same event twice.
 func markNewEvents(events []*github.Event, seen map[string]bool, mu *sync.Mutex) []*github.Event {
 	out := make([]*github.Event, 0, len(events))
 	mu.Lock()
+	trimDedupeMap(seen)
 	for _, e := range events {
 		if seen[e.GetID()] {
 			continue
@@ -186,6 +214,23 @@ func GetRepositories(session *Session) {
 	// page answer 304 Not Modified, which GitHub does not count against the
 	// primary rate limit.
 	etags := make([]string, maxPages+1)
+	// Resume the ETags persisted by a previous run so a restart does not spend
+	// quota re-fetching pages that have not changed. --no-resume ignores them.
+	if session.resumeEnabled() {
+		var cur eventsCursor
+		if err := session.LoadCursor(eventsCursorName, &cur); err == nil {
+			for i, tag := range cur.ETags {
+				if i < len(etags) {
+					etags[i] = tag
+				}
+			}
+		}
+	}
+	saveEventsCursor := func() {
+		if session.resumeEnabled() {
+			_ = session.SaveCursor(eventsCursorName, eventsCursor{ETags: etags})
+		}
+	}
 
 	ticker := time.NewTicker(sleep)
 	defer ticker.Stop()
@@ -262,6 +307,7 @@ func GetRepositories(session *Session) {
 				// changed?" for free.
 				if tag := resp.Header.Get("ETag"); tag != "" {
 					etags[page] = tag
+					saveEventsCursor()
 				}
 
 				if page == 1 {
@@ -292,12 +338,16 @@ func GetRepositories(session *Session) {
 				for _, e := range events {
 					if e.GetType() == "PushEvent" {
 						dst := &github.PushEvent{}
-						json.Unmarshal(e.GetRawPayload(), dst)
+						if err := json.Unmarshal(e.GetRawPayload(), dst); err != nil {
+							session.Log.Debug("Skipping PushEvent %s with malformed payload: %s", e.GetID(), err)
+							continue
+						}
 						id := e.GetRepo().GetID()
 						// An id of 0 means the payload carried no repository;
 						// do not let every such event collapse into one.
 						if !rescanRepositories && id != 0 {
 							seenReposMutex.Lock()
+							trimDedupeMap(seenRepos)
 							dup := seenRepos[id]
 							seenRepos[id] = true
 							seenReposMutex.Unlock()
@@ -313,7 +363,10 @@ func GetRepositories(session *Session) {
 						}
 					} else if e.GetType() == "IssueCommentEvent" {
 						dst := &github.IssueCommentEvent{}
-						json.Unmarshal(e.GetRawPayload(), dst)
+						if err := json.Unmarshal(e.GetRawPayload(), dst); err != nil {
+							session.Log.Debug("Skipping IssueCommentEvent %s with malformed payload: %s", e.GetID(), err)
+							continue
+						}
 
 						// Build a link back to the source issue/PR so matches
 						// can be traced to the exact comment.
@@ -435,6 +488,7 @@ func GetGists(session *Session) {
 		}
 
 		for _, e := range newGists {
+			trimDedupeMap(observedKeys)
 			observedKeys[e.GetID()] = true
 			if u := e.GetGitPullURL(); u != "" {
 				session.Gists <- u
@@ -453,6 +507,12 @@ func GetGists(session *Session) {
 	}
 }
 
+// repoRequestTimeout bounds a single GetByID call. go-github's client carries no
+// http.Client.Timeout, so without this a black-holed connection would pin a
+// worker and drain the client pool indefinitely. It matches the events loop's
+// per-call bound.
+var repoRequestTimeout = 10 * time.Second
+
 func GetRepository(session *Session, id int64) (*github.Repository, error) {
 	// The same repository generates many events; skip the API call for one seen
 	// recently. This is the single biggest saving on the API budget, which is
@@ -464,7 +524,13 @@ func GetRepository(session *Session, id int64) (*github.Repository, error) {
 	client := session.GetClient()
 	defer session.FreeClient(client)
 
-	repo, resp, err := client.Repositories.GetByID(session.Context, id)
+	// Bound the call: session.Context is cancelled only at shutdown, and the
+	// go-github client has no HTTP timeout, so a stalled connection would otherwise
+	// hold this worker until the process exits.
+	ctx, cancel := context.WithTimeout(session.Context, repoRequestTimeout)
+	defer cancel()
+
+	repo, resp, err := client.Repositories.GetByID(ctx, id)
 
 	if err != nil {
 		if isUnauthorized(err, resp) {

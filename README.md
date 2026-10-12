@@ -366,6 +366,13 @@ reference, and this section as the map.
 | `blacklisted_extensions` | File extensions to ignore. |
 | `blacklisted_paths` | Path fragments to ignore; `{sep}` expands to the OS separator. |
 | `blacklisted_entropy_extensions` | Skip entropy scoring for these (keys, certs, logs). |
+| `http` | Shared outbound HTTP client: retries, backoff, timeout, pacing, circuit breaker. |
+| `validators` | Live credential validation: result cache, domain health, concurrency. |
+| `storage` | Persistent findings store (cross-run dedupe, resume, export). Off by default. |
+| `search` | GitHub code-search discovery. Off by default. |
+| `ai_filter` | Opt-in AI false-positive pre-filter. Off by default. |
+| `notify` | Extra alert channels (Slack/Email/File/Sound/…) and quiet hours. |
+| `sources` | Non-GitHub discovery sources (GitLab). Off by default. |
 
 ### Signatures
 
@@ -600,6 +607,26 @@ paths get a plain `404`.
   recommended way to use the dashboard locally.
 - **The feed contains live secrets.** Treat the dashboard as a secrets console:
   do not screen-share it, do not put it on a public interface.
+
+---
+
+## Code search, findings store and other opt-ins
+
+These are off by default; enable them in `config.yaml`.
+
+| Feature | What it does | Key / flag |
+|---|---|---|
+| GitHub code search | Finds secrets in existing code (not just new pushes) via `GET /search/code`, with dorks derived from the signature set. | `search.enabled`, `--search` |
+| Persistent findings store | JSONL journal with cross-run dedupe, resume cursors and CSV/JSONL/encrypted export. | `storage.enabled`, `--export`, `--export-encrypted`, `--decrypt`, `--no-dedupe`, `--no-resume` |
+| Expanded live validators | ~56 provider verifiers (AI, cloud, VCS/CI, monitoring, CRM, payments, messaging) with identity/tier/balance metadata. | `signatures[].verifier`, `validators.*` |
+| Verified severity | Critical/High/Medium/Low from the validation outcome, surfaced in the dashboard, TUI, webhooks and export. | — |
+| AI false-positive filter | Rule quick-filter plus an optional local-LLM classifier that suppresses obvious placeholders; fails open (never drops on error). | `ai_filter.enabled` |
+| Extra alert channels | Slack, Email, File, Sound (in addition to Discord/Telegram/generic), per-channel minimum severity, quiet hours and a daily digest. | `notify.channels`, `notify.quiet_hours` |
+| GitLab source | Scans public GitLab snippets. | `sources.gitlab.enabled` |
+| Context and base URL | Captures a bounded window around each match and extracts relay/Azure base URLs for validation and AI review. | `scanning.context_lines` |
+
+The findings journal stores raw matched values; keep `storage.path` on a private
+filesystem (files are `0600`, directory `0700`).
 
 ---
 

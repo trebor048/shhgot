@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/trebor048/shhgot/core/verifiers"
 )
 
 // --- Provider Constants ---
@@ -122,6 +124,12 @@ const (
 	ProviderBlockCypher = "BlockCypher"
 	ProviderChainstack  = "Chainstack"
 
+	// Collaboration / Maps / Monitoring (providers with documented key formats)
+	ProviderNotion   = "Notion"
+	ProviderLinear   = "Linear"
+	ProviderMapbox   = "Mapbox"
+	ProviderNewRelic = "New Relic"
+
 	// Security/Other
 	ProviderShodan      = "Shodan"
 	ProviderVirusTotal  = "VirusTotal"
@@ -139,6 +147,15 @@ const (
 type tokenTestResult struct {
 	valid    bool
 	provider string
+	// outcome is the verifier's richer verdict (status, tier, balance,
+	// identity, high-value flag, RPM). It feeds severity classification and is
+	// zero when the legacy validation path produced the verdict.
+	outcome verifiers.Outcome
+
+	// ready is non-nil while a validation is in flight. A duplicate that finds
+	// a reserved entry waits on this channel and then reads the real verdict,
+	// instead of being told "valid" before the provider has answered.
+	ready chan struct{}
 }
 
 // TokenValidator handles validation of AI API tokens and other secrets
@@ -146,45 +163,64 @@ type TokenValidator struct {
 	logger       *Logger
 	testedTokens map[string]tokenTestResult
 	mutex        sync.Mutex
-	httpClient   *http.Client
+	httpClient   verifiers.Doer
 
-	// Rate Limiting
-	rateLimitMutex sync.Mutex
-	lastRequest    time.Time
-	minInterval    time.Duration
+	// Cache is the opt-in validation result cache and per-host health tracker.
+	// A nil cache disables both, so an operator who has not enabled
+	// validators.cache_enabled sees the old behaviour.
+	Cache *ValidationCache
+
+	// sem bounds how many credential validations run concurrently, from
+	// validators.max_concurrency. A nil sem is unbounded, which is what a
+	// validator built directly (tests, --test-tokens) gets.
+	sem chan struct{}
 
 	// OnTokenResult is called when a token validation completes (for TUI/web live updates).
 	OnTokenResult func(token string, valid bool, provider string)
+
+	// OnOutcome is called after OnTokenResult with the verifier's Outcome, so
+	// consumers can surface status, tier, balance and RPM without changing the
+	// OnTokenResult signature.
+	OnOutcome func(token string, provider string, o verifiers.Outcome)
 }
 
-// NewTokenValidator creates a new token validator
+// NewTokenValidator creates a new token validator. Validation requests go
+// through the shared client wrapped in a validatorDoer, which applies
+// validators.min_interval_ms as a per-call pacing override so credential
+// validation is paced without pacing code search, GitLab, crypto or AI.
 func NewTokenValidator(logger *Logger) *TokenValidator {
 	return &TokenValidator{
 		logger:       logger,
 		testedTokens: make(map[string]tokenTestResult),
-		httpClient: &http.Client{
-			Timeout: 15 * time.Second,
-		},
-		minInterval: 1200 * time.Millisecond, // ~50 requests/min safe limit
+		httpClient:   validatorDoer{client: SharedHTTPClient()},
 	}
 }
 
-// waitForRateLimit prevents API bans
-func (tv *TokenValidator) waitForRateLimit() {
-	tv.rateLimitMutex.Lock()
-	defer tv.rateLimitMutex.Unlock()
-
-	now := time.Now()
-	timeSinceLast := now.Sub(tv.lastRequest)
-
-	if timeSinceLast < tv.minInterval {
-		sleepTime := tv.minInterval - timeSinceLast
-		tv.rateLimitMutex.Unlock()
-		time.Sleep(sleepTime)
-		tv.rateLimitMutex.Lock()
+// SetConcurrency bounds how many validations this validator runs at once, from
+// validators.max_concurrency. A non-positive n leaves it unbounded. The value is
+// read under the same mutex that guards testedTokens, so it is safe to call
+// concurrently with validations, though callers normally set it once at startup.
+func (tv *TokenValidator) SetConcurrency(n int) {
+	tv.mutex.Lock()
+	defer tv.mutex.Unlock()
+	if n <= 0 {
+		tv.sem = nil
+		return
 	}
+	tv.sem = make(chan struct{}, n)
+}
 
-	tv.lastRequest = time.Now()
+// acquireValidationSlot blocks until a validation slot is free and returns the
+// function that releases it. When no limit is configured the release is a no-op.
+func (tv *TokenValidator) acquireValidationSlot() func() {
+	tv.mutex.Lock()
+	sem := tv.sem
+	tv.mutex.Unlock()
+	if sem == nil {
+		return func() {}
+	}
+	sem <- struct{}{}
+	return func() { <-sem }
 }
 
 // CRITICAL PERFORMANCE FIX: Pre-compile all token extraction regexes at package init
@@ -202,13 +238,17 @@ var (
 	groqRegex       = regexp.MustCompile(`gsk_[A-Za-z0-9]{30,}`)
 	perplexityRegex = regexp.MustCompile(`pplx-[A-Za-z0-9]{30,}`)
 	replicateRegex  = regexp.MustCompile(`r8_[A-Za-z0-9]{30,}`)
-	cohereRegex     = regexp.MustCompile(`[A-Za-z0-9]{40}(_[A-Za-z0-9]{10,})?`)
-	ai21Regex       = regexp.MustCompile(`[A-Za-z0-9]{32}`)
-	elevenRegex     = regexp.MustCompile(`sk_[a-z0-9]{48}`)
-	sambaRegex      = regexp.MustCompile(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
-	fireworksRegex  = regexp.MustCompile(`[A-Za-z0-9]{48}`)
-	assemblyRegex   = regexp.MustCompile(`[a-f0-9]{32}`)
-	azureRegex      = regexp.MustCompile(`[a-f0-9]{32}`)
+	// The length-only detectors below are word-bounded: without the boundary a
+	// longer hex/alnum secret (e.g. a 64-hex key) was split into fabricated
+	// 32-char halves and truncated 40/48-char prefixes, each then probed against
+	// the wrong provider's endpoint.
+	cohereRegex    = regexp.MustCompile(`\b[A-Za-z0-9]{40}(_[A-Za-z0-9]{10,})?\b`)
+	ai21Regex      = regexp.MustCompile(`\b[A-Za-z0-9]{32}\b`)
+	elevenRegex    = regexp.MustCompile(`sk_[a-z0-9]{48}`)
+	sambaRegex     = regexp.MustCompile(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
+	fireworksRegex = regexp.MustCompile(`\b[A-Za-z0-9]{48}\b`)
+	assemblyRegex  = regexp.MustCompile(`\b[a-f0-9]{32}\b`)
+	azureRegex     = regexp.MustCompile(`\b[a-f0-9]{32}\b`)
 
 	// Cloud Providers
 	awsRegex       = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
@@ -218,7 +258,7 @@ var (
 	vercelRegex    = regexp.MustCompile(`[A-Za-z0-9]{24}`)
 
 	// Developer Platforms
-	githubRegex = regexp.MustCompile(`(ghp_[a-zA-Z0-9_]{36}|gho_[a-zA-Z0-9_]{36}|github_pat_[a-zA-Z0-9_]{82})`)
+	githubRegex = regexp.MustCompile(`(ghp_[a-zA-Z0-9_]{36}|gho_[a-zA-Z0-9_]{36}|ghu_[a-zA-Z0-9_]{36}|ghs_[a-zA-Z0-9_]{36}|ghr_[a-zA-Z0-9_]{36}|github_pat_[a-zA-Z0-9_]{82})`)
 	gitlabRegex = regexp.MustCompile(`glpat-[A-Za-z0-9_\-]{20,}`)
 	dockerRegex = regexp.MustCompile(`dckr_pat_[A-Za-z0-9_\-]{20,}`)
 	npmRegex    = regexp.MustCompile(`npm_[a-zA-Z0-9]{36}`)
@@ -341,10 +381,7 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 
 	// 12. Cohere
 	for _, t := range cohereRegex.FindAllString(match, -1) {
-		// Cohere keys are typically 40 chars
-		if len(t) == 40 || strings.Contains(t, "_") {
-			addUnique(t)
-		}
+		addUnique(t)
 	}
 
 	// 13. AI21 / Mistral (32 alphanumeric)
@@ -367,7 +404,7 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 
 	// 17. Fireworks
 	for _, t := range fireworksRegex.FindAllString(match, -1) {
-		if len(t) == 48 && !isLikelyFalsePositive(t) {
+		if !isLikelyFalsePositive(t) {
 			addUnique(t)
 		}
 	}
@@ -379,9 +416,7 @@ func (tv *TokenValidator) ExtractTokensFromMatch(match string) []string {
 
 	// 22. Azure OpenAI
 	for _, t := range azureRegex.FindAllString(match, -1) {
-		if len(t) == 32 {
-			addUnique(t)
-		}
+		addUnique(t)
 	}
 
 	// ═══════════════════════════════════════════════════════════════
@@ -722,9 +757,20 @@ func (tv *TokenValidator) DetectProvider(token string) string {
 		// "sk-" and are 64+ chars, so the generic case swallowed them and they
 		// were validated against OpenAI endpoints (and always reported invalid).
 		return ProviderOpenRouter
+	case strings.HasPrefix(token, "sk_live_"), strings.HasPrefix(token, "sk_test_"), strings.HasPrefix(token, "rk_live_"), strings.HasPrefix(token, "rk_test_"):
+		// Must precede the "sk_" case below: Stripe secret keys start with the
+		// same "sk_" as ElevenLabs, so the shorter prefix swallowed them and a
+		// Stripe secret was validated against api.elevenlabs.io (and reported
+		// invalid). Longest/most-specific prefix wins, matching verifiers.Detect.
+		return ProviderStripe
 	case strings.HasPrefix(token, "sk_"):
 		// ElevenLabs keys use "sk_" (underscore), distinct from OpenAI's "sk-".
 		return ProviderElevenLabs
+	case strings.HasPrefix(token, "pk."), strings.HasPrefix(token, "sk."):
+		// Mapbox public ("pk.") and secret ("sk.") tokens. The period keeps
+		// these distinct from Stripe's "pk_live_"/"sk_live_" and ElevenLabs'
+		// "sk_", so the exact prefix routes to Mapbox.
+		return ProviderMapbox
 	case strings.HasPrefix(token, "sk-") && len(token) > 20:
 		// Could be OpenAI, DeepSeek, Together, etc.
 		if FastMatch("deepseek_key", token) {
@@ -745,7 +791,7 @@ func (tv *TokenValidator) DetectProvider(token string) string {
 		return ProviderReplicate
 	case strings.HasPrefix(token, "dop_v1_"):
 		return ProviderDigitalOcean
-	case strings.HasPrefix(token, "ghp_") || strings.HasPrefix(token, "gho_") || strings.HasPrefix(token, "github_pat_"):
+	case strings.HasPrefix(token, "ghp_") || strings.HasPrefix(token, "gho_") || strings.HasPrefix(token, "ghu_") || strings.HasPrefix(token, "ghs_") || strings.HasPrefix(token, "ghr_") || strings.HasPrefix(token, "github_pat_"):
 		return ProviderGithub
 	case strings.HasPrefix(token, "glpat-"):
 		return ProviderGitLab
@@ -753,8 +799,6 @@ func (tv *TokenValidator) DetectProvider(token string) string {
 		return ProviderDockerHub
 	case strings.HasPrefix(token, "xoxb-"), strings.HasPrefix(token, "xoxp-"), strings.HasPrefix(token, "xoxa-"):
 		return ProviderSlack
-	case strings.HasPrefix(token, "sk_live_"), strings.HasPrefix(token, "sk_test_"), strings.HasPrefix(token, "rk_live_"), strings.HasPrefix(token, "rk_test_"):
-		return ProviderStripe
 	case strings.HasPrefix(token, "pk_live_"), strings.HasPrefix(token, "pk_test_"):
 		return ProviderStripe
 	case strings.HasPrefix(token, "sq0"):
@@ -765,6 +809,14 @@ func (tv *TokenValidator) DetectProvider(token string) string {
 		return ProviderNPM
 	case strings.HasPrefix(token, "pypi-"):
 		return ProviderPyPI
+	case strings.HasPrefix(token, "ntn_"), strings.HasPrefix(token, "secret_"):
+		// Notion integration tokens ("ntn_") and the legacy "secret_" format.
+		return ProviderNotion
+	case strings.HasPrefix(token, "lin_api_"):
+		return ProviderLinear
+	case strings.HasPrefix(token, "NRAK-"):
+		// New Relic user API keys.
+		return ProviderNewRelic
 	case strings.HasPrefix(token, "SG."):
 		return ProviderSendGrid
 	case strings.HasPrefix(token, "key-"):
@@ -786,78 +838,276 @@ func (tv *TokenValidator) DetectProvider(token string) string {
 	case strings.HasPrefix(token, "eyJ") && strings.Count(token, ".") == 2:
 		return ProviderJWT
 	}
+
+	// Fall back to the verifier registry's prefix table for any prefix the
+	// switch above does not name (for example "ghu_", "ghs_" or "xoxr-"), so
+	// detection and the registry cannot drift apart.
+	if v, ok := verifiers.Detect(token); ok {
+		if provider, ok := verifierProviderNames[v.Name]; ok {
+			return provider
+		}
+	}
 	return ProviderUnknown
+}
+
+// providerVerifierNames maps a detected provider to the verifier registry entry
+// that can execute its check. A provider absent from this map (an AWS format
+// check, a JWT shape check, an unknown token) keeps the legacy ValidateToken
+// path. The registry is the single source of truth for the endpoint and
+// response interpretation; this table only bridges the provider constants.
+var providerVerifierNames = map[string]string{
+	ProviderOpenAI:      "openai",
+	ProviderAnthropic:   "anthropic",
+	ProviderGoogle:      "google",
+	ProviderXAI:         "xai",
+	ProviderOpenRouter:  "openrouter",
+	ProviderHuggingFace: "huggingface",
+	ProviderReplicate:   "replicate",
+	ProviderElevenLabs:  "elevenlabs",
+	ProviderDeepSeek:    "deepseek",
+	ProviderGroq:        "groq",
+	ProviderPerplexity:  "perplexity",
+	// Together, Fireworks, Kimi and Qwen have no detectable prefix of their own;
+	// they are probed by ValidateOpenAIToken after a generic "sk-" key fails its
+	// detected verifier, so the mapping keeps the dashboard able to resolve
+	// their category. Mistral and Cohere have no such fallback and are not
+	// mapped: they are only reachable through an explicit `verifier:` entry.
+	ProviderTogether:  "together",
+	ProviderFireworks: "fireworks",
+	ProviderKimi:      "moonshot",
+	ProviderQwen:      "dashscope",
+	ProviderGithub:    "github",
+	ProviderGitLab:    "gitlab",
+	ProviderDockerHub: "dockerhub",
+	ProviderNPM:       "npm",
+	ProviderDiscord:   "discord",
+	ProviderSlack:     "slack",
+	ProviderTelegram:  "telegram",
+	ProviderStripe:    "stripe",
+	ProviderSquare:    "square",
+	ProviderSendGrid:  "sendgrid",
+	ProviderMailgun:   "mailgun",
+	// Mapbox, Notion, Linear and New Relic have documented key prefixes and are
+	// dispatched by DetectProvider above.
+	ProviderMapbox:       "mapbox",
+	ProviderNotion:       "notion",
+	ProviderLinear:       "linear",
+	ProviderNewRelic:     "newrelic",
+	ProviderDigitalOcean: "digitalocean",
+}
+
+// verifierProviderNames is the inverse of providerVerifierNames. DetectProvider
+// uses it to translate a registry match back into the provider constant callers
+// expect, extending detection to prefixes its switch does not list.
+var verifierProviderNames = func() map[string]string {
+	m := make(map[string]string, len(providerVerifierNames))
+	for provider, name := range providerVerifierNames {
+		m[name] = provider
+	}
+	return m
+}()
+
+// VerifierNameForProvider returns the registry verifier name that executes a
+// detected provider's check, and whether the provider has one. It lets callers
+// outside core (the dashboard) resolve a provider display name to its verifier
+// without duplicating the provider->verifier table.
+func VerifierNameForProvider(provider string) (string, bool) {
+	name, ok := providerVerifierNames[strings.TrimSpace(provider)]
+	return name, ok
+}
+
+// validateToken resolves a token's verdict. When the detected provider has a
+// registry verifier the verifier runs (through the cache and domain-health
+// tracker); otherwise the legacy ValidateToken switch is used and its verdict
+// is wrapped in an Outcome so every caller sees the same shape.
+func (tv *TokenValidator) validateToken(token string) (bool, string, string, verifiers.Outcome) {
+	provider := tv.DetectProvider(token)
+	if name, ok := providerVerifierNames[provider]; ok {
+		if v, found := verifiers.Lookup(name); found {
+			valid, p, detail, outcome := tv.verifyWithRegistry(v, token, provider)
+			if valid || !openAICompatibleSK(token) {
+				return valid, p, detail, outcome
+			}
+			// The one registry verifier ran against the detected provider
+			// (usually OpenAI) and did not accept the key. A generic "sk-" key
+			// can belong to any OpenAI-compatible provider, so probe the ordered
+			// compatible-endpoint list before concluding invalid; otherwise a
+			// valid Moonshot/Qwen/Together key is reported invalid, downgraded
+			// to low severity and cached with the wrong verdict.
+			if fvalid, fprovider, fdetail := tv.ValidateOpenAIToken(token); fvalid {
+				return true, fprovider, fdetail, verifiers.Outcome{Status: verifiers.Valid, Detail: fdetail}
+			}
+			return valid, p, detail, outcome
+		}
+	}
+	valid, p, response := tv.ValidateToken(token)
+	return valid, p, response, verdictOutcome(valid, response)
+}
+
+// openAICompatibleSK reports whether token is a generic "sk-" key whose provider
+// is ambiguous. OpenAI, DeepSeek, Moonshot, Qwen, Together, Groq, Perplexity,
+// Fireworks and Anyscale all mint "sk-" keys, so one registry verifier cannot by
+// itself prove the key is invalid. Anthropic ("sk-ant-"), OpenRouter
+// ("sk-or-v1-"), OpenAI project ("sk-proj-") and service-account
+// ("sk-svcacct-") keys also start with "sk-" but have their own endpoints and
+// are excluded from the fallback probe.
+func openAICompatibleSK(token string) bool {
+	if !strings.HasPrefix(token, "sk-") {
+		return false
+	}
+	for _, prefix := range []string{"sk-ant-", "sk-or-v1-", "sk-proj-", "sk-svcacct-"} {
+		if strings.HasPrefix(token, prefix) {
+			return false
+		}
+	}
+	return true
+}
+
+// verifyWithRegistry runs a registry verifier for token, consulting the
+// validation cache and domain-health tracker when they are configured. A
+// protected host (an AI endpoint) is never short-circuited.
+func (tv *TokenValidator) verifyWithRegistry(v verifiers.Verifier, token, provider string) (bool, string, string, verifiers.Outcome) {
+	cred := verifiers.Credential{Key: token}
+	base, host := verifierEndpoint(v, cred)
+
+	if cv, ok := tv.Cache.Get(token, base); ok {
+		o := outcomeFromCached(cv)
+		return outcomeValid(o), provider, o.Detail, o
+	}
+	if tv.Cache.DomainDead(host) {
+		o := verifiers.Outcome{Status: verifiers.Dead, Detail: "connection error: host " + host + " is marked dead"}
+		return false, provider, o.Detail, o
+	}
+
+	o, _ := v.Verify(tv.httpClient, cred, base)
+	// Only a definitive provider answer proves the host healthy. Dead is a
+	// failure; Unverified (for example a missing companion credential returned
+	// before any request was issued) must not revive a dead host, so it leaves
+	// the domain counters untouched.
+	switch o.Status {
+	case verifiers.Dead:
+		tv.Cache.RecordDomainFailure(host)
+	case verifiers.Valid, verifiers.Invalid, verifiers.QuotaLimited:
+		tv.Cache.RecordDomainSuccess(host)
+	}
+	tv.Cache.Put(token, base, cachedFromOutcome(provider, o))
+	return outcomeValid(o), provider, o.Detail, o
+}
+
+// verifierEndpoint derives the base URL and host a verifier will contact
+// without issuing the request, so the cache key and domain health are keyed on
+// the real endpoint.
+func verifierEndpoint(v verifiers.Verifier, c verifiers.Credential) (base, host string) {
+	req, err := v.Build(c, "")
+	if err != nil || req == nil || req.URL == nil {
+		return "", ""
+	}
+	return req.URL.Scheme + "://" + req.URL.Host, req.URL.Host
+}
+
+// outcomeValid reports whether an Outcome means the credential exists and the
+// finding should be kept. A rate-limited credential (429) is real, just
+// throttled, so it counts as valid for match acceptance.
+func outcomeValid(o verifiers.Outcome) bool {
+	return o.Status == verifiers.Valid || o.Status == verifiers.QuotaLimited
+}
+
+// verdictOutcome wraps a legacy verdict as an Outcome.
+func verdictOutcome(valid bool, detail string) verifiers.Outcome {
+	if valid {
+		return verifiers.Outcome{Status: verifiers.Valid, Detail: detail}
+	}
+	return verifiers.Outcome{Status: verifiers.Invalid, Detail: detail}
+}
+
+// cachedFromOutcome projects an Outcome onto the subset stored by the cache.
+func cachedFromOutcome(provider string, o verifiers.Outcome) CachedValidation {
+	return CachedValidation{
+		Status:    string(o.Status),
+		Provider:  provider,
+		Tier:      o.Tier,
+		Balance:   o.Balance,
+		Identity:  o.Identity,
+		RPM:       o.RPM,
+		HighValue: o.HighValue,
+	}
+}
+
+// outcomeFromCached rebuilds an Outcome from a cached validation.
+func outcomeFromCached(cv CachedValidation) verifiers.Outcome {
+	return verifiers.Outcome{
+		Status:    verifiers.Status(cv.Status),
+		Detail:    cv.Provider + ": cached",
+		Tier:      cv.Tier,
+		Balance:   cv.Balance,
+		Identity:  cv.Identity,
+		RPM:       cv.RPM,
+		HighValue: cv.HighValue,
+	}
 }
 
 // --- VALIDATORS ---
 
 // ValidateOpenAIToken validates OpenAI, DeepSeek, Kimi, Qwen (OpenAI Compatible)
 func (tv *TokenValidator) ValidateOpenAIToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
 
 	// Try OpenAI First
-	valid, msg := tv.checkOpenAICompatible(token, "https://api.openai.com/v1/models", ProviderOpenAI)
+	valid, openAIMsg := tv.checkOpenAICompatible(token, "https://api.openai.com/v1/models", ProviderOpenAI)
 	if valid {
-		return true, ProviderOpenAI, msg
+		return true, ProviderOpenAI, openAIMsg
 	}
 
 	// DeepSeek Endpoint Check
-	tv.waitForRateLimit()
-	valid, msg = tv.checkOpenAICompatible(token, "https://api.deepseek.com/v1/models", ProviderDeepSeek)
+	valid, msg := tv.checkOpenAICompatible(token, "https://api.deepseek.com/v1/models", ProviderDeepSeek)
 	if valid {
 		return true, ProviderDeepSeek, msg
 	}
 
 	// Kimi (Moonshot) Endpoint Check
-	tv.waitForRateLimit()
 	valid, msg = tv.checkOpenAICompatible(token, "https://api.moonshot.cn/v1/models", ProviderKimi)
 	if valid {
 		return true, ProviderKimi, msg
 	}
 
 	// Qwen (Alibaba) Endpoint Check
-	tv.waitForRateLimit()
 	valid, msg = tv.checkOpenAICompatible(token, "https://dashscope.aliyuncs.com/compatible-mode/v1/models", ProviderQwen)
 	if valid {
 		return true, ProviderQwen, msg
 	}
 
 	// Together AI Endpoint Check
-	tv.waitForRateLimit()
 	valid, msg = tv.checkOpenAICompatible(token, "https://api.together.xyz/v1/models", ProviderTogether)
 	if valid {
 		return true, ProviderTogether, msg
 	}
 
 	// Groq Endpoint Check
-	tv.waitForRateLimit()
 	valid, msg = tv.checkOpenAICompatible(token, "https://api.groq.com/openai/v1/models", ProviderGroq)
 	if valid {
 		return true, ProviderGroq, msg
 	}
 
 	// Perplexity Endpoint Check
-	tv.waitForRateLimit()
 	valid, msg = tv.checkOpenAICompatible(token, "https://api.perplexity.ai/models", ProviderPerplexity)
 	if valid {
 		return true, ProviderPerplexity, msg
 	}
 
 	// Fireworks Endpoint Check
-	tv.waitForRateLimit()
 	valid, msg = tv.checkOpenAICompatible(token, "https://api.fireworks.ai/v1/models", ProviderFireworks)
 	if valid {
 		return true, ProviderFireworks, msg
 	}
 
 	// Anyscale Endpoint Check
-	tv.waitForRateLimit()
 	valid, msg = tv.checkOpenAICompatible(token, "https://api.endpoints.anyscale.com/v1/models", ProviderAnyscale)
 	if valid {
 		return true, ProviderAnyscale, msg
 	}
 
-	return false, ProviderOpenAI, msg
+	// The final provider label is OpenAI but the message must be OpenAI's own
+	// verdict, not the last endpoint (Anyscale) that happened to be tried.
+	return false, ProviderOpenAI, openAIMsg
 }
 
 // checkOpenAICompatible is a helper for any provider using the OpenAI SDK spec
@@ -885,7 +1135,6 @@ func (tv *TokenValidator) checkOpenAICompatible(token, url, provider string) (bo
 
 // ValidateAnthropicToken validates Claude
 func (tv *TokenValidator) ValidateAnthropicToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
 	payload := map[string]interface{}{
 		"model":      "claude-3-haiku-20240307",
 		"max_tokens": 5,
@@ -912,10 +1161,13 @@ func (tv *TokenValidator) ValidateAnthropicToken(token string) (bool, string, st
 
 // ValidateGoogleToken validates Gemini/Google Cloud
 func (tv *TokenValidator) ValidateGoogleToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models?key=%s", token)
 
-	resp, err := tv.httpClient.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return false, ProviderGoogle, fmt.Sprintf("Req Err: %v", err)
+	}
+	resp, err := tv.httpClient.Do(req)
 	if err != nil {
 		return false, ProviderGoogle, fmt.Sprintf("Net Err: %v", err)
 	}
@@ -929,7 +1181,6 @@ func (tv *TokenValidator) ValidateGoogleToken(token string) (bool, string, strin
 
 // ValidateXAIToken validates xAI/Grok
 func (tv *TokenValidator) ValidateXAIToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
 	req, _ := http.NewRequest("GET", "https://api.x.ai/v1/models", nil)
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
@@ -947,7 +1198,6 @@ func (tv *TokenValidator) ValidateXAIToken(token string) (bool, string, string) 
 
 // ValidateOpenRouterToken validates OpenRouter
 func (tv *TokenValidator) ValidateOpenRouterToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
 	req, _ := http.NewRequest("GET", "https://openrouter.ai/api/v1/models", nil)
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
@@ -965,7 +1215,6 @@ func (tv *TokenValidator) ValidateOpenRouterToken(token string) (bool, string, s
 
 // ValidateHuggingFaceToken validates HuggingFace
 func (tv *TokenValidator) ValidateHuggingFaceToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
 	req, _ := http.NewRequest("GET", "https://huggingface.co/api/whoami", nil)
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
@@ -983,7 +1232,6 @@ func (tv *TokenValidator) ValidateHuggingFaceToken(token string) (bool, string, 
 
 // ValidateReplicateToken validates Replicate
 func (tv *TokenValidator) ValidateReplicateToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
 	req, _ := http.NewRequest("GET", "https://api.replicate.com/v1/models", nil)
 	req.Header.Set("Authorization", fmt.Sprintf("Token %s", token))
 
@@ -1001,7 +1249,6 @@ func (tv *TokenValidator) ValidateReplicateToken(token string) (bool, string, st
 
 // ValidateElevenLabsToken validates ElevenLabs
 func (tv *TokenValidator) ValidateElevenLabsToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
 	req, _ := http.NewRequest("GET", "https://api.elevenlabs.io/v1/user", nil)
 	req.Header.Set("xi-api-key", token)
 
@@ -1019,7 +1266,6 @@ func (tv *TokenValidator) ValidateElevenLabsToken(token string) (bool, string, s
 
 // ValidateGithubToken validates GitHub PAT
 func (tv *TokenValidator) ValidateGithubToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
 	req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
 	req.Header.Set("Authorization", fmt.Sprintf("token %s", token))
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
@@ -1043,6 +1289,10 @@ func (tv *TokenValidator) ValidateGithubToken(token string) (bool, string, strin
 // a local test server.
 var discordAPIBase = "https://discord.com/api/v10"
 
+// telegramAPIBase is overridable so the validation flow can be exercised
+// against a local test server.
+var telegramAPIBase = "https://api.telegram.org"
+
 // ValidateDiscordToken validates a Discord bot or user token.
 //
 // Discord bot tokens must be sent as "Bot <token>"; user (OAuth) tokens go in
@@ -1054,8 +1304,6 @@ func (tv *TokenValidator) ValidateDiscordToken(token string) (bool, string, stri
 	lastMsg := "Invalid Discord Token"
 
 	for _, prefix := range schemes {
-		tv.waitForRateLimit()
-
 		req, err := http.NewRequest("GET", discordAPIBase+"/users/@me", nil)
 		if err != nil {
 			return false, ProviderDiscord, fmt.Sprintf("Req Err: %v", err)
@@ -1086,7 +1334,6 @@ func (tv *TokenValidator) ValidateDiscordToken(token string) (bool, string, stri
 
 // ValidateSlackToken validates Slack Bot/User Token
 func (tv *TokenValidator) ValidateSlackToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
 	req, _ := http.NewRequest("GET", "https://slack.com/api/auth.test", nil)
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
@@ -1096,9 +1343,17 @@ func (tv *TokenValidator) ValidateSlackToken(token string) (bool, string, string
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-	// Slack returns 200 OK even if auth fails, check body for "ok": false
-	if resp.StatusCode == 200 && strings.Contains(string(body), `"ok":true`) {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	if err != nil {
+		return false, ProviderSlack, fmt.Sprintf("Read Err: %v", err)
+	}
+	// Slack returns 200 OK even if auth fails, so decide on the parsed "ok"
+	// field, not a substring: a pretty-printed body (`"ok": true`, extra
+	// whitespace) never contains `"ok":true` and misclassified valid tokens.
+	var result struct {
+		Ok bool `json:"ok"`
+	}
+	if resp.StatusCode == 200 && json.Unmarshal(body, &result) == nil && result.Ok {
 		return true, ProviderSlack, "Valid Slack Token"
 	}
 	return false, ProviderSlack, fmt.Sprintf("Invalid (%s)", string(body))
@@ -1106,7 +1361,6 @@ func (tv *TokenValidator) ValidateSlackToken(token string) (bool, string, string
 
 // ValidateStripeToken validates Stripe Secret Key
 func (tv *TokenValidator) ValidateStripeToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
 	req, _ := http.NewRequest("GET", "https://api.stripe.com/v1/charges?limit=1", nil)
 	req.SetBasicAuth(token, "")
 
@@ -1134,7 +1388,6 @@ func (tv *TokenValidator) ValidateAWSToken(token string) (bool, string, string) 
 
 // ValidateNPMToken validates NPM Token
 func (tv *TokenValidator) ValidateNPMToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
 	req, _ := http.NewRequest("GET", "https://registry.npmjs.org/-/whoami", nil)
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
@@ -1152,10 +1405,13 @@ func (tv *TokenValidator) ValidateNPMToken(token string) (bool, string, string) 
 
 // ValidateTelegramToken validates Telegram Bot Token
 func (tv *TokenValidator) ValidateTelegramToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/getMe", token)
+	url := fmt.Sprintf("%s/bot%s/getMe", telegramAPIBase, token)
 
-	resp, err := tv.httpClient.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return false, ProviderTelegram, fmt.Sprintf("Req Err: %v", err)
+	}
+	resp, err := tv.httpClient.Do(req)
 	if err != nil {
 		return false, ProviderTelegram, fmt.Sprintf("Net Err: %v", err)
 	}
@@ -1170,7 +1426,6 @@ func (tv *TokenValidator) ValidateTelegramToken(token string) (bool, string, str
 
 // ValidateSquareToken validates Square Access Token
 func (tv *TokenValidator) ValidateSquareToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
 	req, _ := http.NewRequest("GET", "https://connect.squareup.com/v2/me", nil)
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 	req.Header.Set("Square-Version", "2023-12-13")
@@ -1189,7 +1444,6 @@ func (tv *TokenValidator) ValidateSquareToken(token string) (bool, string, strin
 
 // ValidateSendGridToken validates SendGrid API Key
 func (tv *TokenValidator) ValidateSendGridToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
 	req, _ := http.NewRequest("GET", "https://api.sendgrid.com/v3/user/profile", nil)
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
@@ -1207,7 +1461,6 @@ func (tv *TokenValidator) ValidateSendGridToken(token string) (bool, string, str
 
 // ValidateDigitalOceanToken validates DigitalOcean Token
 func (tv *TokenValidator) ValidateDigitalOceanToken(token string) (bool, string, string) {
-	tv.waitForRateLimit()
 	req, _ := http.NewRequest("GET", "https://api.digitalocean.com/v2/account", nil)
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
@@ -1284,45 +1537,50 @@ func (tv *TokenValidator) ValidateToken(token string) (bool, string, string) {
 	case ProviderJWT:
 		return tv.ValidateJWT(token)
 	default:
-		// For unknown tokens, check if it's a valid JWT
-		if strings.Count(token, ".") == 2 && strings.HasPrefix(token, "eyJ") {
-			return tv.ValidateJWT(token)
-		}
 		return false, ProviderUnknown, "Unrecognized token format"
 	}
 }
 
-// SaveValidToken saves a valid token to priority3.log
+// SaveValidToken saves a valid token to priority3.log.
+//
+// The file is the operator's loot file: it stores the FULL token so a
+// validated credential can actually be recovered and reused afterwards. The
+// console output stays masked (callers only print short display prefixes), and
+// the per-signature CSVs under logs/matches/ plus the --scan-keys key files
+// already carry full secrets, so this matches the existing sinks. Writing only
+// a masked prefix (the old behaviour) made validated tokens unrecoverable:
+// they "validated" but never showed up usably in the logs.
 func (tv *TokenValidator) SaveValidToken(token string, provider string, response string) error {
 	logDir := "logs"
-	if err := os.MkdirAll(logDir, 0755); err != nil {
+	// The loot file holds plaintext credentials, so the directory and file are
+	// owner-only (like key_validator's key files and the review store), not
+	// world-readable.
+	if err := os.MkdirAll(logDir, 0700); err != nil {
 		return err
 	}
 
 	logFile := filepath.Join(logDir, "priority3.log")
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 
-	maskedToken := tv.maskToken(token)
 	entry := fmt.Sprintf("[%s] Provider: %s | Token: %s | Response: %s\n",
-		timestamp, provider, maskedToken, response)
+		timestamp, provider, token, response)
 
-	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	// O_CREATE does not change the mode of a file an earlier release created
+	// world-readable, so tighten it (best effort: never fail the save on it).
+	_ = f.Chmod(0600)
 
 	_, err = f.WriteString(entry)
 	return err
 }
 
-// maskToken safely masks a token for logging
-func (tv *TokenValidator) maskToken(token string) string {
-	if len(token) <= 12 {
-		return strings.Repeat("*", len(token))
-	}
-	return token[:8] + "..." + token[len(token)-4:]
-}
+// maxTestedTokens bounds the in-memory verdict cache so a long-running scan
+// over attacker-controlled content cannot grow it without limit.
+const maxTestedTokens = 50000
 
 // TestAndLogToken tests a single token, logs the outcome and returns whether it
 // is valid. The verdict is cached, so a repeated match for the same token is
@@ -1330,11 +1588,27 @@ func (tv *TokenValidator) maskToken(token string) string {
 func (tv *TokenValidator) TestAndLogToken(token string, sigColor string) bool {
 	tv.mutex.Lock()
 	if res, ok := tv.testedTokens[token]; ok {
+		// A reserved entry means a validation for this token is already in
+		// flight. Wait for its verdict and return that, rather than the
+		// placeholder value (previously hard-coded true, which told a
+		// concurrent duplicate the token was valid before the provider had
+		// answered).
+		if res.ready != nil {
+			ready := res.ready
+			tv.mutex.Unlock()
+			<-ready
+			tv.mutex.Lock()
+			final := tv.testedTokens[token]
+			tv.mutex.Unlock()
+			return final.valid
+		}
 		tv.mutex.Unlock()
 		return res.valid
 	}
 	// Reserve the token so a concurrent worker does not start a second call.
-	tv.testedTokens[token] = tokenTestResult{valid: true}
+	// The channel is closed once the real verdict is stored, waking any waiter.
+	ready := make(chan struct{})
+	tv.testedTokens[token] = tokenTestResult{ready: ready}
 	tv.mutex.Unlock()
 
 	displayToken := token
@@ -1348,11 +1622,25 @@ func (tv *TokenValidator) TestAndLogToken(token string, sigColor string) bool {
 		tv.logger.Info("🔍 Testing [%s]: %s", providerHint, displayToken)
 	}
 
-	valid, provider, response := tv.ValidateToken(token)
+	release := tv.acquireValidationSlot()
+	valid, provider, response, outcome := tv.validateToken(token)
+	release()
 
 	tv.mutex.Lock()
-	tv.testedTokens[token] = tokenTestResult{valid: valid, provider: provider}
+	// Bound the verdict cache so a long-running scan over attacker-controlled
+	// content cannot grow it without limit. Completed entries are evicted once
+	// the cap is reached; in-flight reservations (ready != nil) are left intact
+	// so their waiters still receive a verdict.
+	if len(tv.testedTokens) >= maxTestedTokens {
+		for k, r := range tv.testedTokens {
+			if r.ready == nil {
+				delete(tv.testedTokens, k)
+			}
+		}
+	}
+	tv.testedTokens[token] = tokenTestResult{valid: valid, provider: provider, outcome: outcome}
 	tv.mutex.Unlock()
+	close(ready)
 
 	if valid {
 		color := sigColor
@@ -1383,6 +1671,15 @@ func (tv *TokenValidator) TestAndLogToken(token string, sigColor string) bool {
 		tv.OnTokenResult(masked, valid, provider)
 	}
 
+	// Second, non-breaking callback carrying the richer verifier outcome.
+	if tv.OnOutcome != nil {
+		masked := token
+		if len(token) > 20 {
+			masked = token[:17] + "..."
+		}
+		tv.OnOutcome(masked, provider, outcome)
+	}
+
 	return valid
 }
 
@@ -1396,14 +1693,20 @@ func (tv *TokenValidator) TestMatchedTokens(matches []string, sigColor string) {
 	}
 }
 
-// TestTokens tests a list of tokens (for manual testing)
+// TestTokens tests a list of tokens (for manual testing). It tolerates a nil
+// logger (NewTokenValidator(nil) is a supported construction) the same way
+// TestAndLogToken does.
 func (tv *TokenValidator) TestTokens(tokens []string) {
 	if len(tokens) == 0 {
-		tv.logger.Warn("No tokens to test")
+		if tv.logger != nil {
+			tv.logger.Warn("No tokens to test")
+		}
 		return
 	}
 
-	tv.logger.Important("Testing %d token(s)...", len(tokens))
+	if tv.logger != nil {
+		tv.logger.Important("Testing %d token(s)...", len(tokens))
+	}
 
 	for i, token := range tokens {
 		token = strings.TrimSpace(token)
@@ -1417,22 +1720,30 @@ func (tv *TokenValidator) TestTokens(tokens []string) {
 		}
 
 		providerHint := tv.DetectProvider(token)
-		tv.logger.Info("[%d/%d] Testing [%s]: %s...", i+1, len(tokens), providerHint, displayToken)
+		if tv.logger != nil {
+			tv.logger.Info("[%d/%d] Testing [%s]: %s...", i+1, len(tokens), providerHint, displayToken)
+		}
 
 		valid, provider, response := tv.ValidateToken(token)
 
 		if valid {
-			tv.logger.LogWithColor("#10A37F", "✓ %s token is VALID", provider)
-			tv.logger.Important("Response: %s", response)
+			if tv.logger != nil {
+				tv.logger.LogWithColor("#10A37F", "✓ %s token is VALID", provider)
+				tv.logger.Important("Response: %s", response)
+			}
 
 			if err := tv.SaveValidToken(token, provider, response); err != nil {
-				tv.logger.Error("Failed to save valid token: %v", err)
+				if tv.logger != nil {
+					tv.logger.Error("Failed to save valid token: %v", err)
+				}
 			}
-		} else {
+		} else if tv.logger != nil {
 			tv.logger.LogWithColor("#FF0000", "✗ %s token is INVALID", provider)
 			tv.logger.Warn("Response: %s", response)
 		}
 	}
 
-	tv.logger.Important("Token validation complete.")
+	if tv.logger != nil {
+		tv.logger.Important("Token validation complete.")
+	}
 }

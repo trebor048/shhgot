@@ -4,8 +4,8 @@ import { api } from './api'
 // Client-side caps mirror the server ring buffers (maxMatches/maxLogs/maxTokens
 // in web.go) so a long-running dashboard cannot grow without bound.
 export const MAX_MATCHES = 10000
-export const MAX_LOGS = 2000
-export const MAX_TOKENS = 2000
+export const MAX_LOGS = 1000
+export const MAX_TOKENS = 1000
 
 const EMPTY_STATS = {
   total_matches: 0,
@@ -30,6 +30,19 @@ function cap(arr, max) {
   return arr.length > max ? arr.slice(arr.length - max) : arr
 }
 
+// mergeToken upserts one token result into a list keyed by `token`, replacing an
+// existing entry in place (so its enrichment refresh wins) or appending when the
+// token is new. The server upserts one row per token, so the client must too or
+// every `token` event duplicates the row.
+function mergeToken(list, tok) {
+  if (!tok) return list
+  const i = list.findIndex((t) => t && t.token === tok.token)
+  if (i < 0) return list.concat([tok])
+  const next = list.slice()
+  next[i] = tok
+  return next
+}
+
 // useFeed subscribes to /api/events (Server-Sent Events) and keeps the live
 // match list, stats, log tail, token results and activity snapshot in sync.
 //
@@ -44,7 +57,6 @@ export function useFeed() {
   const [tokens, setTokens] = useState([])
   const [activity, setActivity] = useState(ACTIVITY_EMPTY)
   const [connected, setConnected] = useState(false)
-  const [lastReview, setLastReview] = useState(null)
   const [reviewTick, setReviewTick] = useState(0)
 
   // High-frequency streams (logs can arrive many times a second) are buffered
@@ -52,6 +64,9 @@ export function useFeed() {
   const pendingLogs = useRef([])
   const pendingTokens = useRef([])
   const flushTimer = useRef(null)
+  // Set once the SSE stream has delivered its first event. After that the
+  // stream is authoritative and the one-shot /api/ws fetch must not clobber it.
+  const streamSeen = useRef(false)
 
   useEffect(() => {
     let cancelled = false
@@ -64,7 +79,10 @@ export function useFeed() {
       api.activity().catch(() => null),
     ]).then(([snap, logRes, tokRes, actRes]) => {
       if (cancelled) return
-      if (snap) {
+      // The /api/ws snapshot is only a pre-stream fallback (e.g. SSE blocked by
+      // a proxy). If the stream has already delivered newer state, applying it
+      // here would drop matches the live feed just pushed.
+      if (snap && !streamSeen.current) {
         if (Array.isArray(snap.matches)) setMatches(snap.matches)
         if (snap.stats) setStats(snap.stats)
       }
@@ -82,13 +100,37 @@ export function useFeed() {
       if (pendingTokens.current.length) {
         const add = pendingTokens.current
         pendingTokens.current = []
-        setTokens((prev) => cap(prev.concat(add), MAX_TOKENS))
+        setTokens((prev) => cap(add.reduce(mergeToken, prev), MAX_TOKENS))
       }
     }, 250)
 
     const es = new EventSource('/api/events')
 
-    es.onopen = () => setConnected(true)
+    let opened = false
+    // The reconnect snapshot only carries matches/stats/activity, so refetch the
+    // log tail and token list on every reconnect. Without this, log lines and
+    // token results pushed during the gap are lost for good.
+    const resyncTabs = () => {
+      api
+        .logs()
+        .then((r) => {
+          if (!cancelled && r && Array.isArray(r.logs)) setLogs(cap(r.logs, MAX_LOGS))
+        })
+        .catch(() => {})
+      api
+        .tokens()
+        .then((r) => {
+          if (!cancelled && r && Array.isArray(r.tokens)) setTokens(cap(r.tokens, MAX_TOKENS))
+        })
+        .catch(() => {})
+    }
+    es.onopen = () => {
+      setConnected(true)
+      // First open: the mount-time Promise.all already fetched the tabs.
+      // Every later open is a reconnect, so resync them.
+      if (opened) resyncTabs()
+      opened = true
+    }
     es.onerror = () => {
       // EventSource reconnects on its own; reflect the gap in the UI only.
       setConnected(false)
@@ -100,6 +142,7 @@ export function useFeed() {
       } catch {
         return
       }
+      streamSeen.current = true
       switch (data.type) {
         case 'snapshot':
           setConnected(true)
@@ -115,16 +158,13 @@ export function useFeed() {
           if (data.log != null) pendingLogs.current.push(data.log)
           break
         case 'token':
-          if (data.token) pendingTokens.current.push(data.token)
+          if (data.token) pendingTokens.current = mergeToken(pendingTokens.current, data.token)
           break
         case 'activity':
           if (data.activity) setActivity(data.activity)
           break
         case 'review':
-          if (data.review) {
-            setLastReview(data.review)
-            setReviewTick((n) => n + 1)
-          }
+          if (data.review) setReviewTick((n) => n + 1)
           break
         default:
           break
@@ -138,5 +178,5 @@ export function useFeed() {
     }
   }, [])
 
-  return { matches, stats, logs, tokens, activity, connected, lastReview, reviewTick }
+  return { matches, stats, logs, tokens, activity, connected, reviewTick }
 }

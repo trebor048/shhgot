@@ -41,19 +41,20 @@ export default function StatsPanel({ stats }) {
   }))
 
   const total = stats.total_matches || 0
+  // Average SEVERITY from the verified severity buckets, not rule priority: the
+  // two are different axes (a priority-3 rule can classify as any severity).
+  const sev = stats.matches_by_severity || {}
   const severity =
     total > 0
       ? (
-          ((stats.matches_by_priority?.[3] || 0) * 3 +
-            (stats.matches_by_priority?.[2] || 0) * 2 +
-            (stats.matches_by_priority?.[1] || 0) * 1) /
+          ((sev.critical || 0) * 3 + (sev.high || 0) * 2 + (sev.medium || 0) * 1) /
           total
         ).toFixed(2)
       : '0.00'
 
   const cards = [
     { label: 'Total matches', value: total, cls: 'from-cyan-600 to-blue-600' },
-    { label: 'Critical', value: stats.matches_by_priority?.[3] || 0, cls: 'from-red-600 to-red-700' },
+    { label: 'Critical', value: sev.critical || 0, cls: 'from-red-600 to-red-700' },
     { label: 'Unique signatures', value: Object.keys(stats.matches_by_signature || {}).length, cls: 'from-fuchsia-600 to-purple-600' },
     { label: 'Avg severity', value: `${severity}/3`, cls: 'from-amber-600 to-orange-600' },
   ]

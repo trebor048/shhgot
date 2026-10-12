@@ -95,10 +95,24 @@ var colorGradients = []ColorGradient{
 	}},
 }
 
+// bannerDelay is the per-character typing pace for the startup banner. It is
+// deliberately slower than the 1 ms decoration pace: the banner is the
+// operator's startup readout, not wallpaper. When the typewriter effect is
+// enabled with a slower configured delay, that delay wins instead.
+func bannerDelay() time.Duration {
+	const defaultBannerPace = 5 * time.Millisecond
+	if session != nil && session.Config != nil &&
+		session.Config.TypewriterEffect &&
+		session.Config.TypewriterDelayMS > 5 {
+		return time.Duration(session.Config.TypewriterDelayMS) * time.Millisecond
+	}
+	return defaultBannerPace
+}
+
 // PrintAnimatedBanner displays the banner with animated typing and random gradient
 func PrintAnimatedBanner() {
-	// Pick a random gradient
-	rand.Seed(time.Now().UnixNano())
+	// Pick a random gradient. The global source is auto-seeded since Go 1.20,
+	// so rand.Seed here is unnecessary (and deprecated).
 	gradient := colorGradients[rand.Intn(len(colorGradients))]
 
 	lines := splitLines(BannerText)
@@ -116,7 +130,7 @@ func PrintAnimatedBanner() {
 		// Type out each character
 		for _, char := range line {
 			colorFunc.Print(string(char))
-			time.Sleep(time.Millisecond * 1) // Fast typing effect
+			time.Sleep(bannerDelay())
 		}
 		fmt.Println() // Newline after each line
 	}
@@ -164,9 +178,4 @@ func TypePrint(text string) {
 		fmt.Print(string(char))
 		time.Sleep(delay)
 	}
-}
-
-// TypePrintln prints text with typing animation and newline
-func TypePrintln(text string) {
-	TypePrint(text + "\n")
 }

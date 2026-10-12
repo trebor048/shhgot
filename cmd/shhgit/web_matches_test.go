@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/trebor048/shhgot/core"
+	"github.com/trebor048/shhgot/core/verifiers"
 )
 
 // These tests exercise the dashboard's backend match pipeline end to end
@@ -25,6 +26,7 @@ func resetHubForTest(h *WebHub) {
 		MatchesBySource:    make(map[string]int),
 		MatchesBySignature: make(map[string]int),
 		MatchesByPriority:  make(map[int]int),
+		MatchesBySeverity:  make(map[string]int),
 	}
 	h.matchesMutex.Unlock()
 }
@@ -294,6 +296,63 @@ func TestEventsConnectSnapshotCarriesMatchesAndStats(t *testing.T) {
 		return
 	}
 	t.Fatal("no snapshot frame arrived")
+}
+
+// A verifier outcome that reclassifies an existing match must broadcast a
+// snapshot event so dashboards update the severity/verified flag in place
+// instead of showing stale state until the next reload.
+func TestUpdateHubMatchOutcomeBroadcastsSnapshot(t *testing.T) {
+	hub := ensureWebHub()
+	resetHubForTest(hub)
+
+	m := testMatch("outcome-1")
+	select {
+	case hub.broadcast <- m:
+	case <-time.After(time.Second):
+		t.Fatal("hub.broadcast full")
+	}
+	waitForCond(t, 2*time.Second, func() bool {
+		hub.matchesMutex.RLock()
+		defer hub.matchesMutex.RUnlock()
+		return len(hub.matches) == 1
+	})
+
+	ch := make(chan []byte, 1)
+	feedMu.Lock()
+	feedClients[ch] = true
+	feedMu.Unlock()
+	defer func() {
+		feedMu.Lock()
+		delete(feedClients, ch)
+		feedMu.Unlock()
+	}()
+
+	priority := updateHubMatchOutcome(m.Secret, verifiers.Outcome{Status: verifiers.Valid})
+	if priority != m.Priority {
+		t.Fatalf("priority = %d, want %d", priority, m.Priority)
+	}
+
+	select {
+	case data := <-ch:
+		if !strings.Contains(string(data), `"type":"snapshot"`) {
+			t.Fatalf("expected snapshot event, got %s", string(data))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no snapshot broadcast after outcome update")
+	}
+}
+
+// The Prometheus exposition must read the latency sum from the captured
+// snapshot, not from the live collector, so quantiles, ops and sum are
+// consistent for the same subsystem.
+func TestPrometheusMetricsReadsSumFromSnapshot(t *testing.T) {
+	m := core.NewMetrics()
+	m.ObserveLatency("scan", 100*time.Millisecond)
+	m.ObserveLatency("scan", 200*time.Millisecond)
+	out := prometheusMetrics(m.Snapshot())
+	if !strings.Contains(out, `shhgit_latency_seconds_total{subsystem="scan"} 0.3`) {
+		t.Fatalf("prometheus output missing consistent sum:\n%s", out)
+	}
 }
 
 // --- file cache eviction -----------------------------------------------------

@@ -1,10 +1,15 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { ArrowDownToLine, Trash2 } from 'lucide-react'
-import { ansiToRuns } from '../lib/format'
+import { ansiToRuns, safeUrl } from '../lib/format'
 
 export default function LogsPanel({ logs }) {
   const [follow, setFollow] = useState(true)
-  const [hidden, setHidden] = useState([])
+  // Anchor "Clear view" on the last line present at the moment of clearing
+  // rather than on an index or count: the log buffer is a rolling window that
+  // evicts old entries from the front, so a stored index goes stale as soon as
+  // the cap is reached (it would hide the newest lines forever). Once the
+  // anchor line itself is evicted, everything buffered is newer than the clear.
+  const [clearedTail, setClearedTail] = useState(null)
   const bottomRef = useRef(null)
 
   useEffect(() => {
@@ -13,9 +18,10 @@ export default function LogsPanel({ logs }) {
     }
   }, [logs, follow])
 
-  const clear = () => setHidden(logs.slice())
+  const clear = () => setClearedTail(logs.length ? logs[logs.length - 1] : null)
 
-  const visible = logs.slice(hidden.length)
+  const cut = clearedTail == null ? -1 : logs.lastIndexOf(clearedTail)
+  const visible = cut >= 0 ? logs.slice(cut + 1) : logs
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -43,11 +49,27 @@ export default function LogsPanel({ logs }) {
         {visible.length === 0 && <div className="text-slate-600 italic p-2">No log lines yet.</div>}
         {visible.map((line, i) => (
           <div key={i} className="whitespace-pre-wrap break-all hover:bg-cyan-500/5 px-1">
-            {ansiToRuns(line).map((run, j) => (
-              <span key={j} className={run.className}>
-                {run.text}
-              </span>
-            ))}
+            {ansiToRuns(line).map((run, j) => {
+              const href = safeUrl(run.href)
+              if (!href) {
+                return (
+                  <span key={j} className={run.className}>
+                    {run.text}
+                  </span>
+                )
+              }
+              return (
+                <a
+                  key={j}
+                  href={href}
+                  target="_blank"
+                  rel="noreferrer"
+                  className={`${run.className} underline decoration-dotted hover:text-cyan-200`}
+                >
+                  {run.text}
+                </a>
+              )
+            })}
           </div>
         ))}
         <div ref={bottomRef} />

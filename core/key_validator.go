@@ -8,7 +8,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"time"
 )
 
 type KeyValidator struct {
@@ -118,7 +117,10 @@ func (kv *KeyValidator) ValidateKey(key string) *ValidatedKey {
 		return kv.validateXAI(key)
 	} else if strings.HasPrefix(key, "hf_") {
 		return kv.validateHuggingFace(key)
-	} else if strings.HasPrefix(key, "ghp_") || strings.HasPrefix(key, "gho_") || strings.HasPrefix(key, "github_pat_") {
+	} else if strings.HasPrefix(key, "ghp_") || strings.HasPrefix(key, "gho_") || strings.HasPrefix(key, "ghu_") || strings.HasPrefix(key, "ghs_") || strings.HasPrefix(key, "ghr_") || strings.HasPrefix(key, "github_pat_") {
+		// Every prefix the GITHUB extraction regex below recognises must reach
+		// validateGitHubKey; otherwise a just-detected ghu_/ghs_/ghr_ token fell
+		// through to the UNKNOWN branch and was recorded as an unknown format.
 		return kv.validateGitHubKey(key)
 	}
 
@@ -131,12 +133,11 @@ func (kv *KeyValidator) ValidateKey(key string) *ValidatedKey {
 }
 
 func (kv *KeyValidator) validateAnthropic(key string) *ValidatedKey {
-	client := &http.Client{Timeout: 10 * time.Second}
 	req, _ := http.NewRequest("GET", "https://api.anthropic.com/v1/models", nil)
 	req.Header.Set("x-api-key", key)
 	req.Header.Set("anthropic-version", "2023-06-01")
 
-	resp, err := client.Do(req)
+	resp, err := SharedHTTPClient().Do(req)
 	if err != nil {
 		return &ValidatedKey{
 			Key:      key,
@@ -157,11 +158,10 @@ func (kv *KeyValidator) validateAnthropic(key string) *ValidatedKey {
 }
 
 func (kv *KeyValidator) validateOpenAI(key string) *ValidatedKey {
-	client := &http.Client{Timeout: 10 * time.Second}
 	req, _ := http.NewRequest("GET", "https://api.openai.com/v1/models", nil)
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
 
-	resp, err := client.Do(req)
+	resp, err := SharedHTTPClient().Do(req)
 	if err != nil {
 		return &ValidatedKey{
 			Key:      key,
@@ -200,10 +200,9 @@ func (kv *KeyValidator) validateAWSKey(key string) *ValidatedKey {
 }
 
 func (kv *KeyValidator) validateGoogleAPI(key string) *ValidatedKey {
-	client := &http.Client{Timeout: 10 * time.Second}
 	req, _ := http.NewRequest("GET", fmt.Sprintf("https://www.googleapis.com/customsearch/v1?key=%s&q=test", key), nil)
 
-	resp, err := client.Do(req)
+	resp, err := SharedHTTPClient().Do(req)
 	if err != nil {
 		return &ValidatedKey{
 			Key:      key,
@@ -224,11 +223,10 @@ func (kv *KeyValidator) validateGoogleAPI(key string) *ValidatedKey {
 }
 
 func (kv *KeyValidator) validateXAI(key string) *ValidatedKey {
-	client := &http.Client{Timeout: 10 * time.Second}
 	req, _ := http.NewRequest("GET", "https://api.x.ai/v1/models", nil)
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
 
-	resp, err := client.Do(req)
+	resp, err := SharedHTTPClient().Do(req)
 	if err != nil {
 		return &ValidatedKey{
 			Key:      key,
@@ -249,11 +247,10 @@ func (kv *KeyValidator) validateXAI(key string) *ValidatedKey {
 }
 
 func (kv *KeyValidator) validateOpenRouter(key string) *ValidatedKey {
-	client := &http.Client{Timeout: 10 * time.Second}
 	req, _ := http.NewRequest("GET", "https://openrouter.ai/api/v1/models", nil)
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
 
-	resp, err := client.Do(req)
+	resp, err := SharedHTTPClient().Do(req)
 	if err != nil {
 		return &ValidatedKey{
 			Key:      key,
@@ -274,11 +271,10 @@ func (kv *KeyValidator) validateOpenRouter(key string) *ValidatedKey {
 }
 
 func (kv *KeyValidator) validateHuggingFace(key string) *ValidatedKey {
-	client := &http.Client{Timeout: 10 * time.Second}
 	req, _ := http.NewRequest("GET", "https://huggingface.co/api/whoami", nil)
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
 
-	resp, err := client.Do(req)
+	resp, err := SharedHTTPClient().Do(req)
 	if err != nil {
 		return &ValidatedKey{
 			Key:      key,
@@ -299,7 +295,6 @@ func (kv *KeyValidator) validateHuggingFace(key string) *ValidatedKey {
 }
 
 func (kv *KeyValidator) validateGitHubKey(key string) *ValidatedKey {
-	client := &http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequest("GET", "https://api.github.com/user", nil)
 	if err != nil {
 		return &ValidatedKey{Key: key, Provider: "GITHUB", Valid: false, Error: err.Error()}
@@ -307,7 +302,7 @@ func (kv *KeyValidator) validateGitHubKey(key string) *ValidatedKey {
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Accept", "application/vnd.github+json")
 
-	resp, err := client.Do(req)
+	resp, err := SharedHTTPClient().Do(req)
 	if err != nil {
 		return &ValidatedKey{Key: key, Provider: "GITHUB", Valid: false, Error: err.Error()}
 	}
@@ -322,11 +317,10 @@ func (kv *KeyValidator) validateGitHubKey(key string) *ValidatedKey {
 }
 
 func (kv *KeyValidator) validateStripe(key string) *ValidatedKey {
-	client := &http.Client{Timeout: 10 * time.Second}
 	req, _ := http.NewRequest("GET", "https://api.stripe.com/v1/account", nil)
 	req.SetBasicAuth(key, "")
 
-	resp, err := client.Do(req)
+	resp, err := SharedHTTPClient().Do(req)
 	if err != nil {
 		return &ValidatedKey{
 			Key:      key,
@@ -398,7 +392,7 @@ func (kv *KeyValidator) ScanDirectoryForKeys(dir string, session *Session) []Val
 	files := GetMatchingFiles(dir)
 
 	keyPatterns := map[string]*regexp.Regexp{
-		"OPENAI":            regexp.MustCompile(`sk-[a-zA-Z0-9]{48}`),
+		"OPENAI":            regexp.MustCompile(`sk-proj-[A-Za-z0-9_-]{20,}|sk-[a-zA-Z0-9]{48}`),
 		"ANTHROPIC":         regexp.MustCompile(`sk-ant-api03-[a-zA-Z0-9_-]{95}`),
 		"AWS":               regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
 		"GOOGLE_API":        regexp.MustCompile(`AIza[0-9A-Za-z_-]{35,40}`),
@@ -408,7 +402,7 @@ func (kv *KeyValidator) ScanDirectoryForKeys(dir string, session *Session) []Val
 		"STRIPE_SECRET":     regexp.MustCompile(`sk_(live|test)_[a-zA-Z0-9]{24,}`),
 		"STRIPE_PUBLIC":     regexp.MustCompile(`pk_(live|test)_[a-zA-Z0-9]{24,}`),
 		"STRIPE_RESTRICTED": regexp.MustCompile(`rk_(live|test)_[a-zA-Z0-9]{24,}`),
-		"GITHUB":            regexp.MustCompile(`(ghp_[A-Za-z0-9]{36}|github_pat_[0-9a-zA-Z_]{22}[0-9a-zA-Z_]{64})`),
+		"GITHUB":            regexp.MustCompile(`(ghp_[A-Za-z0-9]{36}|gho_[A-Za-z0-9]{36}|ghu_[A-Za-z0-9]{36}|ghs_[A-Za-z0-9]{36}|ghr_[A-Za-z0-9]{36}|github_pat_[0-9a-zA-Z_]{22}[0-9a-zA-Z_]{64})`),
 	}
 
 	foundKeys := make(map[string]bool)

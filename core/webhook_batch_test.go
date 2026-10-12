@@ -64,4 +64,35 @@ func TestMergeDiscordPayloads(t *testing.T) {
 			t.Fatal("a single item is not a merge")
 		}
 	})
+
+	t.Run("keeps every content", func(t *testing.T) {
+		ping := func(content string, n int) string {
+			b, _ := json.Marshal(map[string]any{
+				"content": content,
+				"embeds":  []map[string]any{{"title": string(rune('a' + n))}},
+			})
+			return string(b)
+		}
+		merged, ok := mergeDiscordPayloads([]*WebhookQueueItem{
+			item("https://discord.com/api/webhooks/1/x", ping("<@111>", 0)),
+			item("https://discord.com/api/webhooks/1/x", ping("<@222>", 1)),
+			item("https://discord.com/api/webhooks/1/x", ping("<@111>", 2)),
+		})
+		if !ok {
+			t.Fatal("expected a merge")
+		}
+		var doc struct {
+			Content string           `json:"content"`
+			Embeds  []map[string]any `json:"embeds"`
+		}
+		if err := json.Unmarshal([]byte(merged), &doc); err != nil {
+			t.Fatalf("merged payload is not valid JSON: %v", err)
+		}
+		if len(doc.Embeds) != 3 {
+			t.Fatalf("merged %d embeds, want 3", len(doc.Embeds))
+		}
+		if doc.Content != "<@111>\n<@222>" {
+			t.Fatalf("merged content = %q, want both pings once each", doc.Content)
+		}
+	})
 }

@@ -87,6 +87,17 @@ func NewMatchFile(path string) MatchFile {
 // binary file, which cannot hold a text secret, so the remainder is never read.
 // On a repository full of images and vendored blobs that is the difference
 // between reading the tree and reading the text in it.
+// maxFileSizeKB returns the configured maximum file size in kilobytes, falling
+// back to the CLI/flag default when no session is installed. Unit tests build a
+// MatchFile with no session; GetContents' other session reads already tolerate a
+// nil session, so this one must too instead of dereferencing session.Options.
+func maxFileSizeKB() uint {
+	if session != nil && session.Options != nil && session.Options.MaximumFileSize != nil {
+		return *session.Options.MaximumFileSize
+	}
+	return 256
+}
+
 func (m *MatchFile) GetContents() []byte {
 	if m.loaded {
 		return m.Contents
@@ -94,7 +105,7 @@ func (m *MatchFile) GetContents() []byte {
 	m.loaded = true
 
 	// Check max file size before reading
-	maxSize := int64(*session.Options.MaximumFileSize * 1024)
+	maxSize := int64(maxFileSizeKB() * 1024)
 	if m.Size > maxSize {
 		m.Contents = []byte{}
 		return m.Contents
@@ -140,7 +151,11 @@ func (m *MatchFile) GetContents() []byte {
 	copied := copy(m.Contents, head)
 	if copied < len(m.Contents) {
 		n, rerr := io.ReadFull(file, m.Contents[copied:])
-		if rerr != nil && rerr != io.ErrUnexpectedEOF {
+		// io.EOF (nothing left to read) and io.ErrUnexpectedEOF (a partial
+		// read) both mean the file shrank between the os.Stat that set Size and
+		// this read. Only a genuine read error should discard the head already
+		// read; treating io.EOF as fatal threw away the whole file body.
+		if rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
 			m.Contents = []byte{}
 			return m.Contents
 		}
@@ -173,16 +188,33 @@ type pathRule struct {
 
 // Pre-compute blacklist checks for faster lookup
 var (
-	blacklistExtMap   map[string]bool
-	blacklistPathList []pathRule
-	blacklistOnce     sync.Once
+	blacklistExtMap map[string]bool
+	// blacklistExtSuffixes holds entries filepath.Ext can never return as a
+	// match on their own, e.g. the multi-dot ".tar.gz" (Ext is ".gz"). They are
+	// checked with a filename-suffix test instead.
+	blacklistExtSuffixes []string
+	blacklistPathList    []pathRule
+	blacklistOnce        sync.Once
 )
 
 func initBlacklists() {
+	// A caller that has no session yet (a unit test exercising a helper that
+	// consults the blacklist, or an early call before GetSession) must not
+	// panic. Skipping the initialization leaves both maps nil, which the
+	// lookups below treat as "nothing blacklisted"; because the once is not
+	// consumed, a later call with a real session still populates them.
+	if session == nil || session.Config == nil {
+		return
+	}
 	blacklistOnce.Do(func() {
 		blacklistExtMap = make(map[string]bool, len(session.Config.BlacklistedExtensions))
+		blacklistExtSuffixes = blacklistExtSuffixes[:0]
 		for _, ext := range session.Config.BlacklistedExtensions {
-			blacklistExtMap[strings.ToLower(ext)] = true
+			lower := strings.ToLower(ext)
+			blacklistExtMap[lower] = true
+			if strings.Count(lower, ".") > 1 {
+				blacklistExtSuffixes = append(blacklistExtSuffixes, lower)
+			}
 		}
 
 		seen := make(map[pathRule]bool, len(session.Config.BlacklistedPaths))
@@ -193,15 +225,9 @@ func initBlacklists() {
 			if entry == "" {
 				continue
 			}
-			trimmed := strings.TrimSuffix(entry, "/")
-			var rule pathRule
-			switch {
-			case strings.Contains(trimmed, "/"):
-				rule = pathRule{pathRuleFragment, entry}
-			case strings.HasSuffix(entry, "/"):
-				rule = pathRule{pathRuleComponent, trimmed}
-			default:
-				rule = pathRule{pathRuleBasename, entry}
+			rule, ok := classifyBlacklistPath(entry)
+			if !ok {
+				continue
 			}
 			if seen[rule] {
 				continue
@@ -212,12 +238,70 @@ func initBlacklists() {
 	})
 }
 
+// classifyBlacklistPath turns a normalised blacklist entry into its rule.
+//
+// A multi-component entry is a fragment rule whose pattern is TRIMMED of a
+// trailing slash: matchPathFragment requires a separator (or end) after the
+// fragment, so keeping the trailing slash (`vendor/bundle/`) made the rule
+// unmatchable against a real path (`vendor/bundle/ruby/...`).
+func classifyBlacklistPath(entry string) (pathRule, bool) {
+	trimmed := strings.TrimSuffix(entry, "/")
+	switch {
+	case strings.Contains(trimmed, "/"):
+		return pathRule{pathRuleFragment, trimmed}, true
+	case strings.HasSuffix(entry, "/"):
+		return pathRule{pathRuleComponent, trimmed}, true
+	default:
+		return pathRule{pathRuleBasename, entry}, true
+	}
+}
+
+// matchPathFragment reports whether frag occurs in slashed delimited by path
+// separators (or the string boundary) on both sides, so a fragment rule matches
+// a whole component run rather than any substring.
+func matchPathFragment(slashed, frag string) bool {
+	if frag == "" {
+		return false
+	}
+	for start := 0; ; {
+		i := strings.Index(slashed[start:], frag)
+		if i < 0 {
+			return false
+		}
+		beg := start + i
+		end := beg + len(frag)
+		if (beg == 0 || slashed[beg-1] == '/') && (end == len(slashed) || slashed[end] == '/') {
+			return true
+		}
+		start = beg + 1
+	}
+}
+
+// blacklistedExtension reports whether path carries a blacklisted extension.
+// filepath.Ext only returns the last dot segment, so entries such as ".tar.gz"
+// are matched with a filename-suffix test as well.
+func blacklistedExtension(slashed string) bool {
+	if blacklistExtMap[strings.ToLower(filepath.Ext(slashed))] {
+		return true
+	}
+	if len(blacklistExtSuffixes) == 0 {
+		return false
+	}
+	lower := strings.ToLower(slashed)
+	for _, suffix := range blacklistExtSuffixes {
+		if strings.HasSuffix(lower, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 func IsSkippableFile(path string) bool {
 	initBlacklists()
 
 	slashed := filepath.ToSlash(path)
 	// Fast map lookup instead of linear search
-	if blacklistExtMap[strings.ToLower(filepath.Ext(slashed))] {
+	if blacklistedExtension(slashed) {
 		return true
 	}
 
@@ -232,7 +316,9 @@ func IsSkippableFile(path string) bool {
 				}
 			}
 		case pathRuleFragment:
-			if strings.Contains(slashed, rule.pattern) {
+			// Match the fragment only on whole path components, so a rule such
+			// as `vendor/autoload.php` does not also skip `myvendor/autoload.php`.
+			if matchPathFragment(slashed, rule.pattern) {
 				return true
 			}
 		case pathRuleBasename:
@@ -249,9 +335,20 @@ func (match MatchFile) CanCheckEntropy() bool {
 	if match.Filename == "id_rsa" {
 		return false
 	}
+	if session == nil || session.Config == nil {
+		return true
+	}
 
-	for _, skippableExt := range session.Config.BlacklistedEntropyExtensions {
-		if match.Extension == skippableExt {
+	for _, skippable := range session.Config.BlacklistedEntropyExtensions {
+		if skippable == "" {
+			continue
+		}
+		// Entries may be a bare extension (".pem"), a multi-dot suffix
+		// (".env.local") or a whole filename ("id_ed25519"). Comparing only
+		// match.Extension missed the last two - filepath.Ext("id_ed25519") is
+		// empty and filepath.Ext(".env.local") is ".local" - so those keys never
+		// skipped anything.
+		if strings.HasSuffix(match.Filename, skippable) {
 			return false
 		}
 	}
@@ -273,7 +370,7 @@ type ScanPlan struct {
 // PlanScan walks dir and classifies each file without reading it.
 func PlanScan(dir string) (ScanPlan, error) {
 	initBlacklists()
-	maxFileSize := *session.Options.MaximumFileSize * 1024
+	maxFileSize := maxFileSizeKB() * 1024
 
 	var plan ScanPlan
 	err := filepath.Walk(dir, func(path string, f os.FileInfo, werr error) error {
@@ -288,7 +385,7 @@ func PlanScan(dir string) (ScanPlan, error) {
 		case uint(f.Size()) > maxFileSize:
 			plan.SkippedSize++
 		case IsSkippableFile(path):
-			if blacklistExtMap[strings.ToLower(filepath.Ext(filepath.ToSlash(path)))] {
+			if blacklistedExtension(filepath.ToSlash(path)) {
 				plan.SkippedExt++
 			} else {
 				plan.SkippedPath++
@@ -315,7 +412,7 @@ func GetMatchingFiles(dir string) []MatchFile {
 // same tree.
 func GetMatchingFilesCounted(dir string) ([]MatchFile, int) {
 	fileList := make([]MatchFile, 0, 1000) // Pre-allocate with reasonable capacity
-	maxFileSize := *session.Options.MaximumFileSize * 1024
+	maxFileSize := maxFileSizeKB() * 1024
 
 	initBlacklists() // Ensure blacklists are ready
 
@@ -339,7 +436,9 @@ func GetMatchingFilesCounted(dir string) ([]MatchFile, int) {
 		fileList = append(fileList, NewMatchFile(path))
 		return nil
 	}); err != nil {
-		session.Log.Debug("Error walking %s: %s", dir, err)
+		if session != nil && session.Log != nil {
+			session.Log.Debug("Error walking %s: %s", dir, err)
+		}
 	}
 
 	return fileList, total

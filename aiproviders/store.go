@@ -180,9 +180,12 @@ func (s *Store) Get() (Settings, error) {
 //
 // Validation judges the configuration as it will be evaluated, environment
 // fallbacks included: a key supplied through the environment is a working setup,
-// and refusing to store the rest of the form because of it would be wrong. What
-// is written is the caller's own values, so no environment secret is copied into
-// the file.
+// and refusing to store the rest of the form because of it would be wrong. For a
+// custom endpoint the base URL and model are likewise taken from the environment
+// so the save does not fail on "requires a base URL" when they were supplied
+// through SHHGIT_AI_BASE_URL/SHHGIT_AI_MODEL. Providers with built-in defaults
+// keep those defaults instead, and the API key is always left as the caller
+// supplied it: no environment secret is copied into the file.
 func (s *Store) Set(v Settings) error {
 	if strings.TrimSpace(s.path) == "" {
 		return fmt.Errorf("%w: settings store has no path", ErrBadConfig)
@@ -192,10 +195,25 @@ func (s *Store) Set(v Settings) error {
 		return err
 	}
 
-	// A blank provider means "whichever one is in effect", so record that rather
-	// than an empty string the next read would have to guess at.
+	// Resolve the provider: a blank one means "whichever one is in effect", so
+	// record that rather than an empty string the next read would have to guess
+	// at. For a custom endpoint, draw the base URL and model from the environment
+	// too: custom has no built-in endpoint to fall back on, so a value supplied
+	// through SHHGIT_AI_BASE_URL/SHHGIT_AI_MODEL is the only thing that makes the
+	// saved form usable. Providers with built-in defaults keep those defaults, so
+	// the stored file never captures an environment value that would then outrank
+	// the environment it came from. The API key is never copied.
+	fb := WithEnvFallback(v)
 	if normalizeProvider(v.Provider) == "" {
-		v.Provider = WithEnvFallback(v).Provider
+		v.Provider = fb.Provider
+	}
+	if spec, lerr := lookupProvider(v.Provider); lerr == nil && spec.custom {
+		if strings.TrimSpace(v.BaseURL) == "" {
+			v.BaseURL = fb.BaseURL
+		}
+		if strings.TrimSpace(v.Model) == "" {
+			v.Model = fb.Model
+		}
 	}
 
 	eff, err := applyDefaults(v)

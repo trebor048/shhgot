@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   MessageSquare,
-  Plus,
   RefreshCw,
   Send,
   Sparkles,
@@ -85,15 +84,31 @@ export default function ReviewPanel({ pendingMatch, onConsumePending, reviewTick
       .catch((e) => setListError(e.message))
   }, [])
 
+  // selectedIdRef lets an in-flight detail fetch detect that the selection moved
+  // on, so a late response cannot overwrite the panel with a different review.
+  const selectedIdRef = useRef(selectedId)
+  useEffect(() => {
+    selectedIdRef.current = selectedId
+  }, [selectedId])
+
   const loadDetail = useCallback(
     (id) => {
       api
         .reviewGet(id)
         .then((d) => {
+          if (selectedIdRef.current !== id) return
           setDetail(d)
           setAssessment(d.assessment || '')
         })
-        .catch((e) => toast(`Could not load review: ${e.message}`, 'error'))
+        .catch((e) => {
+          if (selectedIdRef.current !== id) return
+          // Clear the stale detail: otherwise the previous review's
+          // assessment stays on screen masquerading as the failed load.
+          // The { error } shape renders through the existing error block.
+          setDetail({ error: `Could not load review: ${e.message}` })
+          setAssessment('')
+          toast(`Could not load review: ${e.message}`, 'error')
+        })
     },
     [toast],
   )
@@ -109,8 +124,14 @@ export default function ReviewPanel({ pendingMatch, onConsumePending, reviewTick
   }, [reviewTick, loadList])
 
   // Create a review when a match is handed over from the Matches tab.
+  const createdPendingRef = useRef(null)
   useEffect(() => {
     if (!pendingMatch) return
+    // StrictMode double-invokes this effect in dev, and the parent's
+    // onConsumePending state update has not applied yet on the second run, so
+    // guard on the handover object to create exactly one review.
+    if (createdPendingRef.current === pendingMatch) return
+    createdPendingRef.current = pendingMatch
     const m = pendingMatch
     onConsumePending()
     api
@@ -120,8 +141,12 @@ export default function ReviewPanel({ pendingMatch, onConsumePending, reviewTick
         secret: (m.matches && m.matches[0]) || m.secret || '',
         file: m.file || '',
         url: m.url || '',
-        repo: m.url || '',
+        // Leave repo empty: the server derives "owner/name" from the URL,
+        // while the full URL here would be stored (and labelled) verbatim.
+        repo: '',
         context: m.line ? `scanner: detected at line ${m.line}` : '',
+        base_url: m.base_url || '',
+        severity: m.severity || '',
       })
       .then((res) => {
         toast('AI review queued', 'ok')

@@ -1,18 +1,11 @@
 package core
 
-import (
-	"sync/atomic"
-)
-
 // ProgressManager tracks aggregate counters for the secret scan.
 type ProgressManager struct {
-	rateLimited atomic.Int64
-
 	// OnRateLimited, when set, runs every time the GitHub API rate limits a
-	// token. The main package points it at the dashboard's activity counter:
-	// this counter is only ever written here, and the number both UIs display
-	// ("Rate limited", the TUI's "limited N") is read from that one, so without
-	// the hook they reported zero for the whole run.
+	// token. The dashboard's activity counter is the single source of truth the
+	// UIs read ("Rate limited", the TUI's "limited N"), so the count lives there
+	// rather than in a second field here that nothing ever read.
 	OnRateLimited func()
 }
 
@@ -21,9 +14,8 @@ func NewProgressManager() *ProgressManager {
 	return &ProgressManager{}
 }
 
-// IncrementRateLimited bumps the rate-limited counter and notifies the hook.
+// IncrementRateLimited notifies the rate-limited hook.
 func (pm *ProgressManager) IncrementRateLimited() {
-	pm.rateLimited.Add(1)
 	if pm.OnRateLimited != nil {
 		pm.OnRateLimited()
 	}

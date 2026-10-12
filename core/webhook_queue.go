@@ -7,12 +7,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fatih/color"
+	"github.com/trebor048/shhgot/core/httpclient"
 )
 
 // discordWebhookFloorMS is the slowest gap we ever allow on a single Discord
@@ -21,6 +22,54 @@ import (
 // clock skew. No configuration can push this endpoint below the floor, because
 // hitting the bucket is what gets the whole webhook throttled.
 const discordWebhookFloorMS int64 = 500
+
+// Severity embed colours, matching the palette the terminal UI uses so a
+// critical finding looks the same in Discord, the dashboard and the TUI.
+const (
+	severityColorCritical = "#ED4245" // red
+	severityColorHigh     = "#E67E22" // orange
+	severityColorMedium   = "#FEE75C" // yellow
+	severityColorLow      = "#57F287" // green
+)
+
+// SeverityColorHex maps a finding severity to the hex colour used for a Discord
+// embed, replacing the signature colour as the embed accent. It returns the
+// empty string for an unknown or empty severity so the caller can keep the
+// signature colour (records written before Slice 6 have no severity).
+func SeverityColorHex(severity string) string {
+	switch strings.ToLower(strings.TrimSpace(severity)) {
+	case "critical":
+		return severityColorCritical
+	case "high":
+		return severityColorHigh
+	case "medium":
+		return severityColorMedium
+	case "low":
+		return severityColorLow
+	default:
+		return ""
+	}
+}
+
+// EmbedColor resolves the decimal Discord embed colour for a finding: the
+// severity colour when the severity is known, otherwise the signature colour.
+// It is the single place the severity -> colour decision is made, so the
+// webhook cannot drift from the dashboard/TUI palette.
+func EmbedColor(severity, signatureColor string) int {
+	if hex := SeverityColorHex(severity); hex != "" {
+		return parseColorHex(hex)
+	}
+	return parseColorHex(signatureColor)
+}
+
+// webhookHTTPClient is deliberately configured with no client-side retries and
+// no per-host pacing. sendWithRetry and reserveSendSlot are the sole retrier and
+// pacer on the webhook path: a second layer would multiply deliveries and fight
+// the queue's own spacing.
+var webhookHTTPClient = httpclient.New(httpclient.Config{
+	Retries: 0,
+	Timeout: 10 * time.Second,
+})
 
 // webhookWarnOnce makes the queue report webhook trouble at most once per run.
 // A successful delivery is never logged: one line per send would drown the
@@ -43,12 +92,21 @@ type WebhookQueueItem struct {
 	Payload    string
 	Hash       string // For deduplication
 	MaxRetries int
+	// OnDelivery, when non-nil, is invoked exactly once with the final outcome
+	// of this item's delivery: true when the endpoint accepted the message (or
+	// it was already delivered inside the dedupe window), false when the item
+	// was dropped or every retry failed. It is how a caller such as publish()
+	// learns whether it may record a cross-run dedupe fingerprint. It runs on
+	// the queue's consumer goroutine, so callers should keep it short (a
+	// mutex-guarded store append, not an unbounded send).
+	OnDelivery func(ok bool)
 }
 
 // WebhookQueue manages webhook delivery with deduplication, rate limiting, and retries
 type WebhookQueue struct {
 	queue        chan *WebhookQueueItem
 	sent         map[string]time.Time // hash -> last sent time
+	inflight     map[string]bool      // hash -> claimed but not yet delivered
 	sentMutex    sync.Mutex
 	startOnce    sync.Once
 	rateLimitMS  int64         // milliseconds between sends per webhook
@@ -61,6 +119,15 @@ type WebhookQueue struct {
 	// senders can never both see "enough time has passed" and fire together.
 	sendMutex sync.Mutex
 	lastSend  map[string]time.Time // webhook URL -> last delivery time
+
+	// done closes when the consumer goroutine exits. closeOnce makes Close
+	// idempotent; closed reports whether Close ran (Enqueue after Close drops
+	// instead of panicking on a send to the closed channel); closeMu
+	// serialises Close against the Enqueue send.
+	done      chan struct{}
+	closeOnce sync.Once
+	closed    atomic.Bool
+	closeMu   sync.Mutex
 }
 
 // NewWebhookQueue creates a new webhook queue with the specified config
@@ -71,10 +138,12 @@ func NewWebhookQueue(queueSize int, rateLimitMS int64, dedupeWindowSec int, batc
 	return &WebhookQueue{
 		queue:        make(chan *WebhookQueueItem, queueSize),
 		sent:         make(map[string]time.Time),
+		inflight:     make(map[string]bool),
 		lastSend:     make(map[string]time.Time),
 		rateLimitMS:  rateLimitMS,
 		dedupeWindow: time.Duration(dedupeWindowSec) * time.Second,
 		batchSize:    batchSize,
+		done:         make(chan struct{}),
 	}
 }
 
@@ -123,6 +192,7 @@ func (wq *WebhookQueue) reserveSendSlot(url string) {
 func (wq *WebhookQueue) Start() {
 	wq.startOnce.Do(func() {
 		go func() {
+			defer close(wq.done)
 			var held *WebhookQueueItem
 			for {
 				item := held
@@ -138,37 +208,65 @@ func (wq *WebhookQueue) Start() {
 				// An item for a different endpoint is held for the next round, so
 				// ordering between endpoints is preserved.
 				batch := []*WebhookQueueItem{item}
+				drained := false
 				for len(batch) < wq.batchSize {
 					select {
 					case nxt := <-wq.queue:
 						if nxt == nil {
-							continue
-						}
-						if nxt.URL == item.URL {
+							// A receive from a closed channel is always ready and
+							// yields nil, so `continue` would spin at 100% CPU.
+							// Close: stop coalescing but still deliver the batch
+							// already accumulated - returning here dropped up to
+							// batchSize-1 buffered alerts (and their persist
+							// callbacks) on shutdown.
+							drained = true
+						} else if nxt.URL == item.URL {
 							batch = append(batch, nxt)
 							continue
+						} else {
+							held = nxt
 						}
-						held = nxt
 					default:
 					}
 					break
 				}
 
 				wq.processBatch(batch)
+				if drained && held == nil {
+					return
+				}
 			}
 		}()
 	})
 }
 
-// Enqueue adds a webhook message to the queue (non-blocking)
-func (wq *WebhookQueue) Enqueue(url, payload string) {
+// Enqueue adds a webhook message to the queue (non-blocking). onDelivery, when
+// non-nil, is invoked exactly once when the item's fate is known: true on an
+// accepted delivery, false on a drop or a permanent failure. A duplicate that
+// was already delivered inside the dedupe window reports true, because the
+// alert did go out.
+func (wq *WebhookQueue) Enqueue(url, payload string, onDelivery func(ok bool)) {
 	wq.Start()
 
 	// Calculate hash for deduplication
 	hash := wq.hashPayload(url, payload)
 
-	// Check if this is a duplicate
-	if wq.isDuplicate(hash) {
+	// Claim the hash atomically before sending. Checking for a duplicate and
+	// only recording it after a successful send let concurrent identical
+	// findings all pass the check and deliver.
+	switch wq.claimHash(hash) {
+	case claimAlreadySent:
+		// The alert already went out inside the dedupe window, so this
+		// duplicate is genuinely delivered.
+		notifyDelivery(onDelivery, true)
+		return
+	case claimInflight:
+		// An identical payload is queued or mid-delivery; its alert has not
+		// gone out yet. Report failure rather than success: if the original
+		// ultimately fails, the finding must be re-alerted by a later run
+		// instead of being suppressed by a dedupe fingerprint recorded from an
+		// alert that was never delivered.
+		notifyDelivery(onDelivery, false)
 		return
 	}
 
@@ -177,20 +275,80 @@ func (wq *WebhookQueue) Enqueue(url, payload string) {
 		Payload:    payload,
 		Hash:       hash,
 		MaxRetries: 3,
+		OnDelivery: onDelivery,
 	}
 
-	// Non-blocking send to queue
+	// Non-blocking send to queue. Serialised against Close: sending (even in
+	// a select with default) on a closed channel panics.
+	wq.closeMu.Lock()
+	defer wq.closeMu.Unlock()
+	if wq.closed.Load() {
+		wq.releaseHash(hash)
+		warnWebhookOnce("delivery queue is closed, dropping messages")
+		notifyDelivery(onDelivery, false)
+		return
+	}
 	select {
 	case wq.queue <- item:
 		// Successfully queued
 	default:
-		// Queue full: warn once, then keep going (never block the scanner).
+		// Queue full: release the claim so a later enqueue can retry, warn once,
+		// then keep going (never block the scanner).
+		wq.releaseHash(hash)
 		warnWebhookOnce("delivery queue is full, dropping messages")
+		notifyDelivery(onDelivery, false)
+	}
+}
+
+// Close stops the queue: no further item is accepted and the consumer exits
+// once the buffered items are delivered. It is idempotent and safe to call
+// before Start.
+func (wq *WebhookQueue) Close() {
+	wq.closeOnce.Do(func() {
+		wq.closeMu.Lock()
+		defer wq.closeMu.Unlock()
+		wq.closed.Store(true)
+		close(wq.queue)
+	})
+}
+
+// Drain closes the queue and waits up to timeout for the buffered items to be
+// delivered (each delivery still fires its OnDelivery callback, so findings
+// are persisted once their alert goes out). It reports whether the queue
+// emptied in time; on timeout the undelivered remainder stays queued and the
+// caller must decide whether to wait longer or exit without it.
+func (wq *WebhookQueue) Drain(timeout time.Duration) bool {
+	wq.Close()
+	if timeout <= 0 {
+		select {
+		case <-wq.done:
+			return true
+		default:
+			return false
+		}
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-wq.done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// notifyDelivery fires an item's completion callback if one is set.
+func notifyDelivery(onDelivery func(ok bool), ok bool) {
+	if onDelivery != nil {
+		onDelivery(ok)
 	}
 }
 
 // maxDiscordEmbeds is Discord's documented cap on embeds per message.
 const maxDiscordEmbeds = 10
+
+// maxDiscordContent is Discord's documented cap on message content characters.
+const maxDiscordContent = 2000
 
 // processBatch delivers one batch of queued items. When batching is enabled and
 // every item targets the same endpoint with a Discord embed payload they are
@@ -202,20 +360,33 @@ func (wq *WebhookQueue) processBatch(batch []*WebhookQueueItem) {
 	}
 	if len(batch) > 1 {
 		if merged, ok := mergeDiscordPayloads(batch); ok {
-			if wq.sendWithRetry(batch[0].URL, merged, batch[0].MaxRetries) == nil {
+			err := wq.sendWithRetry(batch[0].URL, merged, batch[0].MaxRetries)
+			if err == nil {
 				hashes := make([]string, 0, len(batch))
 				for _, it := range batch {
 					hashes = append(hashes, it.Hash)
 				}
 				wq.markSent(hashes)
+			} else {
+				// Permanent failure: release the claims so a later run retries.
+				for _, it := range batch {
+					wq.releaseHash(it.Hash)
+				}
+			}
+			for _, it := range batch {
+				notifyDelivery(it.OnDelivery, err == nil)
 			}
 			return
 		}
 	}
 	for _, it := range batch {
-		if wq.sendWithRetry(it.URL, it.Payload, it.MaxRetries) == nil {
+		err := wq.sendWithRetry(it.URL, it.Payload, it.MaxRetries)
+		if err == nil {
 			wq.markSent([]string{it.Hash})
+		} else {
+			wq.releaseHash(it.Hash)
 		}
+		notifyDelivery(it.OnDelivery, err == nil)
 	}
 }
 
@@ -226,6 +397,9 @@ func (wq *WebhookQueue) markSent(hashes []string) {
 	wq.sentMutex.Lock()
 	for _, h := range hashes {
 		wq.sent[h] = now
+		if wq.inflight != nil {
+			delete(wq.inflight, h)
+		}
 	}
 	wq.sentMutex.Unlock()
 	wq.cleanupSentMap()
@@ -292,8 +466,18 @@ func mergeDiscordPayloads(batch []*WebhookQueueItem) (string, bool) {
 		if err := json.Unmarshal([]byte(it.Payload), &doc); err != nil || len(doc.Embeds) == 0 {
 			return "", false
 		}
-		if content == "" {
-			content = doc.Content
+		// Every item's content (usually a Discord ping) must survive the
+		// merge: keeping only the first silently drops the rest. Distinct
+		// contents are concatenated within Discord's 2000-character message
+		// cap; anything larger refuses the merge and is sent separately.
+		if doc.Content != "" && !strings.Contains(content, doc.Content) {
+			if content != "" {
+				content += "\n"
+			}
+			content += doc.Content
+			if len(content) > maxDiscordContent {
+				return "", false
+			}
 		}
 		embeds = append(embeds, doc.Embeds...)
 		if len(embeds) > maxDiscordEmbeds {
@@ -325,30 +509,20 @@ func (e *rateLimitError) Error() string {
 	return "rate limited: " + e.detail
 }
 
-// parseRetryAfter reads a Retry-After style header. Discord sends seconds as a
-// float (e.g. "1.5"); the HTTP spec also allows an absolute date, so both are
-// accepted. An unparseable or non-positive value yields 0, letting the caller
-// fall back to exponential backoff.
-func parseRetryAfter(value string) time.Duration {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return 0
-	}
-	if secs, err := strconv.ParseFloat(value, 64); err == nil && secs > 0 {
-		return time.Duration(secs * float64(time.Second))
-	}
-	if t, err := http.ParseTime(value); err == nil {
-		if d := time.Until(t); d > 0 {
-			return d
-		}
-	}
-	return 0
-}
-
-// sendWebhook performs the actual HTTP POST
+// sendWebhook performs the actual HTTP POST through the queue's own client,
+// which has client-side retries and pacing disabled.
 func (wq *WebhookQueue) sendWebhook(url, payload string) error {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Post(url, "application/json", strings.NewReader(payload))
+	// SSRF guard: validate the target URL before any request is made.
+	if err := httpclient.SafeURL(url); err != nil {
+		return fmt.Errorf("webhook URL rejected by SSRF guard: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("request error: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := webhookHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("http error: %w", err)
 	}
@@ -357,9 +531,10 @@ func (wq *WebhookQueue) sendWebhook(url, payload string) error {
 	// Check for rate limiting. Discord exposes the wait via Retry-After, and
 	// X-RateLimit-Reset-After on some endpoints; prefer the former.
 	if resp.StatusCode == http.StatusTooManyRequests {
-		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
-		if retryAfter <= 0 {
-			retryAfter = parseRetryAfter(resp.Header.Get("X-RateLimit-Reset-After"))
+		now := time.Now()
+		retryAfter, ok := httpclient.ParseRetryAfter(resp.Header.Get("Retry-After"), now)
+		if !ok {
+			retryAfter, _ = httpclient.ParseRetryAfter(resp.Header.Get("X-RateLimit-Reset-After"), now)
 		}
 		return &rateLimitError{retryAfter: retryAfter, detail: "429 Too Many Requests"}
 	}
@@ -375,24 +550,51 @@ func (wq *WebhookQueue) sendWebhook(url, payload string) error {
 	return nil
 }
 
-// isDuplicate checks if a message hash was sent recently
-func (wq *WebhookQueue) isDuplicate(hash string) bool {
+// claimState is the outcome of claiming a payload hash for delivery.
+type claimState int
+
+const (
+	// claimNew means the caller won the claim and now owns delivery of the hash.
+	claimNew claimState = iota
+	// claimInflight means an identical payload is already queued or being
+	// delivered. Its alert has not necessarily gone out yet.
+	claimInflight
+	// claimAlreadySent means the hash was delivered within the dedupe window.
+	claimAlreadySent
+)
+
+// claimHash atomically claims hash for delivery and reports the resulting
+// state. A new claim is recorded as in-flight, not sent: only markSent records
+// a real delivery, so an in-flight duplicate is never mistaken for a delivered
+// alert. The claim is taken at enqueue time, not after delivery, which is what
+// closes the check-then-act race in Enqueue.
+func (wq *WebhookQueue) claimHash(hash string) claimState {
 	wq.sentMutex.Lock()
 	defer wq.sentMutex.Unlock()
 
-	lastSent, exists := wq.sent[hash]
-	if !exists {
-		return false
+	if wq.inflight == nil {
+		wq.inflight = make(map[string]bool)
 	}
-
-	// Check if within deduplication window
-	if time.Since(lastSent) < wq.dedupeWindow {
-		return true
+	if wq.inflight[hash] {
+		return claimInflight
 	}
+	if last, ok := wq.sent[hash]; ok && time.Since(last) < wq.dedupeWindow {
+		return claimAlreadySent
+	}
+	wq.inflight[hash] = true
+	return claimNew
+}
 
-	// Outside dedupeWindow, remove from tracking
+// releaseHash drops an in-flight claim so a delivery that never happened - a
+// full queue or every retry failing - is retried by a later run instead of
+// being suppressed for the rest of the dedupe window.
+func (wq *WebhookQueue) releaseHash(hash string) {
+	wq.sentMutex.Lock()
 	delete(wq.sent, hash)
-	return false
+	if wq.inflight != nil {
+		delete(wq.inflight, hash)
+	}
+	wq.sentMutex.Unlock()
 }
 
 // cleanupSentMap removes old entries to keep memory usage bounded

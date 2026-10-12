@@ -30,7 +30,9 @@ export default function FileModal({ match, onClose }) {
     return () => {
       cancelled = true
     }
-  }, [match.id])
+    // match.id drives the fetch; file/url render the header from the same
+    // object, so they join the deps to avoid a mismatched header vs content.
+  }, [match.id, match.file, match.url])
 
   useEffect(() => {
     const onKey = (e) => e.key === 'Escape' && onClose()

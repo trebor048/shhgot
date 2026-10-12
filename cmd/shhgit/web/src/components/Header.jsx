@@ -5,6 +5,7 @@ const TABS = [
   { id: 'matches', label: 'Matches' },
   { id: 'review', label: 'Review' },
   { id: 'tokens', label: 'Tokens' },
+  { id: 'suppressed', label: 'Suppressed' },
   { id: 'activity', label: 'Activity' },
   { id: 'stats', label: 'Stats' },
   { id: 'dashboard', label: 'Dashboard' },
@@ -84,6 +85,7 @@ export default function Header({
             <button
               key={t.id}
               onClick={() => setActiveTab(t.id)}
+              aria-current={activeTab === t.id ? 'page' : undefined}
               className={`px-3 py-2 text-sm whitespace-nowrap border-b-2 transition ${
                 activeTab === t.id
                   ? 'border-cyan-500 text-cyan-400'

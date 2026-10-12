@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useState } from 'react'
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { AlertTriangle, CheckCircle2, Info, X } from 'lucide-react'
 
 const ToastCtx = createContext(() => {})
@@ -15,13 +15,26 @@ const KINDS = {
 
 export function ToastProvider({ children }) {
   const [items, setItems] = useState([])
+  const timers = useRef([])
+
+  // Clear pending auto-dismiss timers on unmount so they cannot call setItems
+  // on an unmounted provider.
+  useEffect(
+    () => () => {
+      timers.current.forEach(clearTimeout)
+      timers.current = []
+    },
+    [],
+  )
 
   const push = useCallback((text, kind = 'info') => {
     const id = Math.random().toString(36).slice(2)
     setItems((prev) => prev.concat([{ id, text, kind }]))
-    setTimeout(() => {
-      setItems((prev) => prev.filter((t) => t.id !== id))
+    const t = setTimeout(() => {
+      setItems((prev) => prev.filter((x) => x.id !== id))
+      timers.current = timers.current.filter((x) => x !== t)
     }, 4000)
+    timers.current.push(t)
   }, [])
 
   return (

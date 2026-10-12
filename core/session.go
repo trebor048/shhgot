@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/google/go-github/github"
+	"github.com/trebor048/shhgot/core/store"
+	"github.com/trebor048/shhgot/core/verifiers"
 	"golang.org/x/oauth2"
 )
 
@@ -28,10 +30,12 @@ type Session struct {
 	Clients          chan *GitHubClientWrapper
 	ExhaustedClients chan *GitHubClientWrapper
 	CsvWriter        *csv.Writer
+	CsvFile          *os.File
 	MatchLogger      *MatchLogger
 	CleanupManager   *CleanupManager
 	TokenValidator   *TokenValidator
 	Progress         *ProgressManager
+	Store            store.Store
 	FoundTokens      map[string]bool
 	TokenMutex       sync.Mutex
 	RemovedTokens    map[string]bool
@@ -69,6 +73,7 @@ func (s *Session) Start() {
 	s.InitMatchLogger()
 	s.InitCleanupManager()
 	s.InitTokenValidator()
+	s.InitStore()
 	s.InitRegexOptimizer()
 }
 
@@ -139,8 +144,20 @@ func (s *Session) GetClient() *GitHubClientWrapper {
 				sleepTime := time.Until(client.RateLimitedUntil)
 				if sleepTime > 0 {
 					s.Log.Debug("Token %s[..] still rate limited for %s", MaskToken(client.Token), sleepTime.String())
-					// Put it back
-					go func() { s.ExhaustedClients <- client }()
+					// Put it back without spawning a sender goroutine: under
+					// sustained rate limiting the pool stays full and every
+					// 50 ms poll leaked one goroutine blocked on the send
+					// forever. Parking this waiter (which has nothing better
+					// to do while every token is exhausted) fixes the leak
+					// with identical pool behavior.
+					requeued := false
+					for !requeued {
+						select {
+						case s.ExhaustedClients <- client:
+							requeued = true
+						case <-time.After(50 * time.Millisecond):
+						}
+					}
 				} else {
 					s.Log.Debug("Token %s[..] rate limit reset, returning to pool", MaskToken(client.Token))
 					return client
@@ -155,14 +172,27 @@ func (s *Session) GetClient() *GitHubClientWrapper {
 // FreeClient returns the GitHub Client to the pool of available,
 // non-rate-limited channel of clients in the session. Clients whose token was
 // revoked mid-run are dropped instead of recycled.
+//
+// The return is non-blocking: pool capacity covers every client in flight, so
+// a full channel means a duplicate return and parking here would wedge the
+// worker forever. The duplicate is dropped with a warning, mirroring
+// AddGitHubToken's pool top-up.
 func (s *Session) FreeClient(client *GitHubClientWrapper) {
 	if s.IsTokenRemoved(client.Token) {
 		return
 	}
 	if client.RateLimitedUntil.After(time.Now()) {
-		s.ExhaustedClients <- client
-	} else {
-		s.Clients <- client
+		select {
+		case s.ExhaustedClients <- client:
+		default:
+			s.Log.Warn("Exhausted client pool is full; dropping a duplicate %s[..] return", MaskToken(client.Token))
+		}
+		return
+	}
+	select {
+	case s.Clients <- client:
+	default:
+		s.Log.Warn("GitHub client pool is full; dropping a duplicate %s[..] return", MaskToken(client.Token))
 	}
 }
 
@@ -179,6 +209,19 @@ func (s *Session) hasUsableTokens() bool {
 	s.TokenMutex.Lock()
 	defer s.TokenMutex.Unlock()
 	return s.Config != nil && len(s.Config.GitHubAccessTokens) > 0
+}
+
+// GitHubTokens returns a copy of the configured GitHub tokens. The copy is
+// taken under TokenMutex because AddGitHubToken, RemoveUnauthorizedToken and
+// the token pruner rewrite the slice mid-run; ranging the live slice directly
+// is a data race.
+func (s *Session) GitHubTokens() []string {
+	s.TokenMutex.Lock()
+	defer s.TokenMutex.Unlock()
+	if s.Config == nil {
+		return nil
+	}
+	return append([]string(nil), s.Config.GitHubAccessTokens...)
 }
 
 // RemoveUnauthorizedToken handles a mid-run HTTP 401 (bad credentials) for
@@ -227,7 +270,10 @@ func (s *Session) RemoveUnauthorizedToken(token string) {
 func (s *Session) InitThreads() {
 	low := s.lowImpact()
 
-	if *s.Options.Threads == 0 {
+	// A negative --threads is treated like the unset 0 rather than reaching
+	// InitGitHubClients, where a negative value becomes a negative channel
+	// capacity and make(chan T, n) panics.
+	if *s.Options.Threads <= 0 {
 		numCPUs := runtime.NumCPU()
 		if low && numCPUs > 2 {
 			// Leave half the machine free so the scan does not make it unusable.
@@ -284,6 +330,7 @@ func (s *Session) InitCsvWriter() {
 	}
 
 	s.CsvWriter = csv.NewWriter(file)
+	s.CsvFile = file
 
 	if writeHeader {
 		s.WriteToCsv([]string{"Repository name", "Signature name", "Matching file", "Matches"})
@@ -327,7 +374,7 @@ func (s *Session) InitCleanupManager() {
 		cleanupIntervalSecs = s.Config.Cleanup.CleanupIntervalSecs
 	}
 
-	s.CleanupManager = NewCleanupManager(*s.Options.TempDirectory, maxDiskUsageMB)
+	s.CleanupManager = NewCleanupManager(*s.Options.TempDirectory, maxDiskUsageMB, s.Log)
 	s.CleanupManager.cleanupIntervalSecs = cleanupIntervalSecs
 	if s.Config.Cleanup.CleanupThresholdMB > 0 {
 		s.CleanupManager.cleanupThresholdMB = s.Config.Cleanup.CleanupThresholdMB
@@ -340,8 +387,14 @@ func (s *Session) WriteToCsv(line []string) {
 		return
 	}
 
-	s.CsvWriter.Write(line)
+	if err := s.CsvWriter.Write(line); err != nil {
+		LogIfError("Could not write CSV row", err)
+		return
+	}
 	s.CsvWriter.Flush()
+	if err := s.CsvWriter.Error(); err != nil {
+		LogIfError("Could not flush CSV writer", err)
+	}
 }
 
 func GetSession() *Session {
@@ -375,6 +428,11 @@ func GetSession() *Session {
 		// so bursts of matches went out back-to-back and tripped Discord's limit.
 		ConfigureWebhookQueue(session.Config.WebhookQueue)
 
+		// Rebuild the shared outbound HTTP client from config before Start()
+		// constructs the validator that binds it. Without this the singleton was
+		// built from an empty config, so every http.* key was silently ignored.
+		ConfigureSharedHTTPClient(session.Config)
+
 		// Recreate the queue channels at the configured buffer sizes now that
 		// the config is parsed (no consumer has touched them yet). Absent or
 		// <= 0 queue_buffer_size keeps the built-in 1000/100/1000 defaults.
@@ -398,7 +456,91 @@ func GetSession() *Session {
 
 func (s *Session) InitTokenValidator() {
 	s.TokenValidator = NewTokenValidator(s.Log)
+	// Apply the "validators:" section. Without this the cache stayed nil and
+	// every validators.* key (cache_enabled in particular) was a no-op, while
+	// max_concurrency never bounded anything.
+	if s.Config != nil {
+		s.TokenValidator.Cache = s.Config.NewValidationCache()
+		s.TokenValidator.SetConcurrency(s.Config.ValidatorConcurrency())
+	}
 	s.Log.Debug("Token validator initialized")
+}
+
+// InitStore opens the persistent findings store described by config. The store
+// is disabled unless storage.enabled is true, so this is a no-op store by
+// default. A store that cannot be opened (or a journal that cannot be read)
+// degrades to a disabled store: the scan must never be blocked by it.
+func (s *Session) InitStore() {
+	cfg := store.Config{}
+	if s.Config != nil {
+		cfg = s.Config.StoreConfig()
+	}
+	st, err := store.New(cfg)
+	if err != nil {
+		s.Log.Warn("Findings store unavailable; continuing without dedupe or resume: %s", err)
+		st, _ = store.New(store.Config{})
+	}
+	s.Store = st
+	if cfg.Enabled && st.Degraded() {
+		s.Log.Warn("Findings store is degraded; cross-run dedupe is disabled for this run")
+	}
+	if cfg.Enabled {
+		s.Log.Debug("Findings store enabled at %s", cfg.Path)
+	}
+}
+
+// CloseStore flushes and closes the findings store. It is safe to call more
+// than once and with a nil store.
+func (s *Session) CloseStore() {
+	// Release the CSV descriptor too: InitCsvWriter opened the file and the
+	// handle was previously never closed, leaking it until process exit.
+	if s.CsvWriter != nil {
+		s.CsvWriter.Flush()
+		s.CsvWriter = nil
+	}
+	if s.CsvFile != nil {
+		_ = s.CsvFile.Close()
+		s.CsvFile = nil
+	}
+	if s.Store != nil {
+		_ = s.Store.Close()
+	}
+}
+
+// SaveCursor persists a named scan cursor. It is a no-op when no store is
+// configured, so cursor bookkeeping never gates the scan.
+func (s *Session) SaveCursor(name string, v any) error {
+	if s.Store == nil {
+		return nil
+	}
+	return s.Store.SaveCursor(name, v)
+}
+
+// LoadCursor restores a named scan cursor, returning store.ErrNotFound when it
+// was never written or no store is configured.
+func (s *Session) LoadCursor(name string, out any) error {
+	if s.Store == nil {
+		return store.ErrNotFound
+	}
+	return s.Store.LoadCursor(name, out)
+}
+
+// resumeEnabled reports whether persisted scan cursors may be reused. --no-resume
+// forces every run to start fresh.
+func (s *Session) resumeEnabled() bool {
+	return s.Options == nil || s.Options.NoResume == nil || !*s.Options.NoResume
+}
+
+// newGitHubValidationClient builds the API client AddGitHubToken validates a
+// candidate token with. It is a package variable (mirroring pruneGitHubUserURL
+// in the main package) so tests can point it at a stub server instead of
+// api.github.com.
+var newGitHubValidationClient = func(ctx context.Context, token string) *github.Client {
+	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
+	tc := oauth2.NewClient(ctx, ts)
+	client := github.NewClient(tc)
+	client.UserAgent = fmt.Sprintf("%s v%s", Name, Version)
+	return client
 }
 
 // AddGitHubToken adds a new GitHub token to the pool dynamically.
@@ -413,7 +555,19 @@ func (s *Session) AddGitHubToken(token string) bool {
 		s.TokenMutex.Unlock()
 		return false
 	}
-	if !strings.HasPrefix(token, "ghp_") && !strings.HasPrefix(token, "github_pat_") {
+	// Every bearer format the shipped signatures recognise (classic PAT,
+	// OAuth, user/server app tokens, refresh token, fine-grained PAT) is
+	// accepted: they all authenticate a GET /user call. Rejecting some here
+	// while the extractor and detector accept them silently skipped validation.
+	githubTokenPrefixes := []string{"ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"}
+	knownPrefix := false
+	for _, p := range githubTokenPrefixes {
+		if strings.HasPrefix(token, p) {
+			knownPrefix = true
+			break
+		}
+	}
+	if !knownPrefix {
 		s.TokenMutex.Unlock()
 		return false
 	}
@@ -424,14 +578,46 @@ func (s *Session) AddGitHubToken(token string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
-	tc := oauth2.NewClient(ctx, ts)
-	client := github.NewClient(tc)
-	client.UserAgent = fmt.Sprintf("%s v%s", Name, Version)
+	client := newGitHubValidationClient(ctx, token)
 
 	if _, _, err := client.Users.Get(ctx, ""); err != nil {
 		s.Log.Warn("Failed to validate new token %s[..]: %s", MaskToken(token), err)
+		// Roll the claim back. The token was marked FoundTokens before the
+		// validating request; a transient failure (timeout, rate limit, DNS
+		// blip) must not permanently refuse an otherwise-valid token, so a
+		// later encounter re-queues it for validation.
+		s.TokenMutex.Lock()
+		delete(s.FoundTokens, token)
+		s.TokenMutex.Unlock()
 		return false
+	}
+
+	// The token validated against the GitHub API: persist it like every other
+	// verified credential. Previously a valid GitHub token only got an Info
+	// line and never reached logs/priority3.log, so validated GitHub tokens
+	// never showed up in the logs.
+	if s.TokenValidator != nil {
+		if err := s.TokenValidator.SaveValidToken(token, ProviderGithub, "Valid GitHub Token"); err != nil {
+			s.Log.Warn("Failed to save valid GitHub token %s[..]: %s", MaskToken(token), err)
+		} else {
+			s.Log.LogWithColor("#10A37F", "✓ %s token is VALID!", ProviderGithub)
+			s.Log.Important("Response: %s", "Valid GitHub Token")
+			s.Log.Important("✅ Valid token saved to logs/priority3.log")
+		}
+		// Announce the verdict through the validator's callback contract,
+		// exactly as TestAndLogToken does. Without this a validated GitHub
+		// token never reached the web Tokens tab or the outcome cache, and
+		// its finding kept the priority-fallback severity.
+		masked := token
+		if len(token) > 20 {
+			masked = token[:17] + "..."
+		}
+		if s.TokenValidator.OnTokenResult != nil {
+			s.TokenValidator.OnTokenResult(masked, true, ProviderGithub)
+		}
+		if s.TokenValidator.OnOutcome != nil {
+			s.TokenValidator.OnOutcome(masked, ProviderGithub, verifiers.Outcome{Status: verifiers.Valid, Detail: "Valid GitHub Token"})
+		}
 	}
 
 	s.TokenMutex.Lock()

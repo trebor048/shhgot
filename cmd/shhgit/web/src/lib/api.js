@@ -51,21 +51,14 @@ export function del(path) {
 export const api = {
   snapshot: () => getJSON('/api/ws'),
   stats: () => getJSON('/api/stats'),
-  matches: (filters = {}) => {
-    const q = new URLSearchParams()
-    for (const [k, v] of Object.entries(filters)) {
-      if (v !== '' && v != null) q.set(k, v)
-    }
-    const qs = q.toString()
-    return getJSON(`/api/matches${qs ? `?${qs}` : ''}`)
-  },
   logs: () => getJSON('/api/logs'),
+  suppressed: () => getJSON('/api/suppressed'),
   tokens: () => getJSON('/api/tokens'),
-  signatures: () => getJSON('/api/signatures'),
   activity: () => getJSON('/api/activity'),
   skipRepo: (url) => postJSON('/api/activity/skip', { url }),
   scanProgress: () => getJSON('/api/scan/progress'),
   regexStats: () => getJSON('/api/stats/regex'),
+  metrics: () => getJSON('/api/metrics'),
   file: (id) => getJSON(`/api/file?id=${encodeURIComponent(id)}`),
 
   reviewList: () => getJSON('/api/review'),

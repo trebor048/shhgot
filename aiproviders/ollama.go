@@ -103,7 +103,9 @@ func (c *ollamaClient) chat(ctx context.Context, msgs []Message, maxTokens int) 
 
 	var out ollamaChatResponse
 	if err := json.Unmarshal(data, &out); err != nil {
-		return "", fmt.Errorf("%s: decode response: %w (body: %s)", c.name, err, snippet(data))
+		// No body echo: a 200 reply that is not JSON comes from the
+		// operator's own gateway/proxy, which may echo the reviewed finding.
+		return "", fmt.Errorf("%s: decode response (%d bytes): %w", c.name, len(data), err)
 	}
 	if out.Error != "" {
 		return "", fmt.Errorf("%s: %s", c.name, out.Error)
@@ -153,7 +155,8 @@ func (c *ollamaClient) Stream(ctx context.Context, msgs []Message, onDelta func(
 
 		var chunk ollamaChatResponse
 		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
-			return fmt.Errorf("%s: decode stream chunk: %w (data: %s)", c.name, err, snippet([]byte(line)))
+			// No payload echo, same reason as the non-streaming path above.
+			return fmt.Errorf("%s: decode stream chunk (%d bytes): %w", c.name, len(line), err)
 		}
 		if chunk.Error != "" {
 			return fmt.Errorf("%s: %s", c.name, chunk.Error)

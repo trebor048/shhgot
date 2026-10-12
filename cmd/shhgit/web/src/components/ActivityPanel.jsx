@@ -41,13 +41,28 @@ function RepoRow({ item, phase, onSkip }) {
 export default function ActivityPanel({ activity }) {
   const [progress, setProgress] = useState(null)
   const [regex, setRegex] = useState(null)
+  const [stale, setStale] = useState(false)
   const toast = useToast()
 
   useEffect(() => {
     let cancelled = false
     const load = () => {
-      api.scanProgress().then((d) => !cancelled && setProgress(d)).catch(() => {})
-      api.regexStats().then((d) => !cancelled && setRegex(d)).catch(() => {})
+      api.scanProgress().then((d) => {
+        if (cancelled) return
+        setProgress(d)
+        setStale(false)
+      }).catch(() => {
+        // Surface the outage: without this the panel reads "Idle" with
+        // zeros forever and "unreachable" is indistinguishable from "idle".
+        if (!cancelled) setStale(true)
+      })
+      api.regexStats().then((d) => {
+        if (cancelled) return
+        setRegex(d)
+        setStale(false)
+      }).catch(() => {
+        if (!cancelled) setStale(true)
+      })
     }
     load()
     const id = setInterval(load, 2000)
@@ -72,6 +87,7 @@ export default function ActivityPanel({ activity }) {
       <div>
         <h3 className="text-xs uppercase tracking-wide text-slate-500 mb-2 flex items-center gap-1.5">
           <Gauge size={13} /> Scanner progress
+          {stale && <span className="ml-2 text-yellow-400 normal-case">(live stats unavailable)</span>}
         </h3>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
           <Stat label="Repositories scanned" value={(progress?.repos_scanned || 0).toLocaleString()} />
@@ -97,12 +113,14 @@ export default function ActivityPanel({ activity }) {
           <div className="h-2 bg-slate-800 rounded overflow-hidden">
             <div className="h-full bg-gradient-to-r from-cyan-500 to-blue-500 transition-all" style={{ width: `${pct}%` }} />
           </div>
-          {progress?.current_repo && (
-            <div className="mt-2 text-[11px] text-slate-500 break-all">
-              {shortRepo(progress.current_repo)}
-              {progress.current_file ? ` › ${progress.current_file}` : ''}
-            </div>
-          )}
+          <div className="mt-2 text-[11px] text-slate-500 truncate min-h-[18px]">
+            {progress?.current_repo ? (
+              <>
+                {shortRepo(progress.current_repo)}
+                {progress.current_file ? ` › ${progress.current_file}` : ''}
+              </>
+            ) : null}
+          </div>
         </div>
       </div>
 
@@ -119,20 +137,24 @@ export default function ActivityPanel({ activity }) {
           <h3 className="text-xs uppercase tracking-wide text-slate-500 mb-2 flex items-center gap-1.5">
             <Download size={13} /> Fetching ({a.fetching?.length || 0})
           </h3>
-          {(a.fetching || []).length === 0 && <div className="text-xs text-slate-600 italic">idle</div>}
-          {(a.fetching || []).map((it, i) => (
-            <RepoRow key={`${it.url}-${i}`} item={it} phase="fetching" onSkip={skip} />
-          ))}
+          <div className="h-48 overflow-y-auto pr-1">
+            {(a.fetching || []).length === 0 && <div className="text-xs text-slate-600 italic">idle</div>}
+            {(a.fetching || []).map((it, i) => (
+              <RepoRow key={`${it.url}-${i}`} item={it} phase="fetching" onSkip={skip} />
+            ))}
+          </div>
         </div>
 
         <div>
           <h3 className="text-xs uppercase tracking-wide text-slate-500 mb-2 flex items-center gap-1.5">
             <FileSearch size={13} /> Scanning ({a.scanning?.length || 0})
           </h3>
-          {(a.scanning || []).length === 0 && <div className="text-xs text-slate-600 italic">idle</div>}
-          {(a.scanning || []).map((it, i) => (
-            <RepoRow key={`${it.url}-${i}`} item={it} phase="scanning" onSkip={skip} />
-          ))}
+          <div className="h-48 overflow-y-auto pr-1">
+            {(a.scanning || []).length === 0 && <div className="text-xs text-slate-600 italic">idle</div>}
+            {(a.scanning || []).map((it, i) => (
+              <RepoRow key={`${it.url}-${i}`} item={it} phase="scanning" onSkip={skip} />
+            ))}
+          </div>
         </div>
       </div>
 

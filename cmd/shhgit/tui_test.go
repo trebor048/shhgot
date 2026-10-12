@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/trebor048/shhgot/core/verifiers"
 	"github.com/trebor048/shhgot/reviewstore"
 )
 
@@ -511,6 +512,52 @@ func TestTUIViewTinyTerminalShowsTooSmallMessage(t *testing.T) {
 		hh.push(tuiTestMatch("m1", "所有者/日本語リポジトリ", "ディレクトリ/秘密鍵.go", 3, "ghp_日本語トークン", "秘密の署名", 3, time.Now()))
 		assertFrameWidths(t, hh.frame(), sz[0], sz[1])
 	}
+}
+
+// TestTUIViewShowsSeverityLabelNextToSignature pins Slice 6's TUI surface: the
+// dynamic severity is rendered beside the signature, distinct from the rule
+// priority badge.
+func TestTUIViewShowsSeverityLabelNextToSignature(t *testing.T) {
+	h := newTUIHarness(t, 140, 30)
+	m := tuiTestMatch("m1", "acme/webapp", "internal/config/db.go", 42,
+		"sk-"+"a", "OpenAI API Key", 1, time.Now())
+	m.Severity = "critical"
+	h.push(m)
+
+	frame := h.frame()
+	if !strings.Contains(frame, "[sev:critical]") {
+		t.Errorf("severity label is missing from the finding row:\n%s", frame)
+	}
+	// Priority stays visible and distinct.
+	if !strings.Contains(frame, "MED") {
+		t.Errorf("rule priority badge is missing:\n%s", frame)
+	}
+	assertFrameWidths(t, frame, 140, 30)
+}
+
+// TestTUIOutcomeUpdatesSeverityLabel covers the live path: a verifier outcome
+// that arrives after the finding was queued must upgrade the rendered severity.
+func TestTUIOutcomeUpdatesSeverityLabel(t *testing.T) {
+	h := newTUIHarness(t, 140, 30)
+	secret := "sk-" + strings.Repeat("a", 48)
+	m := tuiTestMatch("m1", "o/r", "creds.env", 3, secret, "OpenAI API Key", 1, time.Now())
+	m.Severity = "medium"
+	h.push(m)
+	if f := h.frame(); !strings.Contains(f, "[sev:medium]") {
+		t.Fatalf("expected the unverified severity label first:\n%s", f)
+	}
+
+	h.b.applyOutcome(maskedOutcomeKey(secret), verifiers.Outcome{
+		Status:  verifiers.Valid,
+		Tier:    "GPT-4",
+		Balance: "$150.00",
+	})
+	h.snapshot()
+
+	if f := h.frame(); !strings.Contains(f, "[sev:critical]") || strings.Contains(f, "[sev:medium]") {
+		t.Errorf("verified severity did not replace the label:\n%s", f)
+	}
+	assertFrameWidths(t, h.frame(), 140, 30)
 }
 
 func TestTUIViewTruncationIsRuneSafeAtNarrowWidths(t *testing.T) {

@@ -3,9 +3,11 @@ module github.com/trebor048/shhgot
 go 1.26.0
 
 require (
+	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1
 	github.com/fatih/color v1.7.0
 	github.com/google/go-github v17.0.0+incompatible
 	golang.org/x/crypto v0.36.0
+	golang.org/x/net v0.38.0
 	golang.org/x/oauth2 v0.12.0
 	golang.org/x/term v0.40.0
 	gopkg.in/src-d/go-git.v4 v4.13.1
@@ -13,7 +15,6 @@ require (
 )
 
 require (
-	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1 // indirect
 	github.com/emirpasic/gods v1.12.0 // indirect
 	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/google/go-querystring v1.0.0 // indirect
@@ -28,7 +29,6 @@ require (
 	github.com/src-d/gcfg v1.4.0 // indirect
 	github.com/stretchr/testify v1.8.1 // indirect
 	github.com/xanzy/ssh-agent v0.2.1 // indirect
-	golang.org/x/net v0.38.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/text v0.30.0 // indirect
 	google.golang.org/appengine v1.6.7 // indirect

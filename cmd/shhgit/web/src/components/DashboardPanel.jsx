@@ -12,6 +12,7 @@ import {
   YAxis,
 } from 'recharts'
 import { relTime } from '../lib/format'
+import MetricsPanel from './MetricsPanel'
 
 const tooltipStyle = {
   backgroundColor: '#0f172a',
@@ -148,6 +149,8 @@ export default function DashboardPanel({ matches, stats }) {
           <div className="text-xs text-slate-500 mt-1">distinct sources</div>
         </MiniCard>
       </div>
+
+      <MetricsPanel />
     </div>
   )
 }

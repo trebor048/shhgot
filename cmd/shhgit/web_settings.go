@@ -3,12 +3,18 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/trebor048/shhgot/aiproviders"
 )
+
+// errNoTrailingData is returned when a JSON body holds data past the first
+// value.
+var errNoTrailingData = errors.New("unexpected data after JSON value")
 
 // maxJSONBody caps request bodies for the settings and review APIs. The
 // dashboard sends small JSON objects; anything larger is a mistake or abuse.
@@ -69,18 +75,22 @@ func newSettingsView(s aiproviders.Settings) settingsView {
 // mergeSettings applies a browser-supplied update to the stored settings.
 //
 // Rules: an empty api_key keeps the stored key (so the UI never has to round trip
-// a secret), an omitted base_url/model keeps the stored endpoint, and an explicit
-// empty base_url/model means "use the provider default" rather than "blank it".
-func mergeSettings(cur aiproviders.Settings, in settingsUpdate) aiproviders.Settings {
+// a secret) unless the provider is switched, an omitted base_url/model keeps the
+// stored endpoint, and an explicit empty base_url/model means "use the provider
+// default" rather than "blank it".
+func mergeSettings(cur aiproviders.Settings, in settingsUpdate) (aiproviders.Settings, error) {
 	next := cur
 	if p := strings.ToLower(strings.TrimSpace(in.Provider)); p != "" {
 		next.Provider = p
-		// Switching provider must not inherit the previous provider's endpoint
-		// or model; the provider default is the sane starting point.
+		// Switching provider must not inherit the previous provider's endpoint,
+		// model or key; all three are provider-scoped, and a key silently sent to
+		// a different vendor is a credential disclosure. A key supplied in this
+		// same request is applied below.
 		if p != strings.ToLower(cur.Provider) {
 			d := aiproviders.Defaults(p)
 			next.BaseURL = d.BaseURL
 			next.Model = d.Model
+			next.APIKey = ""
 		}
 	}
 	if k := strings.TrimSpace(in.APIKey); k != "" {
@@ -89,6 +99,10 @@ func mergeSettings(cur aiproviders.Settings, in settingsUpdate) aiproviders.Sett
 	def := aiproviders.Defaults(next.Provider)
 	if in.BaseURL != nil {
 		if v := strings.TrimSpace(*in.BaseURL); v != "" {
+			// The endpoint is operator-supplied and this API is bound to
+			// loopback, so a private/LAN host (Ollama on a GPU box) is a normal
+			// setup, not SSRF. aiproviders.New/Set validate it as an absolute
+			// http(s) URL with a host before it is stored.
 			next.BaseURL = v
 		} else {
 			next.BaseURL = def.BaseURL
@@ -101,7 +115,7 @@ func mergeSettings(cur aiproviders.Settings, in settingsUpdate) aiproviders.Sett
 			next.Model = def.Model
 		}
 	}
-	return next
+	return next, nil
 }
 
 func registerSettingsRoutes(mux *http.ServeMux) {
@@ -140,7 +154,11 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		next := mergeSettings(cur, in)
+		next, err := mergeSettings(cur, in)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 
 		// Judge the configuration the operator will actually get: the values being
 		// saved plus their per-field environment fallbacks. Validating `next` by
@@ -198,7 +216,11 @@ func settingsTestHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	candidate := mergeSettings(cur, in)
+	candidate, err := mergeSettings(cur, in)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
@@ -214,9 +236,18 @@ func settingsTestHandler(w http.ResponseWriter, r *http.Request) {
 // --- small JSON helpers shared by the review and settings APIs ---
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
+	// Marshal before writing the header so a JSON failure can become a clean 500
+	// instead of a truncated 200 body.
+	b, err := json.Marshal(v)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "marshal failed"})
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(b)
 }
 
 func writeJSONError(w http.ResponseWriter, code int, msg string) {
@@ -224,10 +255,30 @@ func writeJSONError(w http.ResponseWriter, code int, msg string) {
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
+	return decodeJSONInner(w, r, v, true)
+}
+
+// decodeJSONPermissive is decodeJSON without unknown-field rejection, for
+// routes that accept payloads from external tools (/api/push takes a Match
+// from any producer): a newer producer's extra field must not become a 400.
+// The body cap and trailing-data rejection still apply.
+func decodeJSONPermissive(w http.ResponseWriter, r *http.Request, v any) error {
+	return decodeJSONInner(w, r, v, false)
+}
+
+func decodeJSONInner(w http.ResponseWriter, r *http.Request, v any, strict bool) error {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBody))
-	dec.DisallowUnknownFields()
+	if strict {
+		dec.DisallowUnknownFields()
+	}
 	if err := dec.Decode(v); err != nil {
 		return err
+	}
+	// Reject trailing garbage after the first JSON value: without this a
+	// body of `<valid object><junk>` decodes as the object and the junk is
+	// silently ignored.
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return errNoTrailingData
 	}
 	return nil
 }

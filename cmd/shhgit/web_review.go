@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -22,6 +21,15 @@ import (
 // reviewTimeout bounds one review or follow-up call. Without it a hung provider
 // would leave a review stuck in "running" forever.
 const reviewTimeout = 5 * time.Minute
+
+// maxConcurrentReviews caps simultaneous provider streams. Each review holds a
+// slot until it finishes or reviewTimeout fires.
+const maxConcurrentReviews = 4
+
+// reviewStreams is the counting semaphore for provider streams. startReview
+// takes a slot for the whole stream; chat turns stream inside their HTTP
+// handler, which the server's own connection limits already bound.
+var reviewStreams = make(chan struct{}, maxConcurrentReviews)
 
 const defaultReviewSystemPrompt = `You are a senior application security engineer triaging a credential that a secret scanner just found in a code repository.
 
@@ -93,6 +101,58 @@ func reconcileInterruptedReviews(store *reviewstore.Store) int {
 	return reconciled
 }
 
+// resolveAndValidateReviewDir resolves the review directory to an absolute path
+// and ensures it resides within the user's home directory (or STORE_BASE_DIR
+// env var). This prevents path traversal via config like "../../../etc/shhgit".
+func resolveAndValidateReviewDir(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("ai-review: resolve dir: %w", err)
+	}
+	// A relative review_dir (the built-in "ai_review" default) resolves against
+	// the process working directory, which is not necessarily under the home
+	// directory; requiring it to sit under $HOME made AI review silently
+	// unavailable whenever the scanner ran from, say, /opt or D:\. A relative
+	// path is accepted as long as it carries no parent ("..") component, so
+	// traversal is still refused. Absolute paths must still live inside the
+	// allowed base directory.
+	if !filepath.IsAbs(dir) {
+		if hasParentComponent(dir) {
+			return "", fmt.Errorf("ai-review: dir %q escapes allowed base directory", abs)
+		}
+		return abs, nil
+	}
+	baseDir := os.Getenv("STORE_BASE_DIR")
+	if baseDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("ai-review: get home dir: %w", err)
+		}
+		baseDir = home
+	}
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", fmt.Errorf("ai-review: resolve base dir: %w", err)
+	}
+	rel, err := filepath.Rel(absBase, abs)
+	if err != nil || isOutsideBase(rel) {
+		return "", fmt.Errorf("ai-review: dir %q escapes allowed base directory %q", abs, absBase)
+	}
+	return abs, nil
+}
+
+// hasParentComponent reports whether p contains a ".." path element.
+func hasParentComponent(p string) bool {
+	clean := filepath.Clean(p)
+	return clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator))
+}
+
+// isOutsideBase mirrors store.isOutsideBase: only the ".." element itself, or a
+// path beginning ".." + separator, escapes a base directory.
+func isOutsideBase(rel string) bool {
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 // initAIReview prepares the review store and the AI settings store. It is
 // called once at startup; a failure is reported but must not stop the scanner,
 // because AI review is an optional feature.
@@ -106,7 +166,12 @@ func initAIReview(cfg *core.Config) error {
 		}
 	}
 
-	reviewsDir := filepath.Join(dir, "reviews")
+	absDir, err := resolveAndValidateReviewDir(dir)
+	if err != nil {
+		return fmt.Errorf("ai-review: %w", err)
+	}
+
+	reviewsDir := filepath.Join(absDir, "reviews")
 	if err := os.MkdirAll(reviewsDir, 0o700); err != nil {
 		return fmt.Errorf("create review directory: %w", err)
 	}
@@ -119,12 +184,18 @@ func initAIReview(cfg *core.Config) error {
 	if n := reconcileInterruptedReviews(st); n > 0 {
 		log.Printf("[ai-review] marked %d interrupted review(s) as failed", n)
 	}
+	// A review file that could not be read or parsed is skipped rather than
+	// failing the whole store; surface the count so a lost review is visible
+	// to the operator instead of silently missing from the dashboard.
+	if n := st.Skipped(); n > 0 {
+		log.Printf("[ai-review] skipped %d unreadable review file(s) on open", n)
+	}
 
 	if p := strings.TrimSpace(ai.SystemPrompt); p != "" {
 		reviewPrompt = p
 	}
 
-	store := aiproviders.NewStore(filepath.Join(dir, "settings.json"))
+	store := aiproviders.NewStore(filepath.Join(absDir, "settings.json"))
 	aiSettingsStore = store
 
 	// config.yaml seeds the settings file once. After that the dashboard owns
@@ -136,7 +207,7 @@ func initAIReview(cfg *core.Config) error {
 		// Fill anything config.yaml left blank from the single-backend chat
 		// config this release replaced, so an upgrade keeps the provider, key
 		// and prompt that were already working.
-		legacy, legacyPrompt, hasLegacy := legacyChatSettings(dir)
+		legacy, legacyPrompt, hasLegacy := legacyChatSettings(absDir)
 		if hasLegacy {
 			if seed.Provider == "" {
 				seed.Provider = legacy.Provider
@@ -294,6 +365,11 @@ type reviewRequest struct {
 	URL       string `json:"url"`
 	Repo      string `json:"repo"`
 	Context   string `json:"context"`
+	// BaseURL and Severity are the scanner metadata the dashboard holds for the
+	// match (Slice 4): the ranked relay/Azure endpoint extracted around the
+	// finding and its dynamic severity. Both are optional.
+	BaseURL  string `json:"base_url"`
+	Severity string `json:"severity"`
 }
 
 // reviewView is what the dashboard receives for a review.
@@ -415,7 +491,7 @@ func reviewCollectionHandler(w http.ResponseWriter, r *http.Request) {
 			File:      strings.TrimSpace(in.File),
 			URL:       strings.TrimSpace(in.URL),
 			Repo:      strings.TrimSpace(in.Repo),
-			Context:   in.Context,
+			Context:   withFindingMeta(in.BaseURL, in.Severity, in.Context),
 			Provider:  settings.Provider,
 			Model:     effectiveModel(settings),
 			Status:    reviewstore.StatusQueued,
@@ -473,15 +549,9 @@ func reviewItemHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			writeJSON(w, http.StatusOK, viewOf(rev, true))
 		case http.MethodDelete:
-			// Only tear down the job once the review is known to exist. Dropping it
-			// first meant a 404 for an unknown id could still have destroyed a
-			// running job, so a stream request arriving in between found no job,
-			// lost the live deltas and was told the review was not running.
-			if _, exists := reviewStore.Get(id); !exists {
-				writeJSONError(w, http.StatusNotFound, "no such review")
-				return
-			}
-			dropJob(id)
+			// Remove the persisted review first; only tear down the in-memory job
+			// once deletion succeeds. Dropping the job before a store failure would
+			// leave a review that claims to be running but has no worker.
 			if err := reviewStore.Delete(id); err != nil {
 				// The store reports a missing review and an invalid id with the
 				// same wrapped os.ErrNotExist, so errors.Is is the way to tell
@@ -493,6 +563,7 @@ func reviewItemHandler(w http.ResponseWriter, r *http.Request) {
 				writeJSONError(w, http.StatusInternalServerError, "could not delete the review: "+err.Error())
 				return
 			}
+			dropJob(id)
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		default:
 			w.Header().Set("Allow", "GET, DELETE")
@@ -531,6 +602,23 @@ func reviewItemHandler(w http.ResponseWriter, r *http.Request) {
 func startReview(rev *reviewstore.Review, client aiproviders.Client) {
 	store := reviewStore
 	if store == nil || client == nil {
+		return
+	}
+	// Cap concurrent provider streams: every review holds one until the
+	// 5-minute timeout, so unthrottled creation (double-clicks, scripts)
+	// would exhaust connections/file descriptors. A rejected review fails
+	// visibly with a retry message instead of starving the running ones.
+	select {
+	case reviewStreams <- struct{}{}:
+		defer func() { <-reviewStreams }()
+	default:
+		msg := "too many reviews running; wait for one to finish and retry"
+		if err := store.SetResult(rev.ID, reviewstore.StatusFailed, "", msg); err != nil {
+			log.Printf("[ai-review] could not fail overloaded review %s: %v", rev.ID, err)
+		}
+		if fresh, ok := store.Get(rev.ID); ok {
+			broadcastReview(fresh)
+		}
 		return
 	}
 	// Read the package-level prompt and store once, here, rather than from the
@@ -603,16 +691,28 @@ func startReview(rev *reviewstore.Review, client aiproviders.Client) {
 
 // buildReviewMessages assembles the analysis prompt for a fresh review.
 func buildReviewMessages(rev *reviewstore.Review, system string) []aiproviders.Message {
+	baseURL, severity, body := splitFindingMeta(rev.Context)
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "Repository: %s\n", orUnknown(rev.Repo))
 	fmt.Fprintf(&b, "File: %s\n", orUnknown(rev.File))
 	fmt.Fprintf(&b, "Source URL: %s\n", orUnknown(rev.URL))
+	// The ranked endpoint and the severity belong in the finding description,
+	// not the file content: they are scanner metadata. An absent value adds no
+	// line at all rather than an empty "Base URL: (unknown)" the model might
+	// read as a fact.
+	if baseURL != "" {
+		fmt.Fprintf(&b, "Base URL: %s\n", baseURL)
+	}
+	if severity != "" {
+		fmt.Fprintf(&b, "Severity: %s\n", severity)
+	}
 	fmt.Fprintf(&b, "Detected signature: %s\n", orUnknown(rev.Signature))
 	fmt.Fprintf(&b, "Detected value: %s\n", orUnknown(rev.Secret))
-	if rev.Context != "" {
-		b.WriteString(contextHeading(rev.Context))
-		b.WriteString(rev.Context)
-		if !strings.HasSuffix(rev.Context, "\n") {
+	if body != "" {
+		b.WriteString(contextHeading(body))
+		b.WriteString(body)
+		if !strings.HasSuffix(body, "\n") {
 			b.WriteString("\n")
 		}
 		b.WriteString("--- end of supplied context ---")
@@ -637,7 +737,72 @@ const (
 	scannerNotesMarker = "--- scanner notes, not part of the file ---"
 	// noFileBodyMarker is written when only the summary exists.
 	noFileBodyMarker = "--- no file content was captured for this finding ---"
+
+	// findingMetaMarker opens the small metadata block prepended to a review's
+	// stored context when the scanner captured a ranked base URL or a severity
+	// for the finding (Slice 4). A review record can only carry text in
+	// Context, so the block is the durable carrier; buildReviewMessages lifts
+	// it into the finding description and out of the context body. Older
+	// records simply lack the block and are unaffected.
+	findingMetaMarker = "--- finding metadata ---"
+	// findingMetaEndMarker closes that block.
+	findingMetaEndMarker = "--- end of finding metadata ---"
 )
+
+// withFindingMeta prepends the finding metadata block to context. It returns
+// context unchanged when neither value is present, so a review with no such
+// data keeps the exact stored shape records written before this change have.
+func withFindingMeta(baseURL, severity, context string) string {
+	baseURL = strings.TrimSpace(oneLine(baseURL))
+	severity = strings.TrimSpace(oneLine(severity))
+	if baseURL == "" && severity == "" {
+		return context
+	}
+	var b strings.Builder
+	b.WriteString(findingMetaMarker)
+	b.WriteString("\n")
+	if baseURL != "" {
+		fmt.Fprintf(&b, "base_url: %s\n", baseURL)
+	}
+	if severity != "" {
+		fmt.Fprintf(&b, "severity: %s\n", severity)
+	}
+	b.WriteString(findingMetaEndMarker)
+	if context != "" {
+		b.WriteString("\n")
+		b.WriteString(context)
+	}
+	return b.String()
+}
+
+// splitFindingMeta separates the metadata block from the context body. A record
+// with no block (every review written before this change) is returned whole, so
+// nothing about the old prompt shape changes.
+func splitFindingMeta(context string) (baseURL, severity, body string) {
+	head, rest, found := strings.Cut(context, findingMetaMarker+"\n")
+	if !found || strings.TrimSpace(head) != "" {
+		return "", "", context
+	}
+	block, body, ok := strings.Cut(rest, findingMetaEndMarker)
+	if !ok {
+		// A truncated block is safer treated as body text than silently dropped.
+		return "", "", context
+	}
+	body = strings.TrimPrefix(body, "\n")
+	for _, line := range strings.Split(block, "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "base_url":
+			baseURL = strings.TrimSpace(value)
+		case "severity":
+			severity = strings.TrimSpace(value)
+		}
+	}
+	return baseURL, severity, body
+}
 
 // contextHeading introduces a review's stored context in the prompt.
 //
@@ -978,7 +1143,11 @@ func sseHeaders(w http.ResponseWriter) http.Flusher {
 	return f
 }
 
-func sseSend(w io.Writer, f http.Flusher, v any) error {
+func sseSend(w http.ResponseWriter, f http.Flusher, v any) error {
+	// Refresh the write deadline so a client that stops reading (but keeps the
+	// connection open) cannot block this handler forever - which would leak the
+	// goroutine, the socket and the job's subscriber entry.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(30 * time.Second))
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err

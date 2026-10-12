@@ -2,6 +2,7 @@ package main
 
 import (
 	"embed"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"net/http"
@@ -74,9 +75,15 @@ func serveWebUI(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(webUIIndex)
 
 	case strings.HasPrefix(r.URL.Path, "/assets/"):
-		// Vite emits content-hashed filenames, so a long immutable cache is safe.
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-		webUIAssets.ServeHTTP(w, r)
+		// Reject the directory itself so FileServer cannot render a listing of
+		// the bundle filenames.
+		if strings.HasSuffix(r.URL.Path, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		// Vite emits content-hashed filenames, so a long immutable cache is safe
+		// for 200s. The wrapper prevents a 404 from being cached as immutable.
+		webUIAssets.ServeHTTP(&cacheOnlyOnSuccess{ResponseWriter: w}, r)
 
 	case r.URL.Path == "/favicon.ico":
 		w.WriteHeader(http.StatusNoContent)
@@ -84,11 +91,45 @@ func serveWebUI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/api/"):
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprintf(w, `{"error":"no such endpoint","path":%q}`, r.URL.Path)
+		writeNoSuchEndpoint(w, r.URL.Path)
 
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// cacheOnlyOnSuccess wraps an http.ResponseWriter so that the immutable asset
+// cache header is only attached to 2xx responses. Without this, a request for a
+// missing hashed asset (404) would still carry Cache-Control: immutable and
+// could be cached by a browser/proxy for a year.
+type cacheOnlyOnSuccess struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (c *cacheOnlyOnSuccess) WriteHeader(code int) {
+	if c.wroteHeader {
+		return
+	}
+	c.wroteHeader = true
+	if code >= 200 && code < 300 {
+		c.ResponseWriter.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	}
+	c.ResponseWriter.WriteHeader(code)
+}
+
+func (c *cacheOnlyOnSuccess) Write(p []byte) (int, error) {
+	if !c.wroteHeader {
+		c.WriteHeader(http.StatusOK)
+	}
+	return c.ResponseWriter.Write(p)
+}
+
+// json.Marshal is used rather than %q so control characters in the path become
+// valid JSON escapes (\u00XX) instead of Go's \xNN, which a JSON parser rejects.
+func writeNoSuchEndpoint(w http.ResponseWriter, path string) {
+	body, _ := json.Marshal(map[string]string{"error": "no such endpoint", "path": path})
+	_, _ = w.Write(body)
 }
 
 // serveLegacyDashboard serves the original self-contained dashboard embedded
@@ -102,7 +143,7 @@ func serveLegacyDashboard(w http.ResponseWriter, r *http.Request) {
 		case strings.HasPrefix(r.URL.Path, "/api/"):
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprintf(w, `{"error":"no such endpoint","path":%q}`, r.URL.Path)
+			writeNoSuchEndpoint(w, r.URL.Path)
 		default:
 			http.NotFound(w, r)
 		}

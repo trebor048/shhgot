@@ -94,6 +94,11 @@ func takesValue(arg string) bool {
 // scanModeArgs applies the mode flags found in args to cfg.
 func scanModeArgs(args []string, cfg *ModeConfig) {
 	for i := 0; i < len(args); i++ {
+		// "--" terminates flag parsing: everything after it is a positional
+		// argument, exactly as Go's flag package treats it.
+		if args[i] == "--" {
+			break
+		}
 		name, value, hasValue := splitFlagArg(args[i])
 		switch name {
 		case "":
@@ -137,6 +142,12 @@ func scanModeArgs(args []string, cfg *ModeConfig) {
 func (mc *ModeConfig) RemoveModeFlags() {
 	newArgs := []string{os.Args[0]}
 	for i := 1; i < len(os.Args); i++ {
+		// The bare "--" terminator ends flag parsing; keep it and everything
+		// after it verbatim so the flag package sees the same positional args.
+		if os.Args[i] == "--" {
+			newArgs = append(newArgs, os.Args[i:]...)
+			break
+		}
 		name, _, hasValue := splitFlagArg(os.Args[i])
 		switch name {
 		case "web", "tui", "terminal", "scanner":

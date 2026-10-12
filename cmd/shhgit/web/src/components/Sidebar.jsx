@@ -1,8 +1,9 @@
 import React, { useMemo } from 'react'
 import { Filter, Search, X } from 'lucide-react'
-import { priorityMeta } from '../lib/format'
+import { SEVERITY, priorityMeta, severityMeta } from '../lib/format'
 
 const PRIORITIES = [3, 2, 1, 0]
+const SEVERITIES = Object.keys(SEVERITY)
 
 export default function Sidebar({ isOpen, onClose, stats, filters, setFilters }) {
   const sources = useMemo(
@@ -20,7 +21,7 @@ export default function Sidebar({ isOpen, onClose, stats, filters, setFilters })
 
   const set = (patch) => setFilters((f) => ({ ...f, ...patch }))
   const active =
-    filters.search || filters.source || filters.signature || filters.priority !== ''
+    filters.search || filters.source || filters.signature || filters.priority !== '' || filters.severity
 
   return (
     <>
@@ -41,7 +42,7 @@ export default function Sidebar({ isOpen, onClose, stats, filters, setFilters })
           <div className="flex items-center gap-2">
             {active && (
               <button
-                onClick={() => set({ search: '', source: '', signature: '', priority: '' })}
+                onClick={() => set({ search: '', source: '', signature: '', priority: '', severity: '' })}
                 className="text-xs text-cyan-400 hover:text-cyan-300"
               >
                 clear
@@ -107,6 +108,32 @@ export default function Sidebar({ isOpen, onClose, stats, filters, setFilters })
                 )
               })}
             </div>
+          </div>
+
+          <div>
+            <label
+              htmlFor="sidebar-severity"
+              className="block text-xs uppercase tracking-wide text-slate-500 mb-1.5"
+            >
+              Verified severity
+            </label>
+            <select
+              id="sidebar-severity"
+              value={filters.severity || ''}
+              onChange={(e) => set({ severity: e.target.value })}
+              className="w-full px-2 py-1.5 bg-slate-950 border border-slate-700 rounded text-sm focus:outline-none focus:border-cyan-500"
+            >
+              <option value="">All severities</option>
+              {SEVERITIES.map((s) => {
+                const m = severityMeta(s)
+                const n = stats.matches_by_severity?.[s]
+                return (
+                  <option key={s} value={s}>
+                    {n != null ? `${m.label} (${n})` : m.label}
+                  </option>
+                )
+              })}
+            </select>
           </div>
 
           {sources.length > 0 && (

@@ -20,6 +20,9 @@ type Options struct {
 	TempDirectory          *string
 	CsvPath                *string
 	SearchQuery            *string
+	Search                 *bool
+	SearchMaxResults       *int
+	SearchSleepMS          *int
 	Local                  *string
 	Live                   *string
 	ConfigPath             *string
@@ -27,6 +30,13 @@ type Options struct {
 	ScanKeys               *string
 	LowImpact              *bool
 	DryRun                 *bool
+	NoDedupe               *bool
+	NoResume               *bool
+	Export                 *bool
+	ExportFormat           *string
+	ExportEncrypted        *string
+	Decrypt                *string
+	Stats                  *bool
 }
 
 func ParseOptions() (*Options, error) {
@@ -44,6 +54,9 @@ func ParseOptions() (*Options, error) {
 		TempDirectory:          flag.String("temp-directory", filepath.Join(os.TempDir(), Name), "Directory to process and store repositories/matches"),
 		CsvPath:                flag.String("csv-path", "", "CSV file path to log found secrets to. Leave blank to disable"),
 		SearchQuery:            flag.String("search-query", "", "Specify a search string to ignore signatures and filter on files containing this string (regex compatible)"),
+		Search:                 flag.Bool("search", false, "Enable GitHub code-search discovery for this run (overrides search.enabled in config)"),
+		SearchMaxResults:       flag.Int("search-max-results", 0, "Override search.max_results for this run (0 = use config/default)"),
+		SearchSleepMS:          flag.Int("search-sleep-ms", 0, "Override search.sleep_ms for this run (0 = use config/default)"),
 		Local:                  flag.String("local", "", "Specify local directory (absolute path) which to scan. Scans only given directory recursively. No need to have GitHub tokens with local run."),
 		Live:                   flag.String("live", "", "Your shhgit live endpoint"),
 		ConfigPath:             flag.String("config-path", "", "Searches for config.yaml from given directory. If not set, tries to find if from shhgit binary's and current directory"),
@@ -51,6 +64,13 @@ func ParseOptions() (*Options, error) {
 		ScanKeys:               flag.String("scan-keys", "", "Scan a directory for API keys and validate them"),
 		LowImpact:              flag.Bool("low-impact", false, "Reduce CPU priority and worker count so a scan does not make the machine unusable"),
 		DryRun:                 flag.Bool("dry-run", false, "With --local, report what would be scanned and what the blacklists and size caps drop, then exit without reading any file"),
+		NoDedupe:               flag.Bool("no-dedupe", false, "Ignore the findings store's cross-run dedupe index for this run"),
+		NoResume:               flag.Bool("no-resume", false, "Ignore persisted scan cursors and start fresh"),
+		Export:                 flag.Bool("export", false, "Export every finding from the store to stdout and exit"),
+		ExportFormat:           flag.String("export-format", "jsonl", "Format for --export: csv or jsonl"),
+		ExportEncrypted:        flag.String("export-encrypted", "", "Write a passphrase-encrypted export of every finding to this file and exit"),
+		Decrypt:                flag.String("decrypt", "", "Decrypt a passphrase-encrypted export file to stdout and exit"),
+		Stats:                  flag.Bool("stats", false, "Print findings store totals (by severity, top signatures/providers) and exit"),
 	}
 
 	// Mode flags are consumed by the main package's mode system (modes.go).
@@ -64,6 +84,13 @@ func ParseOptions() (*Options, error) {
 	flag.String("web-host", "127.0.0.1", "Web dashboard host")
 
 	flag.Parse()
+
+	// A negative --threads would flow into InitGitHubClients as a negative
+	// channel capacity (make(chan T, n) panics for n < 0). Normalise it to the
+	// unset 0, which InitThreads resolves to one worker per logical CPU.
+	if options.Threads != nil && *options.Threads < 0 {
+		*options.Threads = 0
+	}
 
 	return options, nil
 }

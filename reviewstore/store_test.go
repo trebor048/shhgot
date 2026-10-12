@@ -952,3 +952,22 @@ func TestReviewJSONFieldNames(t *testing.T) {
 		}
 	}
 }
+
+// TestCorruptFilesAreSkippedButCounted proves one unreadable review cannot
+// fail the store, and Skipped() reports the loss instead of hiding it.
+func TestCorruptFilesAreSkippedButCounted(t *testing.T) {
+	_, dir := newTestStore(t)
+	if err := os.WriteFile(reviewPath(dir, "20240101T000000.000000000-aaaa"), []byte("{truncated"), 0600); err != nil {
+		t.Fatalf("write corrupt review: %v", err)
+	}
+	s, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore over corrupt file: %v", err)
+	}
+	if got := s.Skipped(); got != 1 {
+		t.Errorf("Skipped = %d, want 1", got)
+	}
+	if n := len(s.List()); n != 0 {
+		t.Errorf("List = %d reviews, want 0 (corrupt file skipped)", n)
+	}
+}

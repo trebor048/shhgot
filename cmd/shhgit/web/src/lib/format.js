@@ -12,8 +12,51 @@ export function priorityMeta(p) {
   return PRIORITY[p] || PRIORITY[0]
 }
 
-// Relative "3m ago" style timestamp; falls back to a locale time for recent
-// events so a freshly detected match reads as "just now".
+// Verified severity is the scanner's assessment of a captured secret (after
+// validation), which is a different axis from the rule's configured priority.
+// Keys mirror the `severity` strings core.Classify emits: low | medium | high |
+// critical (never "info"). Ordered most- to least-severe so Object.keys is
+// sortable.
+export const SEVERITY = {
+  critical: {
+    key: 'critical',
+    label: 'Critical',
+    dot: 'bg-red-500',
+    text: 'text-red-400',
+    badge: 'text-red-300 bg-red-500/15 border-red-500/40',
+  },
+  high: {
+    key: 'high',
+    label: 'High',
+    dot: 'bg-orange-500',
+    text: 'text-orange-400',
+    badge: 'text-orange-300 bg-orange-500/15 border-orange-500/40',
+  },
+  medium: {
+    key: 'medium',
+    label: 'Medium',
+    dot: 'bg-yellow-500',
+    text: 'text-yellow-300',
+    badge: 'text-yellow-200 bg-yellow-500/15 border-yellow-500/40',
+  },
+  low: {
+    key: 'low',
+    label: 'Low',
+    dot: 'bg-green-500',
+    text: 'text-green-400',
+    badge: 'text-green-300 bg-green-500/15 border-green-500/40',
+  },
+}
+
+// severityMeta normalises the API's severity string (case-insensitively) to its
+// display metadata, or null for an absent/unknown value so a missing severity
+// never renders as a misleading badge.
+export function severityMeta(s) {
+  if (s == null || s === '') return null
+  return SEVERITY[String(s).trim().toLowerCase()] || null
+}
+
+// Relative "3m ago" style timestamp; recent events read as "just now".
 export function relTime(iso) {
   if (!iso) return '-'
   const t = new Date(iso).getTime()
@@ -28,12 +71,6 @@ export function relTime(iso) {
   return `${Math.round(hrs / 24)}d ago`
 }
 
-export function localeTime(iso) {
-  if (!iso) return '-'
-  const d = new Date(iso)
-  return Number.isNaN(d.getTime()) ? '-' : d.toLocaleTimeString()
-}
-
 export function shortRepo(u) {
   if (!u) return ''
   return String(u)
@@ -42,28 +79,9 @@ export function shortRepo(u) {
     .replace(/^www\./, '')
 }
 
-// owner/repo form for compact display.
-export function repoName(u) {
-  const parts = shortRepo(u).split('/')
-  return parts.length >= 3 ? parts.slice(-2).join('/') : shortRepo(u)
-}
-
-export function repoFromUrl(u) {
-  const parts = shortRepo(u).split('/')
-  return parts.length >= 3 ? parts.slice(-2).join('/') : shortRepo(u)
-}
-
 export function short(s, n = 60) {
   s = String(s == null ? '' : s)
   return s.length > n ? s.slice(0, n - 1) + '\u2026' : s
-}
-
-// Mask a captured secret for display: keep a short prefix/suffix so an operator
-// can identify it without the full value sitting on screen or in a screenshot.
-export function maskSecret(v) {
-  const s = String(v == null ? '' : v)
-  if (s.length <= 10) return '*'.repeat(s.length)
-  return s.slice(0, 2) + '*'.repeat(Math.min(24, s.length - 6)) + s.slice(-4)
 }
 
 export function truncateMiddle(s, head = 8, tail = 6) {
@@ -125,32 +143,80 @@ function sgrToClass(params) {
   return classes.length ? classes : null
 }
 
-const ANSI_RE = /\u001B\[([0-9;]*)m/g
+// CSI_FINAL_RE matches a CSI sequence's final byte (the letter that terminates
+// ESC [ params <final>). Used to walk past SGR and every other CSI escape.
+const CSI_FINAL_RE = /[A-Za-z@-~]/
 
-// ansiToRuns returns [{text, className}] runs for one log line. Unknown escape
-// sequences are stripped rather than printed, so raw control bytes never reach
-// the DOM.
+// ansiToRuns returns [{text, className, href}] runs for one log line.
+//
+// The scanner emits three kinds of control sequence into the log ring buffer:
+//   - SGR colour codes (ESC [ ... m), rendered as CSS classes;
+//   - OSC 8 hyperlinks (ESC ] 8 ; params ; URL ST), which wrap a visible label
+//     and are surfaced as a real link so the Logs tab matches the terminal;
+//   - every other escape or control byte, stripped rather than printed so raw
+//     controls never reach the DOM.
 export function ansiToRuns(line) {
   const s = String(line == null ? '' : line)
   const runs = []
-  let last = 0
+  let text = ''
   let classes = []
-  let m
-  ANSI_RE.lastIndex = 0
-  while ((m = ANSI_RE.exec(s)) !== null) {
-    if (m.index > last) {
-      runs.push({ text: s.slice(last, m.index), className: classes.join(' ') })
+  let href = ''
+  let i = 0
+
+  const flush = () => {
+    if (text !== '') {
+      runs.push({ text, className: classes.join(' '), href })
+      text = ''
     }
-    const params = m[1] === '' ? [0] : m[1].split(';').map((x) => parseInt(x, 10) || 0)
-    // null means "unrecognised, keep current style"; [] is an explicit reset.
-    const next = sgrToClass(params)
-    if (next !== null) classes = next
-    last = m.index + m[0].length
   }
-  if (last < s.length) {
-    runs.push({ text: s.slice(last), className: classes.join(' ') })
+
+  while (i < s.length) {
+    const ch = s[i]
+
+    if (ch === '\u001B') {
+      // Close the current run before the sequence changes colour or link state.
+      flush()
+      const next = s[i + 1]
+      if (next === ']') {
+        // OSC sequence: ESC ] ... (BEL | ESC \). Only OSC 8 carries a link URL.
+        let j = i + 2
+        while (j < s.length && s[j] !== '\u0007' && !(s[j] === '\u001B' && s[j + 1] === '\\')) j++
+        const body = s.slice(i + 2, j)
+        const link = /^8;([^;]*);(.*)$/.exec(body)
+        // An empty URL is the closing half of an OSC 8 pair, so it clears href.
+        if (link) href = link[2]
+        i = j < s.length ? (s[j] === '\u0007' ? j + 1 : j + 2) : j
+        continue
+      }
+      if (next === '[') {
+        // CSI sequence: ESC [ params <final>. Only "m" changes colour.
+        let j = i + 2
+        while (j < s.length && !CSI_FINAL_RE.test(s[j])) j++
+        if (s[j] === 'm') {
+          const raw = s.slice(i + 2, j)
+          const params = raw === '' ? [0] : raw.split(';').map((x) => parseInt(x, 10) || 0)
+          // null means "unrecognised, keep current style"; [] is an explicit reset.
+          const chosen = sgrToClass(params)
+          if (chosen !== null) classes = chosen
+        }
+        i = j < s.length ? j + 1 : j
+        continue
+      }
+      // Any other escape: skip the ESC and the byte that follows it.
+      i += next ? 2 : 1
+      continue
+    }
+
+    // Keep tabs and newlines; drop every other C0 control (notably CR, which
+    // white-space: pre-wrap would otherwise render as a spurious line break).
+    if (ch === '\n' || ch === '\t' || ch >= ' ') {
+      text += ch
+    }
+    i++
   }
-  if (runs.length === 0) runs.push({ text: '', className: '' })
+
+  flush()
+  if (runs.length === 0) runs.push({ text: '', className: '', href: '' })
   return runs
 }
 
@@ -165,5 +231,10 @@ export function fmtDuration(secs) {
 }
 
 export function csvEscape(v) {
-  return `"${String(v == null ? '' : v).replace(/"/g, '""')}"`
+  let s = String(v == null ? '' : v)
+  // Neutralise spreadsheet formula injection: Excel/Sheets evaluate a cell that
+  // begins with =, +, -, @ or a leading control char (tab/CR). A leading single
+  // quote forces the cell to be treated as text.
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`
+  return `"${s.replace(/"/g, '""')}"`
 }

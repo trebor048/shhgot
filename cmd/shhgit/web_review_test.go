@@ -128,6 +128,38 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) 
 	t.Fatalf("timed out waiting for %s", msg)
 }
 
+// TestStartReviewRejectsWhenBusy proves review creation degrades visibly under
+// load instead of spawning unbounded provider streams: with every slot held,
+// the review fails fast with a retry message and never touches the provider.
+func TestStartReviewRejectsWhenBusy(t *testing.T) {
+	withReviewEnv(t)
+	for i := 0; i < maxConcurrentReviews; i++ {
+		reviewStreams <- struct{}{}
+	}
+	t.Cleanup(func() {
+		for i := 0; i < maxConcurrentReviews; i++ {
+			<-reviewStreams
+		}
+	})
+
+	rev := &reviewstore.Review{Signature: "X", Secret: "s", Status: reviewstore.StatusQueued}
+	if err := reviewStore.Create(rev); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	fake := &fakeClient{chunks: []string{"hi"}}
+	startReview(rev, fake)
+	if fake.calls != 0 {
+		t.Fatal("busy review reached the provider, want fail-fast")
+	}
+	got, ok := reviewStore.Get(rev.ID)
+	if !ok {
+		t.Fatal("busy review vanished from the store")
+	}
+	if got.Status != reviewstore.StatusFailed || !strings.Contains(got.Error, "too many reviews") {
+		t.Fatalf("busy review = (%s, %q), want failed with retry message", got.Status, got.Error)
+	}
+}
+
 // --- engine ------------------------------------------------------------------
 
 func TestStartReviewStreamsPersistsAndLabels(t *testing.T) {
@@ -926,6 +958,99 @@ func TestPromptSaysWhetherItHasFileContent(t *testing.T) {
 	}
 }
 
+// Slice 4.3: the finding's ranked endpoint and dynamic severity are scanner
+// metadata, so they belong in the finding description, not in the file body.
+// They must appear when the match carries them and add no line at all when it
+// does not - an empty "Base URL:" would read as a fact the model cannot check.
+func TestPromptCarriesBaseURLAndSeverity(t *testing.T) {
+	withMeta := buildReviewMessages(&reviewstore.Review{
+		Signature: "OpenAI API Key",
+		Secret:    "sk-test",
+		File:      "app/.env",
+		Repo:      "acme/app",
+		Context:   withFindingMeta("https://api.relay.example/v1", "high", "OPENAI_API_KEY=sk-test"),
+	}, "system")
+	if len(withMeta) != 2 {
+		t.Fatalf("messages = %d, want 2", len(withMeta))
+	}
+	body := withMeta[1].Content
+	for _, want := range []string{"Base URL: https://api.relay.example/v1", "Severity: high", "OPENAI_API_KEY=sk-test"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("prompt is missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, findingMetaMarker) {
+		t.Errorf("the metadata block leaked into the prompt as raw context:\n%s", body)
+	}
+
+	// Absent metadata: neither line is emitted, and the context still stands.
+	plain := buildReviewMessages(&reviewstore.Review{
+		Signature: "OpenAI API Key", Secret: "sk-test", Context: "OPENAI_API_KEY=sk-test",
+	}, "system")
+	plainBody := plain[1].Content
+	for _, absent := range []string{"Base URL:", "Severity:", findingMetaMarker} {
+		if strings.Contains(plainBody, absent) {
+			t.Errorf("prompt added %q when the match carried no such field:\n%s", absent, plainBody)
+		}
+	}
+	if !strings.Contains(plainBody, "OPENAI_API_KEY=sk-test") {
+		t.Errorf("prompt dropped the context:\n%s", plainBody)
+	}
+
+	// A base URL with no severity still renders, and vice versa.
+	onlyURL := buildReviewMessages(&reviewstore.Review{
+		Signature: "S", Secret: "x", Context: withFindingMeta("https://relay.example", "", "body"),
+	}, "system")[1].Content
+	if !strings.Contains(onlyURL, "Base URL: https://relay.example") || strings.Contains(onlyURL, "Severity:") {
+		t.Errorf("base-url-only rendering is wrong:\n%s", onlyURL)
+	}
+}
+
+// The request carries the scanner's base URL and severity alongside the context
+// (Slice 4). They must survive into the stored review and thus into the prompt,
+// including when the file body is filled in from the dashboard's file cache.
+func TestReviewRequestCarriesFindingMetadata(t *testing.T) {
+	withReviewEnv(t)
+
+	const matchID = "meta-match-1"
+	storeMatchFile(matchID, "https://github.com/acme/app", "app/.env", "OPENAI_API_KEY=sk-test", "sk-test", 1)
+
+	body, _ := json.Marshal(reviewRequest{
+		MatchID:   matchID,
+		Signature: "OpenAI API Key",
+		Secret:    "sk-test",
+		Context:   "scanner summary",
+		BaseURL:   "https://api.relay.example",
+		Severity:  "critical",
+	})
+	rec := httptest.NewRecorder()
+	reviewCollectionHandler(rec, localRequest(http.MethodPost, "/api/review", body))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+
+	rev, ok := reviewStore.Get(created.ID)
+	if !ok {
+		t.Fatal("review was not stored")
+	}
+	// The cached file body must still be there, with the metadata alongside it.
+	if !strings.Contains(rev.Context, "OPENAI_API_KEY=sk-test") {
+		t.Errorf("the cached file body was lost: %q", rev.Context)
+	}
+	prompt := buildReviewMessages(rev, "system")[1].Content
+	for _, want := range []string{"Base URL: https://api.relay.example", "Severity: critical", "OPENAI_API_KEY=sk-test"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt is missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 // An empty bind address must never produce a listening socket on every interface
 // with the loopback guard switched off. Whatever host is used, "the guard is on"
 // has to agree with "bound to loopback".
@@ -1177,6 +1302,31 @@ func TestPushRejectsAnOversizedBody(t *testing.T) {
 	receiveMatch(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d for a %d-byte body, want 400", rec.Code, len(big))
+	}
+}
+
+// Trailing garbage after a valid JSON value must be rejected, not silently
+// ignored; unknown fields from newer producers must still be accepted.
+func TestPushRejectsTrailingDataButToleratesUnknownFields(t *testing.T) {
+	withReviewEnv(t)
+	ensureWebHub()
+
+	junk := `{"signature":"x","secret":"y"} garbage`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/push", strings.NewReader(junk))
+	req.Host = "127.0.0.1:8080"
+	receiveMatch(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d for trailing garbage, want 400", rec.Code)
+	}
+
+	future := `{"signature":"x","secret":"y","some_future_field":"kept"}`
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/push", strings.NewReader(future))
+	req.Host = "127.0.0.1:8080"
+	receiveMatch(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d for unknown fields, want 200", rec.Code)
 	}
 }
 
@@ -1561,5 +1711,29 @@ func TestReviewPromptHasTheFiveRequiredSections(t *testing.T) {
 	}
 	if !strings.Contains(defaultReviewSystemPrompt, "Never repeat the credential") {
 		t.Error("the prompt no longer tells the model not to echo the credential")
+	}
+}
+
+// The built-in relative review_dir ("ai_review") resolves against the working
+// directory, which need not be under $HOME; requiring it to be under the home
+// directory made AI review silently unavailable off-home. Traversal and
+// absolute paths outside the base must still be refused.
+func TestResolveAndValidateReviewDir(t *testing.T) {
+	t.Setenv("STORE_BASE_DIR", t.TempDir())
+
+	if _, err := resolveAndValidateReviewDir("ai_review"); err != nil {
+		t.Fatalf("relative default dir rejected: %v", err)
+	}
+	if _, err := resolveAndValidateReviewDir(filepath.Join("nested", "reviews")); err != nil {
+		t.Fatalf("relative subdir rejected: %v", err)
+	}
+	if _, err := resolveAndValidateReviewDir(filepath.Join("a", "..", "b")); err != nil {
+		t.Fatalf("self-contained relative dir rejected: %v", err)
+	}
+	if _, err := resolveAndValidateReviewDir(filepath.Join("..", "etc", "shhgit")); err == nil {
+		t.Fatal("parent-traversing dir accepted, want error")
+	}
+	if _, err := resolveAndValidateReviewDir(filepath.Join(t.TempDir(), "outside")); err == nil {
+		t.Fatal("absolute dir outside base accepted, want error")
 	}
 }

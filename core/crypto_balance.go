@@ -17,6 +17,8 @@ import (
 	//lint:ignore SA1019 Bitcoin P2PKH addresses are defined as RIPEMD-160(SHA-256(pubkey)); there is no substitute.
 	"golang.org/x/crypto/ripemd160"
 	"golang.org/x/crypto/sha3"
+
+	"github.com/trebor048/shhgot/core/httpclient"
 )
 
 // Real balance verification for leaked private keys.
@@ -140,6 +142,14 @@ type evmRPCResponse struct {
 	} `json:"error"`
 }
 
+// doCryptoRequest sends req through the shared client with client-side pacing
+// disabled. This path owns its own 150ms spacing (paceBalanceLookup), so a
+// second pacer would only add latency on repeated lookups to the same node.
+func doCryptoRequest(req *http.Request) (*http.Response, error) {
+	pacingOff := false
+	return SharedHTTPClient().DoWithOptions(req, httpclient.Options{Pacing: &pacingOff})
+}
+
 func evmBalance(ctx context.Context, rpcURL, address string) (*big.Int, error) {
 	payload, err := json.Marshal(evmRPCRequest{
 		JSONRPC: "2.0",
@@ -157,7 +167,7 @@ func evmBalance(ctx context.Context, rpcURL, address string) (*big.Int, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := httpClient.Do(req)
+	resp, err := doCryptoRequest(req)
 	if err != nil {
 		return nil, err
 	}
@@ -211,10 +221,15 @@ func checkEthereumBalance(privateKeyHex string) (bool, string) {
 	defer cancel()
 
 	reachable := false
+	// answered is false once any queried chain failed. "Zero balance" may only
+	// be concluded when every chain answered, otherwise a key funded on a chain
+	// whose RPC happened to error would be mislabelled as empty.
+	answeredAll := true
 	for _, chain := range evmChains {
 		paceBalanceLookup()
 		balance, err := evmBalance(ctx, chain.rpc, address)
 		if err != nil {
+			answeredAll = false
 			continue
 		}
 		reachable = true
@@ -228,7 +243,7 @@ func checkEthereumBalance(privateKeyHex string) (bool, string) {
 		}
 	}
 
-	if reachable {
+	if reachable && answeredAll {
 		result = balanceResult{description: fmt.Sprintf("EVM (zero balance, %s)", address)}
 	} else {
 		result = balanceResult{funded: true, description: fmt.Sprintf("EVM (unverified, no RPC reachable, %s)", address)}
@@ -362,7 +377,7 @@ func btcBalance(ctx context.Context, address string) (int64, error) {
 	}
 	req.Header.Set("User-Agent", fmt.Sprintf("%s v%s", Name, Version))
 
-	resp, err := httpClient.Do(req)
+	resp, err := doCryptoRequest(req)
 	if err != nil {
 		return 0, err
 	}

@@ -82,6 +82,40 @@ func TestLegacyDashboardEscapeHatch(t *testing.T) {
 	}
 }
 
+func TestMissingAssetNotCachedImmutable(t *testing.T) {
+	rec := get(t, testWebMux(t), "/assets/does-not-exist-deadbeef.js")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET missing asset = %d, want 404", rec.Code)
+	}
+	if cc := rec.Header().Get("Cache-Control"); strings.Contains(cc, "immutable") {
+		t.Fatalf("missing asset Cache-Control = %q, must not contain immutable", cc)
+	}
+}
+
+func TestReadOnlyEndpointsRejectNonGet(t *testing.T) {
+	prev := webBindIsLoopback
+	webBindIsLoopback = false
+	t.Cleanup(func() { webBindIsLoopback = prev })
+
+	mux := testWebMux(t)
+	paths := []string{
+		"/api/stats", "/api/matches", "/api/ws", "/api/logs", "/api/tokens",
+		"/api/signatures", "/api/activity", "/api/scan/progress", "/api/stats/regex",
+		"/api/metrics", "/api/file", "/api/suppressed", "/health",
+	}
+	for _, path := range paths {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("POST %s = %d, want 405", path, rec.Code)
+		}
+		allow := rec.Header().Get("Allow")
+		if !strings.Contains(allow, "GET") {
+			t.Errorf("POST %s Allow header = %q, want GET", path, allow)
+		}
+	}
+}
+
 func TestUnknownAPIPathIsJSON404(t *testing.T) {
 	rec := get(t, testWebMux(t), "/api/definitely-not-a-route")
 	if rec.Code != http.StatusNotFound {

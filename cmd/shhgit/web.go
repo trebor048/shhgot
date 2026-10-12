@@ -16,9 +16,16 @@ import (
 	"unicode/utf8"
 
 	"github.com/trebor048/shhgot/core"
+	"github.com/trebor048/shhgot/core/verifiers"
 )
 
 // Match represents a detected secret match.
+//
+// Priority is the signature's static rule priority; Severity is the dynamic
+// finding severity derived from the verifier outcome (or the priority when the
+// secret was never verified). They are distinct fields on purpose: the
+// dashboard labels priority as "rule priority" and severity as "verified
+// severity" so neither can be mistaken for the other.
 type Match struct {
 	ID        string    `json:"id"`
 	Timestamp time.Time `json:"timestamp"`
@@ -33,6 +40,16 @@ type Match struct {
 	Stars     int       `json:"stars"`
 	Priority  int       `json:"priority"`
 	Color     string    `json:"color"`
+
+	// BaseURL is the ranked relay/Azure endpoint extracted around the finding
+	// (Slice 4); Context is the bounded window of file lines around the secret.
+	// Both are empty unless scanning.context_lines > 0.
+	BaseURL  string `json:"base_url,omitempty"`
+	Context  string `json:"context,omitempty"`
+	Severity string `json:"severity,omitempty"`
+	// Verified reports whether a live verifier accepted the secret. nil means
+	// no verifier outcome is known (never verified, or verification pending).
+	Verified *bool `json:"verified,omitempty"`
 }
 
 // MatchFileDetail carries the full file content behind a match so the
@@ -49,11 +66,23 @@ type MatchFileDetail struct {
 	Truncated  bool   `json:"truncated"`
 }
 
-// TokenResult records one live token-validation outcome for the web UI.
+// TokenResult records one live token-validation outcome for the web UI. The
+// first four fields are the basic verdict; the rest carry the verifier's richer
+// metadata (Slice 5.7) and are empty/zero when the legacy validation path
+// produced the verdict.
 type TokenResult struct {
 	Token     string    `json:"token"`
 	Valid     bool      `json:"valid"`
 	Provider  string    `json:"provider"`
+	Status    string    `json:"status,omitempty"`
+	Category  string    `json:"category,omitempty"`
+	Identity  string    `json:"identity,omitempty"`
+	Tier      string    `json:"tier,omitempty"`
+	Balance   string    `json:"balance,omitempty"`
+	RPM       int       `json:"rpm,omitempty"`
+	HighValue bool      `json:"high_value,omitempty"`
+	Severity  string    `json:"severity,omitempty"`
+	LatencyMS int64     `json:"latency_ms,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
 }
 
@@ -63,8 +92,14 @@ type Stats struct {
 	MatchesBySource    map[string]int  `json:"matches_by_source"`
 	MatchesBySignature map[string]int  `json:"matches_by_signature"`
 	MatchesByPriority  map[int]int     `json:"matches_by_priority"`
+	MatchesBySeverity  map[string]int  `json:"matches_by_severity"`
 	TopSignatures      []SignatureStat `json:"top_signatures"`
 	LastUpdated        time.Time       `json:"last_updated"`
+	// AIFilterDegraded reports whether the AI false-positive filter's classifier
+	// has failed enough times in a row that its verdicts are unreliable. It is
+	// false when the filter is disabled. Populated by getStats, because the hub
+	// itself has no filter reference.
+	AIFilterDegraded bool `json:"ai_filter_degraded"`
 }
 
 // SignatureStat represents a signature with its match count.
@@ -84,6 +119,7 @@ func (s Stats) snapshot() Stats {
 	cp := s
 	cp.MatchesBySource = copyStringIntMap(s.MatchesBySource)
 	cp.MatchesBySignature = copyStringIntMap(s.MatchesBySignature)
+	cp.MatchesBySeverity = copyStringIntMap(s.MatchesBySeverity)
 	cp.MatchesByPriority = make(map[int]int, len(s.MatchesByPriority))
 	for k, v := range s.MatchesByPriority {
 		cp.MatchesByPriority[k] = v
@@ -215,6 +251,7 @@ func getMatchFile(w http.ResponseWriter, r *http.Request) {
 type FeedEvent struct {
 	Type     string            `json:"type"`
 	Match    *Match            `json:"match,omitempty"`
+	Matches  []*Match          `json:"matches,omitempty"`
 	Log      string            `json:"log,omitempty"`
 	Token    *TokenResult      `json:"token,omitempty"`
 	Activity *ActivitySnapshot `json:"activity,omitempty"`
@@ -273,6 +310,12 @@ func configureWebLimits(p core.PerformanceConfig) {
 	maxTokens = p.Int(p.MaxTokenResults, maxTokens)
 	maxFileDetails = p.Int(p.MaxFileDetails, maxFileDetails)
 	if kb := p.Int(p.MaxFileDetailKB, 0); kb > 0 {
+		// Clamp before the *1024: an operator-supplied kb near MaxInt overflows
+		// to a negative maxStoreFileBytes, which then panics on content[:cut].
+		const maxDetailKB = 1 << 30 // 1 TiB of bytes; far above any sane buffer
+		if kb > maxDetailKB {
+			kb = maxDetailKB
+		}
 		maxStoreFileBytes = kb * 1024
 	}
 }
@@ -316,6 +359,177 @@ func pushTokenResult(token string, valid bool, provider string) {
 	broadcastFeed(FeedEvent{Type: "token", Token: &res})
 }
 
+// pushTokenOutcome enriches the most recent TokenResult for token with the
+// verifier's full outcome, or appends one when OnTokenResult recorded nothing
+// first. It is the OnOutcome half of the token path: OnTokenResult keeps its
+// published signature, and this adds status/category/identity/tier/balance/RPM/
+// severity without changing it.
+//
+// priority is the rule priority of the finding this secret belongs to, passed
+// through from updateHubMatchOutcome. core.Classify only consults it when the
+// outcome does not itself decide the severity (quota-limited/unverified), so
+// this keeps the Tokens tab's label identical to the Matches tab's label
+// instead of always falling back to priority 0.
+func pushTokenOutcome(token, provider string, o verifiers.Outcome, priority int) {
+	res := TokenResult{
+		Token:     token,
+		Valid:     o.Status == verifiers.Valid || o.Status == verifiers.QuotaLimited,
+		Provider:  provider,
+		Status:    string(o.Status),
+		Category:  verifierCategory(provider),
+		Identity:  o.Identity,
+		Tier:      o.Tier,
+		Balance:   o.Balance,
+		RPM:       o.RPM,
+		HighValue: o.HighValue,
+		Severity:  core.Classify(priority, &o).String(),
+		Timestamp: time.Now(),
+	}
+	tokenMu.Lock()
+	updated := false
+	for i := len(tokenResults) - 1; i >= 0; i-- {
+		if tokenResults[i].Token != token {
+			continue
+		}
+		res.Timestamp = tokenResults[i].Timestamp
+		tokenResults[i] = res
+		updated = true
+		break
+	}
+	if !updated {
+		tokenResults = append(tokenResults, res)
+		if len(tokenResults) > maxTokens {
+			tokenResults = tokenResults[len(tokenResults)-maxTokens:]
+		}
+	}
+	tokenMu.Unlock()
+	broadcastFeed(FeedEvent{Type: "token", Token: &res})
+}
+
+// syncTokenSeverity overwrites the severity of the Tokens-tab row for the masked
+// token so it agrees with the Matches tab. applyVerifier (and therefore
+// OnOutcome, which pushes the row) runs during matching, before publish stores
+// the match and knows its rule priority, so the row was first classified with
+// priority 0. publish() calls this once it has the finding's real severity,
+// passing the same value it gave the match.
+func syncTokenSeverity(token, severity string) {
+	if token == "" || severity == "" {
+		return
+	}
+	tokenMu.Lock()
+	var updated *TokenResult
+	for i := len(tokenResults) - 1; i >= 0; i-- {
+		if tokenResults[i].Token != token {
+			continue
+		}
+		if tokenResults[i].Severity == severity {
+			tokenMu.Unlock()
+			return
+		}
+		cp := tokenResults[i]
+		cp.Severity = severity
+		tokenResults[i] = cp
+		updated = &cp
+		break
+	}
+	tokenMu.Unlock()
+	if updated != nil {
+		broadcastFeed(FeedEvent{Type: "token", Token: updated})
+	}
+}
+
+// verifierCategory resolves a detected provider display name ("OpenAI") to the
+// registry verifier's category ("AI"), or "" when nothing matches. It maps the
+// provider through core's provider->verifier table first: comparing the display
+// name directly against verifier names only worked where the two coincided, and
+// returned "" for Google/Gemini, xAI/Grok, Together AI, Kimi/Moonshot,
+// Qwen/Alibaba and Docker Hub.
+func verifierCategory(provider string) string {
+	name, ok := core.VerifierNameForProvider(provider)
+	if !ok {
+		return ""
+	}
+	if v, found := verifiers.Lookup(name); found {
+		return v.Category
+	}
+	return ""
+}
+
+// updateHubMatchOutcome refreshes the Severity and Verified fields of every
+// match in the hub whose secret begins with the masked token a verifier just
+// resolved. The callback only carries a masked token, so the comparison is on
+// the unmasked prefix and is best-effort by design.
+//
+// The hub slice is updated copy-on-write: an entry is replaced, never mutated
+// in place. A snapshot or SSE encoder that already captured the old pointer is
+// then guaranteed to see a consistent struct, so this cannot race them.
+//
+// It returns the rule priority of the first matching finding, or 0 when none is
+// held, so the caller can classify the Tokens tab row with the same priority
+// and the two tabs cannot disagree.
+func updateHubMatchOutcome(maskedToken string, o verifiers.Outcome) int {
+	hub := webHub
+	if hub == nil {
+		return 0
+	}
+	prefix := strings.TrimSuffix(maskedToken, "...")
+	if prefix == "" {
+		return 0
+	}
+	priority := 0
+	found := false
+	var broadcastMatches []*Match
+	hub.matchesMutex.Lock()
+	for i, m := range hub.matches {
+		if m == nil || len(m.Secret) < len(prefix) || !strings.HasPrefix(m.Secret, prefix) {
+			continue
+		}
+		if !found {
+			priority = m.Priority
+			found = true
+		}
+		cp := *m
+		newSeverity := core.Classify(cp.Priority, &o).String()
+		// Keep the severity histogram the sidebar reads in step with the
+		// reclassification: the match was counted under its old severity when
+		// the hub stored it.
+		if newSeverity != cp.Severity {
+			if hub.stats.MatchesBySeverity[cp.Severity] > 0 {
+				hub.stats.MatchesBySeverity[cp.Severity]--
+				if hub.stats.MatchesBySeverity[cp.Severity] == 0 {
+					delete(hub.stats.MatchesBySeverity, cp.Severity)
+				}
+			}
+			hub.stats.MatchesBySeverity[newSeverity]++
+		}
+		cp.Severity = newSeverity
+		// A quota-limited credential is real, just throttled: core treats it as
+		// kept (outcomeValid), so it counts as verified here too.
+		verified := o.Status == verifiers.Valid || o.Status == verifiers.QuotaLimited
+		cp.Verified = &verified
+		hub.matches[i] = &cp
+		broadcastMatches = append(broadcastMatches, &cp)
+	}
+	statsCopy := hub.stats.snapshot()
+	matchesCopy := append([]*Match(nil), hub.matches...)
+	hub.matchesMutex.Unlock()
+
+	// Dashboards only learn about new matches through the live feed; an updated
+	// severity/verified flag on an existing match would otherwise stay stale
+	// until the page was refreshed. Send a snapshot event so every client
+	// resyncs in place.
+	if len(broadcastMatches) > 0 {
+		act := activity.Snapshot()
+		broadcastFeed(FeedEvent{
+			Type:     "snapshot",
+			Matches:  matchesCopy,
+			Stats:    &statsCopy,
+			Activity: &act,
+		})
+	}
+	return priority
+}
+
 // ensureWebHub lazily creates the singleton web hub and starts its run loop.
 func ensureWebHub() *WebHub {
 	hubOnce.Do(func() {
@@ -333,6 +547,7 @@ func newWebHub() *WebHub {
 			MatchesBySource:    make(map[string]int),
 			MatchesBySignature: make(map[string]int),
 			MatchesByPriority:  make(map[int]int),
+			MatchesBySeverity:  make(map[string]int),
 		},
 	}
 }
@@ -349,6 +564,7 @@ func (h *WebHub) run() {
 		h.stats.MatchesBySource[match.Source]++
 		h.stats.MatchesBySignature[match.Signature]++
 		h.stats.MatchesByPriority[match.Priority]++
+		h.stats.MatchesBySeverity[match.Severity]++
 		h.stats.LastUpdated = time.Now()
 
 		h.updateTopSignatures()
@@ -391,7 +607,9 @@ func receiveMatch(w http.ResponseWriter, r *http.Request) {
 	// Cap the body the same way the review and settings APIs do: this route is
 	// reachable without credentials, so an unbounded decode would let any local
 	// process - or a rebound page - grow the process's memory at will.
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBody)).Decode(&match); err != nil {
+	// Permissive on field names (external tools push here) but strict on
+	// trailing data.
+	if err := decodeJSONPermissive(w, r, &match); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -415,6 +633,10 @@ func getStats(w http.ResponseWriter, r *http.Request) {
 	stats := hub.stats.snapshot()
 	hub.matchesMutex.RUnlock()
 
+	// The hub tracks matches, not the AI filter, so the degraded flag is read
+	// here rather than copied through the hub's own snapshot.
+	stats.AIFilterDegraded = aiFilterDegraded()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
 }
@@ -424,6 +646,7 @@ func getMatches(w http.ResponseWriter, r *http.Request) {
 	source := r.URL.Query().Get("source")
 	signature := r.URL.Query().Get("signature")
 	priority := r.URL.Query().Get("priority")
+	severity := r.URL.Query().Get("severity")
 
 	hub := ensureWebHub()
 	hub.matchesMutex.RLock()
@@ -438,6 +661,9 @@ func getMatches(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if priority != "" && fmt.Sprintf("%d", m.Priority) != priority {
+			continue
+		}
+		if severity != "" && m.Severity != severity {
 			continue
 		}
 		filtered = append(filtered, m)
@@ -524,7 +750,7 @@ func skipRepo(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		URL string `json:"url"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBody)).Decode(&in); err != nil {
+	if err := decodeJSON(w, r, &in); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -569,6 +795,71 @@ func getRegexStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(core.GlobalRegexOptimizer.Stats())
 }
 
+// getMetrics returns the process-wide metrics collector's snapshot. Without a
+// format parameter the response is JSON (core.DefaultMetrics.Snapshot()); with
+// ?format=prometheus it is the Prometheus text exposition format. An optional
+// ?subsystem=<name> narrows the JSON (and prometheus) output to one subsystem.
+//
+// Like the rest of the captured-material API it carries localGuard even though
+// it exposes no secrets: it reveals scan throughput and timings, and a rebound
+// page should not be able to fingerprint the running instance for free.
+func getMetrics(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	var snapshot map[string]core.LatencyStats
+	if subsystem := strings.TrimSpace(q.Get("subsystem")); subsystem != "" {
+		snapshot = map[string]core.LatencyStats{subsystem: core.DefaultMetrics.LatencyStats(subsystem)}
+	} else {
+		snapshot = core.DefaultMetrics.Snapshot()
+	}
+	if strings.EqualFold(strings.TrimSpace(q.Get("format")), "prometheus") {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		fmt.Fprint(w, prometheusMetrics(snapshot))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(snapshot)
+}
+
+// prometheusMetrics renders a metrics snapshot in the Prometheus text
+// exposition format. Subsystem names are sorted and the quantile set is fixed,
+// so the output is stable run to run.
+func prometheusMetrics(snapshot map[string]core.LatencyStats) string {
+	names := make([]string, 0, len(snapshot))
+	for name := range snapshot {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	b.WriteString("# HELP shhgit_latency_seconds Latency quantiles per subsystem, in seconds.\n")
+	b.WriteString("# TYPE shhgit_latency_seconds gauge\n")
+	for _, name := range names {
+		s := snapshot[name]
+		for _, q := range []struct {
+			label string
+			value time.Duration
+		}{{"0.5", s.P50}, {"0.95", s.P95}, {"0.99", s.P99}} {
+			fmt.Fprintf(&b, "shhgit_latency_seconds{subsystem=%q,quantile=%q} %g\n", name, q.label, q.value.Seconds())
+		}
+	}
+	b.WriteString("# HELP shhgit_latency_seconds_total Total observed latency per subsystem, in seconds.\n")
+	b.WriteString("# TYPE shhgit_latency_seconds_total counter\n")
+	for _, name := range names {
+		fmt.Fprintf(&b, "shhgit_latency_seconds_total{subsystem=%q} %g\n", name, snapshot[name].Sum.Seconds())
+	}
+	b.WriteString("# HELP shhgit_operations_total Completed operations per subsystem.\n")
+	b.WriteString("# TYPE shhgit_operations_total counter\n")
+	for _, name := range names {
+		fmt.Fprintf(&b, "shhgit_operations_total{subsystem=%q} %d\n", name, snapshot[name].Ops)
+	}
+	b.WriteString("# HELP shhgit_errors_total Errors per subsystem.\n")
+	b.WriteString("# TYPE shhgit_errors_total counter\n")
+	for _, name := range names {
+		fmt.Fprintf(&b, "shhgit_errors_total{subsystem=%q} %d\n", name, snapshot[name].Errors)
+	}
+	return b.String()
+}
+
 // eventsHandler streams live FeedEvents to the dashboard over Server-Sent
 // Events. The client reconnects automatically if the connection drops.
 func eventsHandler(w http.ResponseWriter, r *http.Request) {
@@ -581,6 +872,7 @@ func eventsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 	// No Access-Control-Allow-Origin here. This stream carries live findings, so
 	// a wildcard let any page the operator visited subscribe to it, and setting it
 	// after corsMiddleware also overwrote that middleware's per-origin value. The
@@ -596,7 +888,15 @@ func eventsHandler(w http.ResponseWriter, r *http.Request) {
 		feedMu.Unlock()
 	}()
 
+	// Bound each write so a client that stops reading (but holds the TCP
+	// connection open) cannot block this handler forever, which would leak the
+	// goroutine, the socket and the feedClients entry. The deadline is refreshed
+	// before every write and heartbeat.
+	rc := http.NewResponseController(w)
+	touchDeadline := func() { _ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second)) }
+
 	// Initial comment + a snapshot handshake so the client can sync state.
+	touchDeadline()
 	fmt.Fprint(w, ": connected\n\n")
 	flusher.Flush()
 
@@ -607,13 +907,18 @@ func eventsHandler(w http.ResponseWriter, r *http.Request) {
 	{
 		hub := ensureWebHub()
 		hub.matchesMutex.RLock()
-		snap, _ := json.Marshal(map[string]interface{}{
+		snap, err := json.Marshal(map[string]interface{}{
 			"type":     "snapshot",
 			"activity": activity.Snapshot(),
 			"matches":  append([]*Match(nil), hub.matches...),
 			"stats":    hub.stats.snapshot(),
 		})
 		hub.matchesMutex.RUnlock()
+		if err != nil {
+			log.Printf("[web] events snapshot marshal error: %v", err)
+			return
+		}
+		touchDeadline()
 		fmt.Fprintf(w, "data: %s\n\n", snap)
 		flusher.Flush()
 	}
@@ -624,10 +929,16 @@ func eventsHandler(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case data := <-ch:
-			fmt.Fprintf(w, "data: %s\n\n", data)
+			touchDeadline()
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				return
+			}
 			flusher.Flush()
 		case <-heartbeat.C:
-			fmt.Fprint(w, ": ping\n\n")
+			touchDeadline()
+			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		case <-r.Context().Done():
 			return
@@ -638,7 +949,35 @@ func eventsHandler(w http.ResponseWriter, r *http.Request) {
 // Health check endpoint.
 func health(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":             "healthy",
+		"storage_degraded":   storageDegraded(),
+		"ai_filter_degraded": aiFilterDegraded(),
+		"ai_filter":          aiFilterStatus(),
+		"notify":             notifyHealth(),
+	})
+}
+
+// notifyHealth reports the configured alert channels and whether the most
+// recent delivery attempt failed. It stays a JSON object with an empty channel
+// list when notifications are unconfigured, so a probe can always parse it.
+func notifyHealth() map[string]any {
+	names, degraded := notifyStatusSnapshot()
+	return map[string]any{
+		"enabled":  len(names) > 0,
+		"channels": names,
+		"degraded": degraded,
+	}
+}
+
+// storageDegraded reports whether the persistent findings store has fallen back
+// to running without dedupe after a write failure. It is surfaced on /health so
+// a monitoring probe can observe it; false when the store is absent or disabled.
+func storageDegraded() bool {
+	if session == nil || session.Store == nil {
+		return false
+	}
+	return session.Store.Degraded()
 }
 
 // CORS middleware.
@@ -660,7 +999,7 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			w.Header().Set("Vary", "Origin")
 		}
 
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
 		if r.Method == http.MethodOptions {
@@ -729,6 +1068,19 @@ func sameOrigin(origin string, r *http.Request) bool {
 		return false
 	}
 	return strings.EqualFold(u.Host, r.Host)
+}
+
+// requireGet rejects non-GET/HEAD requests on read-only API endpoints so a
+// POST or DELETE to /api/matches cannot be mistaken for a successful read.
+func requireGet(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		next(w, r)
+	}
 }
 
 // webBindIsLoopback records whether the dashboard was bound to loopback, which
@@ -808,7 +1160,17 @@ func StartWebServer(host, port string) error {
 
 	addr := host + ":" + port
 	log.Printf("[web] Dashboard ready at http://%s", addr)
-	return http.ListenAndServe(addr, mux)
+	// Explicit timeouts: a bare ListenAndServe leaves ReadHeaderTimeout at zero,
+	// so a slowloris client can hold half-open connections forever. No
+	// WriteTimeout is set deliberately - it would kill the long-lived SSE
+	// streams, which carry their own per-write deadline.
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	return srv.ListenAndServe()
 }
 
 // registerRoutes installs every handler on mux.
@@ -828,18 +1190,20 @@ func registerRoutes(mux *http.ServeMux) {
 	// /api/push is guarded too: without it a rebound page could inject fabricated
 	// findings into the operator's match list.
 	mux.HandleFunc("/api/push", corsMiddleware(localGuard(receiveMatch)))
-	mux.HandleFunc("/api/stats", corsMiddleware(localGuard(getStats)))
-	mux.HandleFunc("/api/matches", corsMiddleware(localGuard(getMatches)))
-	mux.HandleFunc("/api/ws", corsMiddleware(localGuard(wsHandler)))
-	mux.HandleFunc("/api/logs", corsMiddleware(localGuard(getLogs)))
-	mux.HandleFunc("/api/tokens", corsMiddleware(localGuard(getTokens)))
-	mux.HandleFunc("/api/signatures", corsMiddleware(localGuard(getSignatures)))
-	mux.HandleFunc("/api/activity", corsMiddleware(localGuard(getActivity)))
+	mux.HandleFunc("/api/stats", corsMiddleware(localGuard(requireGet(getStats))))
+	mux.HandleFunc("/api/suppressed", corsMiddleware(localGuard(requireGet(getSuppressed))))
+	mux.HandleFunc("/api/matches", corsMiddleware(localGuard(requireGet(getMatches))))
+	mux.HandleFunc("/api/ws", corsMiddleware(localGuard(requireGet(wsHandler))))
+	mux.HandleFunc("/api/logs", corsMiddleware(localGuard(requireGet(getLogs))))
+	mux.HandleFunc("/api/tokens", corsMiddleware(localGuard(requireGet(getTokens))))
+	mux.HandleFunc("/api/signatures", corsMiddleware(localGuard(requireGet(getSignatures))))
+	mux.HandleFunc("/api/activity", corsMiddleware(localGuard(requireGet(getActivity))))
 	mux.HandleFunc("/api/activity/skip", corsMiddleware(localGuard(skipRepo)))
-	mux.HandleFunc("/api/scan/progress", corsMiddleware(localGuard(getScanProgress)))
-	mux.HandleFunc("/api/stats/regex", corsMiddleware(localGuard(getRegexStats)))
-	mux.HandleFunc("/api/file", corsMiddleware(localGuard(getMatchFile)))
-	mux.HandleFunc("/api/events", corsMiddleware(localGuard(eventsHandler)))
+	mux.HandleFunc("/api/scan/progress", corsMiddleware(localGuard(requireGet(getScanProgress))))
+	mux.HandleFunc("/api/stats/regex", corsMiddleware(localGuard(requireGet(getRegexStats))))
+	mux.HandleFunc("/api/metrics", corsMiddleware(localGuard(requireGet(getMetrics))))
+	mux.HandleFunc("/api/file", corsMiddleware(localGuard(requireGet(getMatchFile))))
+	mux.HandleFunc("/api/events", corsMiddleware(localGuard(requireGet(eventsHandler))))
 	registerReviewRoutes(mux)
 	registerSettingsRoutes(mux)
 
@@ -847,7 +1211,7 @@ func registerRoutes(mux *http.ServeMux) {
 	// depend on it. The dashboard itself carries no secrets and stays reachable
 	// by whatever hostname the operator uses, so that a hosts-file alias or a
 	// tunnel does not lock them out of their own UI.
-	mux.HandleFunc("/health", corsMiddleware(health))
+	mux.HandleFunc("/health", corsMiddleware(requireGet(health)))
 	mux.HandleFunc("/", serveEmbeddedWeb)
 }
 

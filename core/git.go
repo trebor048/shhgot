@@ -22,6 +22,26 @@ const (
 	GIST_SOURCE
 	BITBUCKET_SOURCE
 	GITLAB_SOURCE
+	// GITHUB_SEARCH_SOURCE is a file discovered through GitHub code search
+	// (the dork source), as opposed to a clone of the repository.
+	GITHUB_SEARCH_SOURCE
+	// PASTEBIN_SOURCE is a paste body discovered through the Pastebin
+	// Scraping API source.
+	PASTEBIN_SOURCE
+	// SEARCHCODE_SOURCE is a searchcode.com code-search hit.
+	SEARCHCODE_SOURCE
+	// SOURCEGRAPH_SOURCE is a match found through Sourcegraph stream search.
+	SOURCEGRAPH_SOURCE
+	// GITHUB_COMMITS_SOURCE is a match found in a commit message through
+	// GitHub commit search.
+	GITHUB_COMMITS_SOURCE
+	// GITHUB_ISSUES_SOURCE is a match found in an issue/PR title or body through
+	// GitHub issue search.
+	GITHUB_ISSUES_SOURCE
+	// GREPAPP_SOURCE is a grep.app code-search hit.
+	GREPAPP_SOURCE
+	// PSBDMP_SOURCE is a Pastebin paste body discovered through psbdmp.ws.
+	PSBDMP_SOURCE
 )
 
 type GitResource struct {
@@ -39,7 +59,18 @@ type Comment struct {
 }
 
 func CloneRepository(session *Session, url string, ref string, dir string, progress io.Writer) (*git.Repository, error) {
-	timeout := time.Duration(*session.Options.CloneRepositoryTimeout) * time.Second
+	seconds := *session.Options.CloneRepositoryTimeout
+	if seconds == 0 {
+		// A zero deadline is already expired, so every clone would abort; treat
+		// 0 as the flag's 30s default rather than a "no timeout" request.
+		seconds = 30
+	}
+	// Cap so the seconds->nanoseconds conversion cannot overflow time.Duration.
+	const maxCloneSeconds = 1 << 31 // ~68 years
+	if seconds > maxCloneSeconds {
+		seconds = maxCloneSeconds
+	}
+	timeout := time.Duration(seconds) * time.Second
 	// Derive from the session context so a shutdown/cancel aborts an in-flight
 	// clone instead of leaving it to run out its own timeout.
 	parent := session.Context
@@ -75,7 +106,9 @@ func CloneRepository(session *Session, url string, ref string, dir string, progr
 	}
 	// A failed or partial native clone must not leave a directory behind for
 	// go-git to trip over.
-	os.RemoveAll(dir)
+	if err := os.RemoveAll(dir); err != nil {
+		session.Log.Debug("[%s] cleanup: could not remove stale clone dir %s: %s", url, dir, err)
+	}
 
 	opts := &git.CloneOptions{
 		Depth:             depth,
@@ -111,7 +144,9 @@ func cloneNative(ctx context.Context, url, ref, dir string, depth int, progress 
 	}
 	// `git clone` refuses to write into an existing directory.
 	if _, err := os.Stat(dir); err == nil {
-		os.RemoveAll(dir)
+		if err := os.RemoveAll(dir); err != nil {
+			session.Log.Debug("[%s] cleanup: could not remove stale clone dir %s: %s", url, dir, err)
+		}
 	}
 
 	args := []string{"clone", "--quiet", "--no-tags", "--single-branch"}

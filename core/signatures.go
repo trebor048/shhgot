@@ -27,12 +27,69 @@ var placeholderRe = regexp.MustCompile(
 		`|(?:dev|ci|staging|local|qa|sandbox)[_-]?only` + // bp_dev_only, bp_ci_only
 		`|os\.environ|process\.env|getenv` + // language-level env lookups
 		`|x{4,}` + // xxxx
-		`|change[_-]?me|replace[_-]?me|placeholder|redacted`,
+		`|change[_-]?me|replace[_-]?me|placeholder|redacted` +
+		`|\b(?:fake|dummy|mock|sample|example|todo)\b`, // bare placeholder words, bounded so `myexample`, `sampled_key` etc. are not swallowed (kept out of blacklisted_strings, which must hold complete values only)
 )
 
 // isPlaceholderMatch reports whether a matched value is an obvious template.
 func isPlaceholderMatch(match string) bool {
 	return placeholderRe.MatchString(match)
+}
+
+// nonRoutableHostRe matches hosts that are never a production leak: loopback
+// (localhost, 127/8, ::1), all-zero, RFC-1918 private ranges, mDNS/local
+// names, Docker-internal names and documentation domains. It is tested against
+// the matched text (a DSN/URL such as `postgres://user:pass@localhost/db`),
+// never the whole file, so a real secret elsewhere in the file is unaffected.
+// A per-rule not_regex cannot cover this uniformly - connection-string rules
+// each carried their own copy (localhost/127.0.0.1/::1 only, missing 0.0.0.0,
+// private ranges and example hosts), and a drifted live config may carry none
+// at all. Like placeholderRe this is a global guard, applied to every contents
+// match regardless of which signature produced it.
+// Every host alternative is bounded so it cannot match as a substring of a
+// larger public host: `110.0.0.1` must not be read as private `10.0.0.1`,
+// `100.0.0.0` must not be read as `0.0.0.0`, and `myexample.com` must not be
+// read as the documentation domain `example.com`. RE2 has no lookbehind, so a
+// leading (?:^|[^...]) group consumes the boundary character instead.
+var nonRoutableHostRe = regexp.MustCompile(
+	`(?i)(?:^|[^0-9A-Za-z-])(?:localhost|host\.docker\.internal)(?:[^0-9A-Za-z.-]|$)|` +
+		`(?:^|[^0-9A-Za-z-])example\.(?:com|org|net|io)(?:[^0-9A-Za-z.-]|$)|` +
+		`\.local(?:[^0-9A-Za-z.-]|$)|` +
+		`(?:^|[^0-9.])(?:127\.\d{1,3}\.\d{1,3}\.\d{1,3}|0\.0\.0\.0|` +
+		`10\.\d{1,3}\.\d{1,3}\.\d{1,3}|` +
+		`172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|` +
+		`192\.168\.\d{1,3}\.\d{1,3})(?:[^0-9.]|$)|` +
+		`(?:^|[^0-9A-Fa-f:])::1(?:[^0-9A-Fa-f]|$)|\[::1\]`,
+)
+
+// isNonRoutableMatch reports whether a matched DSN/URL points at a host that
+// can never be a production credential.
+func isNonRoutableMatch(match string) bool {
+	return nonRoutableHostRe.MatchString(match)
+}
+
+// weakPasswordValues are whole-value passwords that are documentation or
+// vendor defaults rather than leaks: `db_password = "password123"` is not a
+// finding. Compared case-insensitively against the entire unquoted value of a
+// password-named assignment only (see passwordNameRe), so a generated token
+// that merely contains one of these words is unaffected.
+var weakPasswordValues = map[string]bool{
+	"password": true, "password1": true, "password123": true,
+	"123456": true, "12345678": true, "123456789": true,
+	"qwerty": true, "abc123": true, "admin": true,
+	"administrator": true, "root": true, "letmein": true, "welcome": true,
+}
+
+// isWeakPasswordValue reports whether a match assigns a trivially guessable
+// whole-value password. Only the entire value counts: `password12345` or
+// `my-password-123` are left alone.
+func isWeakPasswordValue(match string) bool {
+	name, value, ok := splitCredentialAssignment(match)
+	if !ok || !passwordNameRe.MatchString(name) {
+		return false
+	}
+	trimmed := strings.ToLower(strings.Trim(value, `"'`))
+	return weakPasswordValues[trimmed]
 }
 
 // credentialNameRe matches assignment targets that name a credential. A
@@ -47,7 +104,13 @@ func isPlaceholderMatch(match string) bool {
 var credentialNameRe = regexp.MustCompile(
 	`(?i)key|token|secret|password|passwd|pass|pwd|credential|auth|api|access|` +
 		`client|signing|webhook|private|dsn|url|uri|connection|conn|session|` +
-		`refresh|bearer|apikey|license|salt|hash|seed|mnemonic|wallet`,
+		`refresh|bearer|apikey|license|salt|hash|seed|mnemonic|wallet|` +
+		// Format-named targets: a value stored under one of these names is a
+		// card, account or bank identifier, a certificate or a JWT, not a code
+		// reference. Without them the shipped pattern signatures for those
+		// formats matched and were then discarded by the name guard below.
+		`card|cvv|cvc|pan|iban|swift|bic|routing|aba|account|acct|sort|bsb|ifsc|clabe|` +
+		`jwt|certificate|protocol|username|sid`,
 )
 
 // assignTargetRe recognises the left-hand side of an assignment: an identifier
@@ -476,11 +539,19 @@ func (s PatternSignature) GetContentsMatches(file MatchFile) []string {
 		return nil
 	}
 
+	// A caller with no session (a unit test exercising the matcher directly
+	// rather than through the scanner) has no blacklist; not panicking keeps
+	// the matcher reusable outside a full scanner session.
+	var blacklisted []string
+	if session != nil && session.Config != nil {
+		blacklisted = session.Config.BlacklistedStrings
+	}
+
 	for _, match := range s.match.FindAllSubmatch(contents, -1) {
 		match := string(match[0])
 		blacklistedMatch := false
 
-		for _, blacklistedString := range session.Config.BlacklistedStrings {
+		for _, blacklistedString := range blacklisted {
 			// An empty entry would make strings.Contains true for every match
 			// and silently disable the signature, so it is skipped rather than
 			// honoured.
@@ -505,6 +576,19 @@ func (s PatternSignature) GetContentsMatches(file MatchFile) []string {
 		// This catches the placeholders in .env.example files and CI
 		// workflows regardless of which signature matched them.
 		if !blacklistedMatch && isPlaceholderMatch(match) {
+			continue
+		}
+
+		// A connection string pointing at loopback, a private range or a
+		// documentation host (`postgres://user:pass@localhost/db`) is a
+		// dev-example placeholder, not a production leak.
+		if !blacklistedMatch && isNonRoutableMatch(match) {
+			continue
+		}
+
+		// A password-named assignment holding a default value
+		// (`db_password = "password123"`) documents nothing worth stealing.
+		if !blacklistedMatch && isWeakPasswordValue(match) {
 			continue
 		}
 
@@ -546,9 +630,11 @@ func (s PatternSignature) GetExcludeInModes() []string {
 }
 
 func (s PatternSignature) IsTokenType() bool {
-	// Check if this is a GitHub token signature
+	// Check if this is a GitHub token signature. The fine-grained rule is
+	// named "GitHub Fine-Grained PAT" (no "token" in the name), so "pat"
+	// must count too — otherwise those matches never reach AddGitHubToken.
 	sigName := strings.ToLower(s.name)
-	return strings.Contains(sigName, "github") && strings.Contains(sigName, "token")
+	return strings.Contains(sigName, "github") && (strings.Contains(sigName, "token") || strings.Contains(sigName, "pat"))
 }
 
 func (s PatternSignature) GetRegex() *regexp.Regexp {
@@ -588,10 +674,10 @@ func (s PatternSignature) applyVerifier(match string, file MatchFile) bool {
 			isValid = ValidateSSHKey(match)
 			tokenType = "SSH Key"
 		case "crypto_balance":
-			// Always accept crypto key matches (format is valid)
-			// Balance validation is informational only - include in webhook
-			isValid, tokenType = ValidateCryptoKey(match)
-			// Override isValid to always be true so match appears in logs/webhook
+			// A shaped crypto key is always reported: balance validation is
+			// informational only, so a zero/unverified balance must not drop the
+			// finding. The verifier Outcome carries the balance/tier separately.
+			_, tokenType = ValidateCryptoKey(match)
 			isValid = true
 		default:
 			// config.yaml validation rejects unknown verifiers at load time, so
@@ -623,6 +709,19 @@ func (s PatternSignature) applyVerifier(match string, file MatchFile) bool {
 		)
 	}
 
+	// Live AI-token verifiers never gate the finding. A key the provider
+	// rejects (expired, revoked, wrong scope) is still a leaked secret, so it
+	// must reach the terminal, the dashboard, the TUI and the CSVs; the
+	// verdict travels alongside it as the verifier outcome (severity low,
+	// verified=false) rather than by discarding the match. Returning isValid
+	// here made GetContentsMatches drop the match, so TestAndLogToken printed
+	// "✗ ... token is INVALID" and "Response: ..." but the token itself was
+	// never published anywhere - the exact "only the error message shows"
+	// symptom. Non-AI verifiers (discord/telegram/ssh) keep the old gate: an
+	// invalid webhook URL or SSH key is not a leak.
+	if aiTokenVerifiers[s.verifier] {
+		return true
+	}
 	return isValid
 }
 

@@ -6,6 +6,7 @@ import StatsPanel from './components/StatsPanel'
 import DashboardPanel from './components/DashboardPanel'
 import LogsPanel from './components/LogsPanel'
 import TokensPanel from './components/TokensPanel'
+import SuppressedPanel from './components/SuppressedPanel'
 import ActivityPanel from './components/ActivityPanel'
 import ReviewPanel from './components/ReviewPanel'
 import SettingsPanel from './components/SettingsPanel'
@@ -21,7 +22,7 @@ function Workspace() {
   const feed = useFeed()
   const [activeTab, setActiveTab] = useState('matches')
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [filters, setFilters] = useState({ search: '', source: '', signature: '', priority: '' })
+  const [filters, setFilters] = useState({ search: '', source: '', signature: '', priority: '', severity: '' })
   const [fileMatch, setFileMatch] = useState(null)
   const [pendingReview, setPendingReview] = useState(null)
   const [paused, setPaused] = useState(false)
@@ -35,6 +36,7 @@ function Workspace() {
   const togglePause = () => {
     if (paused) {
       setPaused(false)
+      setFrozen([])
     } else {
       setFrozen(feed.matches)
       setPaused(true)
@@ -45,6 +47,7 @@ function Workspace() {
     const q = filters.search.trim().toLowerCase()
     return sourceMatches.filter((m) => {
       if (filters.priority !== '' && m.priority !== parseInt(filters.priority, 10)) return false
+      if (filters.severity && m.severity !== filters.severity) return false
       if (filters.source && m.source !== filters.source) return false
       if (filters.signature && m.signature !== filters.signature) return false
       if (q) {
@@ -63,7 +66,7 @@ function Workspace() {
   }
 
   const exportCsv = () => {
-    const header = ['Timestamp', 'Source', 'URL', 'File', 'Signature', 'Matches', 'Stars', 'Priority']
+    const header = ['Timestamp', 'Source', 'URL', 'File', 'Signature', 'Matches', 'Stars', 'Priority', 'Severity']
     const rows = filtered.map((m) => [
       m.timestamp ? new Date(m.timestamp).toISOString() : '',
       m.source,
@@ -73,6 +76,7 @@ function Workspace() {
       (m.matches || []).join(';'),
       m.stars,
       m.priority,
+      m.severity,
     ])
     const csv = [header, ...rows].map((r) => r.map(csvEscape).join(',')).join('\n')
     const blob = new Blob([csv], { type: 'text/csv' })
@@ -81,7 +85,9 @@ function Workspace() {
     a.href = url
     a.download = `shhgit-matches-${new Date().toISOString().slice(0, 10)}.csv`
     a.click()
-    URL.revokeObjectURL(url)
+    // Defer revocation so the browser has begun the download before the blob
+    // URL is invalidated.
+    setTimeout(() => URL.revokeObjectURL(url), 0)
     toast(`Exported ${rows.length.toLocaleString()} matches`, 'ok')
   }
 
@@ -142,6 +148,7 @@ function Workspace() {
             />
           )}
           {activeTab === 'tokens' && <TokensPanel tokens={feed.tokens} />}
+          {activeTab === 'suppressed' && <SuppressedPanel />}
           {activeTab === 'activity' && <ActivityPanel activity={feed.activity} />}
           {activeTab === 'stats' && <StatsPanel stats={feed.stats} />}
           {activeTab === 'dashboard' && <DashboardPanel matches={feed.matches} stats={feed.stats} />}

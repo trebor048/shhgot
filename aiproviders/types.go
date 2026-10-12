@@ -87,11 +87,13 @@ var (
 // report when the protocol's completion marker was seen, "empty" when no text ever
 // arrived, and "truncated" when text arrived but the marker never did.
 func streamVerdict(name string, sawDelta, sawCompletion bool) error {
+	if !sawDelta {
+		// A completion marker with no text is still an empty response; Chat and
+		// Stream must not disagree on the same provider condition.
+		return fmt.Errorf("%s: %w", name, ErrEmptyResponse)
+	}
 	if sawCompletion {
 		return nil
-	}
-	if !sawDelta {
-		return fmt.Errorf("%s: %w", name, ErrEmptyResponse)
 	}
 	return fmt.Errorf("%s: %w", name, ErrStreamTruncated)
 }

@@ -39,6 +39,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/trebor048/shhgot/core"
+	"github.com/trebor048/shhgot/core/verifiers"
 	"golang.org/x/term"
 )
 
@@ -58,7 +59,11 @@ type TUIMatch struct {
 	Secret    string // the exact matched text
 	Matches   []string
 	Line      int // 1-based line number of the secret
-	Priority  int // 3 critical, 2 high, 1 medium, 0 low
+	Priority  int // 3 critical, 2 high, 1 medium, 0 low (rule priority)
+	// Severity is the dynamic finding severity ("critical"/"high"/"medium"/
+	// "low") derived from the verifier outcome, distinct from Priority. It is
+	// empty when unknown and then nothing is rendered for it.
+	Severity  string
 	Stars     int
 	Timestamp time.Time
 }
@@ -102,6 +107,13 @@ func AddTUILog(line string) { tuiState.addLog(line) }
 // safe to call at any time.
 func AddTUIToken(token string, valid bool, provider string) {
 	tuiState.addToken(token, valid, provider)
+}
+
+// AddTUITokenOutcome refreshes the severity label of every already-visible
+// finding whose secret begins with the masked token a verifier just resolved.
+// It never blocks and is safe to call at any time.
+func AddTUITokenOutcome(token string, o verifiers.Outcome) {
+	tuiState.applyOutcome(token, o)
 }
 
 // SetTUIStatus replaces the scanner status shown in the header. It never blocks
@@ -333,6 +345,40 @@ func (b *tuiBuffer) addLog(line string) {
 	b.poke()
 }
 
+// applyOutcome upgrades the Severity of every buffered finding whose secret
+// matches the masked token a verifier resolved. Matching uses the unmasked
+// prefix, because the callback only carries a masked token; entries are
+// replaced, never mutated, so a view snapshot that already holds the old
+// pointer stays consistent and cannot race the renderer.
+func (b *tuiBuffer) applyOutcome(token string, o verifiers.Outcome) {
+	if b == nil {
+		return
+	}
+	prefix := strings.TrimSuffix(strings.TrimSpace(token), "...")
+	if prefix == "" {
+		return
+	}
+	changed := false
+	b.mu.Lock()
+	for i, e := range b.matches {
+		if e == nil || e.match == nil || len(e.match.Secret) < len(prefix) ||
+			!strings.HasPrefix(e.match.Secret, prefix) {
+			continue
+		}
+		cp := *e.match
+		cp.Severity = core.Classify(cp.Priority, &o).String()
+		b.matches[i] = &tuiMatchEntry{match: &cp, blob: tuiMatchBlob(&cp)}
+		changed = true
+	}
+	if changed {
+		b.version++
+	}
+	b.mu.Unlock()
+	if changed {
+		b.poke()
+	}
+}
+
 func (b *tuiBuffer) addToken(token string, valid bool, provider string) {
 	if b == nil || strings.TrimSpace(token) == "" {
 		return
@@ -553,6 +599,13 @@ func (u *tuiUI) view(b *tuiBuffer, width, height int, color bool) *tuiView {
 	}
 	v.matches = tuiFilterPriority(v.matches, v.prioMask)
 
+	v.logBack = tuiClamp(u.logBack, 0, len(v.logs))
+	// Resolve the selection before the file viewer reads it: v.sel is the view's
+	// copy of u.sel and selectedEntry uses v.sel. Assigning it after the file
+	// block made the viewer always resolve matches[0] instead of the selection.
+	u.sel = tuiClamp(u.sel, 0, tuiListLenFor(v.tab, v)-1)
+	v.sel = u.sel
+
 	// The file viewer resolves the captured body for the selected finding. It is
 	// only read while the pane is open, so the common path pays nothing.
 	if u.tab == tuiTabFindings && u.fileView {
@@ -570,9 +623,6 @@ func (u *tuiUI) view(b *tuiBuffer, width, height int, color bool) *tuiView {
 		v.fileScroll = u.fileScroll
 	}
 
-	v.logBack = tuiClamp(u.logBack, 0, len(v.logs))
-	u.sel = tuiClamp(u.sel, 0, tuiListLenFor(v.tab, v)-1)
-	v.sel = u.sel
 	return v
 }
 
@@ -986,6 +1036,7 @@ func tuiMatchBlob(m *TUIMatch) string {
 	var sb strings.Builder
 	fields := [...]string{
 		m.Signature, m.Source, m.URL, m.Repo, m.File, m.Link, m.Secret,
+		m.Severity,
 		strings.Join(m.Matches, " "),
 	}
 	for _, f := range fields {
@@ -1418,7 +1469,67 @@ func tuiFooterLine(v *tuiView) tuiLine {
 	if v.tab >= 0 && v.tab < tuiTabCount {
 		keys = tuiFooterKeys[v.tab]
 	}
-	return tuiTextLine(" "+keys, v.width, tuiSGRDim, v.color)
+	b := newTUILine(v.width)
+	metrics := tuiMetricsSummary()
+	if metrics == "" {
+		b.clip(" "+keys, tuiSGRDim, v.color)
+		return b.finish()
+	}
+	// Reserve the right-hand metrics segment before laying out the key hints,
+	// so the two never overlap on a narrow terminal.
+	avail := b.limit - tuiDisplayWidth(metrics) - 2
+	if avail < 8 {
+		b.clip(" "+keys, tuiSGRDim, v.color)
+		return b.finish()
+	}
+	b.paint(" "+tuiTruncate(keys, avail), tuiSGRDim, v.color)
+	b.dock(metrics, tuiSGRDim, v.color)
+	return b.finish()
+}
+
+// tuiMetricsSummary renders a compact per-subsystem p95 latency line for the
+// footer, from the process-wide metrics collector. It is empty when metric
+// collection is disabled (or no subsystem has recorded traffic yet), so the
+// footer keeps its previous shape.
+func tuiMetricsSummary() string {
+	if !core.MetricsCollectionEnabled() {
+		return ""
+	}
+	snap := core.DefaultMetrics.Snapshot()
+	if len(snap) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(snap))
+	for name := range snap {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		s := snap[name]
+		if s.Count == 0 && s.Ops == 0 {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s p95 %s", name, tuiShortDuration(s.P95)))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "metrics " + strings.Join(parts, " | ")
+}
+
+// tuiShortDuration renders a latency compactly for the footer metrics segment.
+func tuiShortDuration(d time.Duration) string {
+	switch {
+	case d <= 0:
+		return "0ms"
+	case d < time.Millisecond:
+		return "<1ms"
+	case d < time.Second:
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	default:
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
 }
 
 func tuiPromptLine(v *tuiView) tuiLine {
@@ -1613,7 +1724,7 @@ func tuiFindingRow(v *tuiView, e *tuiMatchEntry, selected bool, repoW, fileW, si
 	if selected {
 		sgr = tuiSGRBold
 	}
-	b.fit(" "+m.Signature+tuiStars(m), sigW, sgr, v.color)
+	b.fit(" "+m.Signature+tuiSeverityTag(m)+tuiStars(m), sigW, sgr, v.color)
 	return b.finish()
 }
 
@@ -1622,6 +1733,20 @@ func tuiStars(m *TUIMatch) string {
 		return ""
 	}
 	return fmt.Sprintf(" *%d", m.Stars)
+}
+
+// tuiSeverityTag renders the dynamic (verified) severity next to a signature,
+// e.g. " [sev:critical]". It is empty when no severity is known, so a finding
+// that carries only its rule priority shows nothing extra.
+func tuiSeverityTag(m *TUIMatch) string {
+	if m == nil {
+		return ""
+	}
+	sev := strings.ToLower(strings.TrimSpace(m.Severity))
+	if sev == "" {
+		return ""
+	}
+	return " [sev:" + sev + "]"
 }
 
 // tuiTopSigsLine is the terminal form of the dashboard's "top signatures" panel:
@@ -1710,6 +1835,7 @@ func tuiDetailLines(v *tuiView, detH int) []tuiLine {
 	title := newTUILine(w)
 	title.paint(" > ", tuiSGRBold+tuiSGRCyan, v.color)
 	title.clip(m.Signature, tuiSGRBold, v.color)
+	title.clip(tuiSeverityTag(m), tuiSGRDim, v.color)
 	title.clip(" ["+strings.ToUpper(tuiPriorityName(pi))+"]", tuiPrioritySGR(pi), v.color)
 	if m.Source != "" {
 		title.clip("  "+m.Source+tuiStars(m), tuiSGRDim, v.color)
@@ -2375,7 +2501,10 @@ func (u *tuiUI) openSelected(v *tuiView) {
 		u.flash("this finding has no link to open")
 		return
 	}
-	openBrowser(link)
+	if err := openBrowser(link); err != nil {
+		u.flash("could not open browser: " + err.Error())
+		return
+	}
 	u.flash("opened " + link)
 }
 
@@ -2565,7 +2694,10 @@ func StartTUI() error {
 	dec := &tuiKeyDecoder{}
 
 	// Keyboard reader: one goroutine feeding a buffered channel, so a slow
-	// frame can never block the console read and vice versa.
+	// frame can never block the console read and vice versa. The reader parks
+	// in the blocking Read after quit until the next input (or process exit)
+	// reaps it; that is one short-lived goroutine per TUI session, not a leak
+	// that accumulates.
 	keys := make(chan byte, 256)
 	readErr := make(chan error, 1)
 	done := make(chan struct{})
